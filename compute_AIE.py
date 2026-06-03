@@ -46,14 +46,14 @@ if __name__ == '__main__':
 
     jailbreak_prompts = get_prompts_list(args.jailbreak_prompts)
     jailbreak_prompts = apply_template(
-        promtps=jailbreak_prompts,
+        prompts=jailbreak_prompts,
         system_prompt=args.system_prompt,
         tokenizer=tokenizer,
         model_config=model_config)
     
     original_prompts = get_prompts_list(args.original_prompts)
     original_prompts = apply_template(
-        promtps=original_prompts,
+        prompts=original_prompts,
         system_prompt=args.system_prompt,
         tokenizer=tokenizer,
         model_config=model_config
