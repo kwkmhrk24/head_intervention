@@ -35,7 +35,10 @@ def replace_activation_w_avg(layer_head_pairs,avg_activations,interpolation_rate
             #Perform intervention
             for (layer,head_n) in layer_head_pairs:
                 if layer == current_layer:
-                    inputs[-1,-1,head_n] = avg_activations[layer,head_n,0]
+                    inputs[-1,-1,head_n] = avg_activations[layer,head_n,0].to(
+                        device=inputs.device,
+                        dtype=inputs.dtype,
+                    )
                     total_intervention += 1
             
             inputs = inputs.view(*original_shape)
@@ -62,6 +65,11 @@ def compute_CIE(prompt, avg_activations, model, model_config, tokenizer):
     else:
         sure_ids = tokenizer.encode("Sure", add_special_tokens=False)
         token_id_of_interest = [sure_ids[0]]
+    token_id_of_interest = torch.tensor(
+        token_id_of_interest,
+        dtype=torch.long,
+        device=model.device,
+    )
     
     inputs = tokenizer(prompt, return_tensors='pt',add_special_tokens=False).to(model.device)
 
@@ -88,7 +96,9 @@ def compute_CIE(prompt, avg_activations, model, model_config, tokenizer):
             # TRACK probs of tokens of interest
             intervention_probs = torch.softmax(output[0], dim=-1)
             #print(f"layer{layer+1},head{head_n+1} intervened_prob: {intervention_probs[0][token_id_of_interest[0]]}")
-            indirect_effect_storage[layer,head_n,0] = (clean_probs-intervention_probs).index_select(1, torch.LongTensor(token_id_of_interest).to(model.device).squeeze()).squeeze()
+            indirect_effect_storage[layer,head_n,0] = (
+                clean_probs - intervention_probs
+            ).index_select(1, token_id_of_interest).squeeze().detach().float().cpu()
 
     return indirect_effect_storage
 
@@ -104,6 +114,6 @@ def generate_with_intervention(prompt,intervention_locations,interpolation_rate,
                                                        model_config=model_config
                                                        )
     with TraceDict(model, layers=head_hook_layer, edit_output=intervention_fn) as td:   
-        outputs = model.generate(inputs.input_ids,**generation_config)
-        outputs = tokenizer.decode(outputs.squeeze()[inputs.input_ids.shape[-1]:])
+        outputs = model.generate(**inputs, **generation_config)
+        outputs = tokenizer.decode(outputs[0, inputs.input_ids.shape[-1]:])
     return outputs
