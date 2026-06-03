@@ -9,7 +9,8 @@ from utils.intervention_utils import generate_with_intervention
 
 intervention_locations = { #set intervened head based on AIE score
     "Llama":  [(3,0),(7,16),(9,9),(13,4),(3,5)],
-    "Mistral": [(16,14),(31,14),(15,14),(30,3),(16,31),(31,13),(11,9),(14,20),(30,9),(14,27)]
+    "Mistral": [(16,14),(31,14),(15,14),(30,3),(16,31),(31,13),(11,9),(14,20),(30,9),(14,27)], 
+    "Qwen": [(0, 0)], # temporary; replace after computing AIE
 }
 generation_config = { #set generation parameters
     "do_sample": False,

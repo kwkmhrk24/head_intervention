@@ -56,6 +56,12 @@ def compute_CIE(prompt, avg_activations, model, model_config, tokenizer):
         token_id_of_interest = [18585]
     elif model_config["model_name"] == "Mistral":
         token_id_of_interest = [12875]
+    elif model_config["model_name"] == "Qwen":
+        sure_ids = tokenizer.encode("Sure", add_special_tokens=False)
+        token_id_of_interest = [sure_ids[0]]
+    else:
+        sure_ids = tokenizer.encode("Sure", add_special_tokens=False)
+        token_id_of_interest = [sure_ids[0]]
     
     inputs = tokenizer(prompt, return_tensors='pt',add_special_tokens=False).to(model.device)
 

@@ -24,5 +24,20 @@ def apply_template(prompts,system_prompt,tokenizer,model_config):
         else:
             messages = [{"role": "system","content":system_prompt}]
         messages.append({"role": "user", "content": prompt})
-        prompts_w_template.append(tokenizer.apply_chat_template(messages,tokenize=False))
+        
+        if model_config["model_name"] == "Qwen":
+            prompts_w_template.append(
+                tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True
+                )
+            )
+        else:
+            prompts_w_template.append(
+                tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False
+                )
+            )
     return prompts_w_template
