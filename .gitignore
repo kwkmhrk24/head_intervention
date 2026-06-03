@@ -1,0 +1,27 @@
+__pycache__/
+*.pyc
+
+.env
+*.log
+
+# data / outputs
+outputs/
+results/
+logs/
+checkpoints/
+
+# model / intermediate files
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.pkl
+*.pickle
+*.npy
+*.npz
+
+# OS/editor
+.DS_Store
+.vscode/
+
+data/

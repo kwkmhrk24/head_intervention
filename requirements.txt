@@ -1,0 +1,6 @@
+git+https://github.com/davidbau/baukit@main#egg=baukit
+pandas==2.2.3
+torch==2.4.0
+tqdm==4.66.4
+transformers==4.42.3
+numpy==1.26.4
