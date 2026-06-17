@@ -35,7 +35,10 @@ def replace_activation_w_avg(layer_head_pairs,avg_activations,interpolation_rate
             #Perform intervention
             for (layer,head_n) in layer_head_pairs:
                 if layer == current_layer:
-                    inputs[-1,-1,head_n] = avg_activations[layer,head_n,0]
+                    inputs[-1,-1,head_n] = avg_activations[layer,head_n,0].to(
+                        device=inputs.device,
+                        dtype=inputs.dtype,
+                    )
                     total_intervention += 1
             
             inputs = inputs.view(*original_shape)
