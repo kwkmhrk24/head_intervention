@@ -134,11 +134,36 @@ resid_dim: 4096
 
 ## Extract Intervention Vector
 
+The XSTest-derived refusal vector is useful for provisional experiments, but the closer paper-reproduction condition is to use 20 AdvBench-derived prompts that are not in the evaluation set and that Llama2 safely refuses.
+
+Select AdvBench safe rejection prompts on the GPU machine:
+
+```bash
+python scripts/select_advbench_refusal_prompts.py \
+  --model /mnt/mp_nas_mks/labmember/h.kawakami/models/Llama-2-7b-chat-hf \
+  --advbench_file data/raw/advbench.jsonl \
+  --exclude_file data/raw/llama2/AutoDAN_llama2.jsonl \
+  --output_file data/derived/llama2/refusal/advbench_safe20_prompts.jsonl \
+  --num_prompts 20 \
+  --max_new_tokens 32
+```
+
 The script saves to `./data/{output_file}.pt`, so create the output directory first:
 
 ```bash
 mkdir -p data/outputs/llama2/autodan
 ```
+
+Recommended paper-reproduction intervention vector from AdvBench safe20:
+
+```bash
+python extract_intervention_vector.py \
+  --model /mnt/mp_nas_mks/labmember/h.kawakami/models/Llama-2-7b-chat-hf \
+  --prompts_file data/derived/llama2/refusal/advbench_safe20_prompts.jsonl \
+  --output_file outputs/llama2/autodan/intervention_activation_advbench_safe20
+```
+
+Provisional XSTest-derived intervention vector:
 
 ```bash
 python extract_intervention_vector.py \
@@ -150,6 +175,7 @@ python extract_intervention_vector.py \
 Expected local output:
 
 ```text
+data/outputs/llama2/autodan/intervention_activation_advbench_safe20.pt
 data/outputs/llama2/autodan/intervention_activation.pt
 ```
 
