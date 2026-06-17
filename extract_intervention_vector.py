@@ -1,5 +1,6 @@
 import argparse
 import torch
+from pathlib import Path
 
 from utils.model_utils import load_model_and_tokenizer
 from utils.prompt_utils import get_prompts_list, apply_template
@@ -27,6 +28,8 @@ if __name__ == '__main__':
         model_config=model_config,
         tokenizer=tokenizer
         )
-    if args.output_file != None:
-        torch.save(mean_activation,f"./data/{args.output_file}.pt")
+    if args.output_file is not None:
+        output_path = Path("./data") / f"{args.output_file}.pt"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(mean_activation, output_path)
     

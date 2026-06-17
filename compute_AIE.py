@@ -1,5 +1,6 @@
 import torch
 import argparse
+from pathlib import Path
 from tqdm import tqdm
 
 from utils.prompt_utils import get_prompts_list, apply_template
@@ -91,5 +92,7 @@ if __name__ == '__main__':
         model_config=model_config,
         tokenizer=tokenizer
         )
-    if args.output_file != None:
-        torch.save(AIE,f"./data/{args.output_file}.pt")
+    if args.output_file is not None:
+        output_path = Path("./data") / f"{args.output_file}.pt"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(AIE, output_path)
