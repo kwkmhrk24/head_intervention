@@ -50,19 +50,33 @@ def parse_intervention_heads(heads,model_config):
 
     return intervention_heads
 
-def calc_ASR(prompts,intervention_locations,interpolation_rate,intervention_activation,model,model_config,tokenizer,generation_config):
+def generate_without_intervention(prompt,model,tokenizer,generation_config):
+    inputs = tokenizer(prompt, return_tensors="pt", add_special_tokens=False).to(model.device)
+    with torch.no_grad():
+        outputs = model.generate(inputs.input_ids,**generation_config)
+    return tokenizer.decode(outputs.squeeze()[inputs.input_ids.shape[-1]:])
+
+def calc_ASR(prompts,intervention_locations,interpolation_rate,intervention_activation,model,model_config,tokenizer,generation_config,no_intervention=False):
     ASN = 0
     for prompt in tqdm(prompts,leave=False):
-        output = generate_with_intervention(
-            prompt=prompt,
-            intervention_locations=intervention_locations,
-            interpolation_rate=interpolation_rate,
-            intervention_activation=intervention_activation,
-            model=model,
-            model_config=model_config,
-            tokenizer=tokenizer,
-            generation_config=generation_config
-            )
+        if no_intervention:
+            output = generate_without_intervention(
+                prompt=prompt,
+                model=model,
+                tokenizer=tokenizer,
+                generation_config=generation_config
+                )
+        else:
+            output = generate_with_intervention(
+                prompt=prompt,
+                intervention_locations=intervention_locations,
+                interpolation_rate=interpolation_rate,
+                intervention_activation=intervention_activation,
+                model=model,
+                model_config=model_config,
+                tokenizer=tokenizer,
+                generation_config=generation_config
+                )
         #print(output)
         if check_success(output):
             ASN+=1
@@ -78,6 +92,7 @@ def get_args():
     parser.add_argument("--intervened_head_num",type=int,default=1,help="number of intervened head")
     parser.add_argument("--interpolation_rate",type=float,default=1.0,help="interpolation rate λ in the paper")
     parser.add_argument("--intervention_heads",type=str,default=None,help="Optional semicolon-separated head list, e.g. '13,4;16,15'. If set, this overrides --intervened_head_num.")
+    parser.add_argument("--no_intervention",action="store_true",help="Run true no-defense evaluation without installing intervention hooks or loading intervention activations.")
 
     args = parser.parse_args()
     return args
@@ -87,13 +102,20 @@ if __name__ == '__main__':
     model,tokenizer,model_config = load_model_and_tokenizer(args.model)
     prompts = get_prompts_list(args.input_file)
     prompts = apply_template(prompts=prompts,system_prompt=args.system_prompt,tokenizer=tokenizer,model_config=model_config)
-    intervention_activation = torch.load(args.intervention_activation)
-    if args.intervention_heads is not None:
-        selected_intervention_heads = parse_intervention_heads(args.intervention_heads,model_config)
+    if args.no_intervention:
+        intervention_activation = None
+        selected_intervention_heads = None
     else:
-        selected_intervention_heads = intervention_locations[model_config["model_name"]][:args.intervened_head_num]
+        if args.intervention_activation is None:
+            raise ValueError("--intervention_activation is required unless --no_intervention is set")
+        intervention_activation = torch.load(args.intervention_activation)
+        if args.intervention_heads is not None:
+            selected_intervention_heads = parse_intervention_heads(args.intervention_heads,model_config)
+        else:
+            selected_intervention_heads = intervention_locations[model_config["model_name"]][:args.intervened_head_num]
 
     print(f"num prompts: {len(prompts)}")
+    print(f"no_intervention: {args.no_intervention}")
     print(f"interpolation_rate: {args.interpolation_rate}")
     print(f"selected intervention heads: {selected_intervention_heads}")
 
@@ -105,6 +127,7 @@ if __name__ == '__main__':
         model=model,
         model_config=model_config,
         tokenizer=tokenizer,
-        generation_config=generation_config
+        generation_config=generation_config,
+        no_intervention=args.no_intervention
     )
     print(f"ASR : {ASR}")

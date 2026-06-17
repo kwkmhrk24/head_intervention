@@ -244,6 +244,15 @@ python scripts/inspect_aie.py \
 
 ## Evaluate AutoDAN ASR
 
+True no-intervention baseline. This is the pure No Defense setting with no intervention hooks and no intervention activation loaded:
+
+```bash
+python evaluate.py \
+  --model /mnt/mp_nas_mks/labmember/h.kawakami/models/Llama-2-7b-chat-hf \
+  --input_file data/derived/llama2/autodan/jailbreak_prompts.jsonl \
+  --no_intervention
+```
+
 Default fixed-head reproduction setting:
 
 ```bash
@@ -287,7 +296,7 @@ python evaluate.py \
   --intervention_heads "13,4;16,15;15,30;12,1;21,14"
 ```
 
-For a no-intervention baseline with the same selected heads, keep the same `--intervention_heads` value and set `--interpolation_rate 0.0`.
+For a hook-through baseline-like comparison with the same selected heads, keep the same `--intervention_heads` value and set `--interpolation_rate 0.0`. Compare this with `--no_intervention`: `--no_intervention` is the pure hook-free No Defense evaluation, while `--interpolation_rate 0.0` still installs the intervention hooks.
 
 ## Smoke-Test Candidates
 
