@@ -28,6 +28,8 @@ CSV_COLUMNS = [
     "layer",
     "head",
     "seq_len",
+    "window_type",
+    "window_size",
     "fro_norm",
     "sym_norm",
     "skew_norm",
@@ -48,6 +50,7 @@ def get_args():
     parser.add_argument("--heads", required=True, help="Semicolon-separated layer,head list, e.g. '3,0;7,16'.")
     parser.add_argument("--output_csv", required=True, help="Output CSV path.")
     parser.add_argument("--max_prompts", type=int, default=None, help="Optional limit on the number of prompts.")
+    parser.add_argument("--tail_tokens", type=int, default=None, help="Analyze only the final N tokens using S[-N:, -N:].")
     parser.add_argument("--system_prompt", type=str, default=None, help="Optional system prompt passed to apply_template().")
     parser.add_argument("--debug", action="store_true", help="Print shape and decomposition diagnostics for the first prompt/head.")
     return parser.parse_args()
@@ -201,6 +204,14 @@ def compute_score_matrix(query_states, key_states, head):
     return torch.matmul(query, key.transpose(-1, -2)) / math.sqrt(head_dim)
 
 
+def select_score_window(score_matrix, tail_tokens):
+    if tail_tokens is None:
+        return score_matrix, "full", score_matrix.shape[-1]
+
+    window_size = min(tail_tokens, score_matrix.shape[-1])
+    return score_matrix[-window_size:, -window_size:], f"tail_{tail_tokens}", window_size
+
+
 def compute_metrics(score_matrix, eps=1e-12):
     seq_len = score_matrix.shape[-1]
     sym = (score_matrix + score_matrix.transpose(-1, -2)) / 2
@@ -213,7 +224,6 @@ def compute_metrics(score_matrix, eps=1e-12):
     energy_rel_error = torch.abs(fro_norm ** 2 - sym_norm ** 2 - skew_norm ** 2) / (fro_norm ** 2 + eps)
 
     return {
-        "seq_len": seq_len,
         "fro_norm": float(fro_norm.item()),
         "sym_norm": float(sym_norm.item()),
         "skew_norm": float(skew_norm.item()),
@@ -227,12 +237,15 @@ def compute_metrics(score_matrix, eps=1e-12):
     }
 
 
-def print_debug(metrics, score_matrix, selected_heads):
-    print(f"tokenized seq_len: {metrics['seq_len']}")
+def print_debug(metrics, full_score_matrix, score_window, selected_heads, window_type, window_size, original_seq_len):
+    print(f"original seq_len: {original_seq_len}")
+    print(f"window_type: {window_type}")
+    print(f"window_size: {window_size}")
+    print(f"full S shape: {tuple(full_score_matrix.shape)}")
+    print(f"S shape: {tuple(score_window.shape)}")
     print(f"selected heads: {selected_heads}")
-    print(f"S shape: {tuple(score_matrix.shape)}")
-    print(f"dtype: {score_matrix.dtype}")
-    print(f"device: {score_matrix.device}")
+    print(f"dtype: {score_window.dtype}")
+    print(f"device: {score_window.device}")
     print(f"reconstruction_rel_error: {metrics['reconstruction_rel_error']}")
     print(f"energy_rel_error: {metrics['energy_rel_error']}")
     print(f"sym_ratio: {metrics['sym_ratio']}")
@@ -247,6 +260,8 @@ def main():
     args = get_args()
     if args.max_prompts is not None and args.max_prompts <= 0:
         raise ValueError("--max_prompts must be positive when specified")
+    if args.tail_tokens is not None and args.tail_tokens <= 0:
+        raise ValueError("--tail_tokens must be positive when specified")
 
     rows = read_prompt_rows(args.prompts_file)
     if args.max_prompts is not None:
@@ -289,9 +304,18 @@ def main():
         for layer, head in selected_heads:
             query_states, key_states = qk_by_layer[layer]
             score_matrix = compute_score_matrix(query_states, key_states, head)
-            metrics = compute_metrics(score_matrix)
+            score_window, window_type, window_size = select_score_window(score_matrix, args.tail_tokens)
+            metrics = compute_metrics(score_window)
             if args.debug and not debug_printed:
-                print_debug(metrics, score_matrix, selected_heads)
+                print_debug(
+                    metrics=metrics,
+                    full_score_matrix=score_matrix,
+                    score_window=score_window,
+                    selected_heads=selected_heads,
+                    window_type=window_type,
+                    window_size=window_size,
+                    original_seq_len=seq_len,
+                )
                 debug_printed = True
 
             output_rows.append({
@@ -299,6 +323,9 @@ def main():
                 "source_index": row.get("index", ""),
                 "layer": layer,
                 "head": head,
+                "seq_len": seq_len,
+                "window_type": window_type,
+                "window_size": window_size,
                 **metrics,
             })
 

@@ -340,6 +340,31 @@ python scripts/analyze_attention_scores.py \
   --debug
 ```
 
+Full-score analysis can be affected by prompt length because AutoDAN jailbreak prompts are much longer than the original prompts. Since the intervention rewrites the selected head output at the final token position, also compare a tail window around the end of the sequence:
+
+```text
+S_tail = S[-N:, -N:]
+```
+
+Start with `--tail_tokens 20` to inspect the final-token neighborhood while keeping the existing full-score analysis available:
+
+```bash
+python scripts/analyze_attention_scores.py \
+  --model /mnt/mp_nas_mks/labmember/h.kawakami/models/Llama-2-7b-chat-hf \
+  --prompts_file data/derived/llama2/autodan/jailbreak_prompts_10.jsonl \
+  --heads "3,0;7,16;9,9;13,4;3,5" \
+  --output_csv data/outputs/llama2/analysis/attention_score_metrics_jailbreak10_tail20.csv \
+  --max_prompts 10 \
+  --tail_tokens 20 \
+  --debug
+```
+
+Suggested tail-window output names:
+
+- `attention_score_metrics_original130_tail20.csv`
+- `attention_score_metrics_jailbreak130_tail20.csv`
+- `attention_score_metrics_safe20_tail20.csv`
+
 Useful comparison inputs:
 
 - `data/derived/llama2/autodan/original_prompts_10.jsonl`
