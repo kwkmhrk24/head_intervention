@@ -218,6 +218,8 @@ python scripts/inspect_aie.py \
 
 ## Evaluate AutoDAN ASR
 
+Default fixed-head reproduction setting:
+
 ```bash
 python evaluate.py \
   --model /path/to/Llama-2-7b-chat-hf \
@@ -234,6 +236,32 @@ The existing Llama head setting in `evaluate.py` is:
 ```
 
 Use this first for paper reproduction before trying AIE-derived alternatives.
+
+To evaluate custom heads from the AutoDAN AIE top 5, pass `--intervention_heads`. This overrides `--intervened_head_num`.
+
+AutoDAN10 smoke with AutoDAN AIE top 5:
+
+```bash
+python evaluate.py \
+  --model /mnt/mp_nas_mks/labmember/h.kawakami/models/Llama-2-7b-chat-hf \
+  --input_file data/derived/llama2/autodan/jailbreak_prompts_10.jsonl \
+  --intervention_activation data/outputs/llama2/autodan/intervention_activation.pt \
+  --interpolation_rate 0.75 \
+  --intervention_heads "13,4;16,15;15,30;12,1;21,14"
+```
+
+AutoDAN130 with AutoDAN AIE top 5:
+
+```bash
+python evaluate.py \
+  --model /mnt/mp_nas_mks/labmember/h.kawakami/models/Llama-2-7b-chat-hf \
+  --input_file data/derived/llama2/autodan/jailbreak_prompts.jsonl \
+  --intervention_activation data/outputs/llama2/autodan/intervention_activation.pt \
+  --interpolation_rate 0.75 \
+  --intervention_heads "13,4;16,15;15,30;12,1;21,14"
+```
+
+For a no-intervention baseline with the same selected heads, keep the same `--intervention_heads` value and set `--interpolation_rate 0.0`.
 
 ## Smoke-Test Candidates
 

@@ -18,6 +18,38 @@ generation_config = { #set generation parameters
     "max_new_tokens": 32
 }
 
+def parse_intervention_heads(heads,model_config):
+    intervention_heads = []
+    for item in heads.split(";"):
+        item = item.strip()
+        if not item:
+            continue
+
+        parts = [part.strip() for part in item.split(",")]
+        if len(parts) != 2:
+            raise ValueError(f"Invalid intervention head {item!r}; expected 'layer,head'")
+
+        try:
+            layer, head = (int(part) for part in parts)
+        except ValueError as exc:
+            raise ValueError(f"Invalid intervention head {item!r}; layer/head must be integers") from exc
+
+        if not 0 <= layer < model_config["n_layers"]:
+            raise ValueError(
+                f"Invalid layer {layer}; expected 0 <= layer < {model_config['n_layers']}"
+            )
+        if not 0 <= head < model_config["n_heads"]:
+            raise ValueError(
+                f"Invalid head {head}; expected 0 <= head < {model_config['n_heads']}"
+            )
+
+        intervention_heads.append((layer,head))
+
+    if not intervention_heads:
+        raise ValueError("--intervention_heads did not contain any valid layer,head pairs")
+
+    return intervention_heads
+
 def calc_ASR(prompts,intervention_locations,interpolation_rate,intervention_activation,model,model_config,tokenizer,generation_config):
     ASN = 0
     for prompt in tqdm(prompts,leave=False):
@@ -45,6 +77,7 @@ def get_args():
     parser.add_argument("--intervention_activation",type=str,help="Path to .pt file containing head output vectors for intervention")
     parser.add_argument("--intervened_head_num",type=int,default=1,help="number of intervened head")
     parser.add_argument("--interpolation_rate",type=float,default=1.0,help="interpolation rate λ in the paper")
+    parser.add_argument("--intervention_heads",type=str,default=None,help="Optional semicolon-separated head list, e.g. '13,4;16,15'. If set, this overrides --intervened_head_num.")
 
     args = parser.parse_args()
     return args
@@ -55,10 +88,18 @@ if __name__ == '__main__':
     prompts = get_prompts_list(args.input_file)
     prompts = apply_template(prompts=prompts,system_prompt=args.system_prompt,tokenizer=tokenizer,model_config=model_config)
     intervention_activation = torch.load(args.intervention_activation)
+    if args.intervention_heads is not None:
+        selected_intervention_heads = parse_intervention_heads(args.intervention_heads,model_config)
+    else:
+        selected_intervention_heads = intervention_locations[model_config["model_name"]][:args.intervened_head_num]
+
+    print(f"num prompts: {len(prompts)}")
+    print(f"interpolation_rate: {args.interpolation_rate}")
+    print(f"selected intervention heads: {selected_intervention_heads}")
 
     ASR = calc_ASR(
         prompts=prompts,
-        intervention_locations=intervention_locations[model_config["model_name"]][:args.intervened_head_num],
+        intervention_locations=selected_intervention_heads,
         interpolation_rate=args.interpolation_rate,
         intervention_activation=intervention_activation,
         model=model,
