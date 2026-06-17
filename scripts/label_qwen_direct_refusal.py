@@ -55,9 +55,6 @@ def get_generation_kwargs(tokenizer):
         pad_token_id = tokenizer.eos_token_id
     return {
         "do_sample": False,
-        "temperature": None,
-        "top_p": None,
-        "top_k": None,
         "max_new_tokens": 64,
         "pad_token_id": pad_token_id,
     }
