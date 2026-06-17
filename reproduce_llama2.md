@@ -311,6 +311,41 @@ Suggested smoke output location:
 - `data/outputs/llama2/smoke/intervention_activation.pt`
 - `data/outputs/llama2/smoke/autodan10_aie.pt`
 
+## Attention Score Decomposition Analysis
+
+The reproduction experiments above intervene on attention head outputs. As a follow-up analysis, inspect the upstream attention score matrix:
+
+```text
+S = QK^T / sqrt(d_head)
+```
+
+Use the post-RoPE, pre-mask, pre-softmax score matrix so the analysis includes positional information but avoids the causal mask triangle and softmax normalization. The analysis decomposes each selected head's score matrix into:
+
+```text
+S_sym = (S + S^T) / 2
+S_skew = (S - S^T) / 2
+```
+
+The script saves scalar metrics such as Frobenius norms, symmetry/skew ratios, reconstruction error, and energy error to CSV. It does not save the score matrices themselves.
+
+Start with the five paper heads:
+
+```bash
+python scripts/analyze_attention_scores.py \
+  --model /mnt/mp_nas_mks/labmember/h.kawakami/models/Llama-2-7b-chat-hf \
+  --prompts_file data/derived/llama2/autodan/jailbreak_prompts_10.jsonl \
+  --heads "3,0;7,16;9,9;13,4;3,5" \
+  --output_csv data/outputs/llama2/analysis/attention_score_metrics_jailbreak10.csv \
+  --max_prompts 10 \
+  --debug
+```
+
+Useful comparison inputs:
+
+- `data/derived/llama2/autodan/original_prompts_10.jsonl`
+- `data/derived/llama2/autodan/jailbreak_prompts_10.jsonl`
+- `data/derived/llama2/refusal/advbench_safe20_prompts.jsonl`
+
 ## Not Yet Run
 
 - Llama2 model loading
