@@ -8,6 +8,12 @@ from utils.extract_utils import get_mean_head_activations
 from utils.intervention_utils import compute_CIE
 
 def compute_AIE(jailbreak_prompts,original_prompts,model,model_config,tokenizer):
+    if len(jailbreak_prompts) != len(original_prompts):
+        raise ValueError(
+            "jailbreak_prompts and original_prompts must have the same length: "
+            f"{len(jailbreak_prompts)} != {len(original_prompts)}"
+        )
+
     AIE = torch.zeros(model_config['n_layers'],model_config['n_heads'])
     for i,(jailbreak_prompt,original_prompt) in enumerate(tqdm(zip(jailbreak_prompts,original_prompts))):
         activation = get_mean_head_activations(
@@ -36,6 +42,11 @@ def get_args():
     parser.add_argument("--original_prompts",type=str,help="Path to the jsonl file containing the original prompts corresponding to jailbreak prompts")
     parser.add_argument("--system_prompt",type=str, default=None, help="System prompt. Default is None. If you set \"self-reminder\", system prompt is automatically set to the prompt we used for self-reminder.")
     parser.add_argument("--output_file",type=str,default=None,help="output file name. Result will be stored in \"./data/output_file.pt\"")
+    parser.add_argument(
+        "--append_target_space",
+        action="store_true",
+        help="Append a literal space to templated original and jailbreak prompts before AIE computation. Useful for Llama2-chat where the target token 'Sure' follows a leading space token."
+    )
 
     args = parser.parse_args()
     return args
@@ -58,6 +69,21 @@ if __name__ == '__main__':
         tokenizer=tokenizer,
         model_config=model_config
         )
+
+    if len(jailbreak_prompts) != len(original_prompts):
+        raise ValueError(
+            "jailbreak_prompts and original_prompts must have the same length: "
+            f"{len(jailbreak_prompts)} != {len(original_prompts)}"
+        )
+
+    if args.append_target_space:
+        jailbreak_prompts = [prompt + " " for prompt in jailbreak_prompts]
+        original_prompts = [prompt + " " for prompt in original_prompts]
+
+    print(f"num jailbreak prompts: {len(jailbreak_prompts)}")
+    print(f"num original prompts: {len(original_prompts)}")
+    print(f"append_target_space: {args.append_target_space}")
+
     AIE = compute_AIE(
         jailbreak_prompts=jailbreak_prompts,
         original_prompts=original_prompts,

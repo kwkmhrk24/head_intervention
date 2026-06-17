@@ -161,7 +161,34 @@ The script saves to `./data/{output_file}.pt`, so create the output directory fi
 
 ```bash
 mkdir -p data/outputs/llama2/autodan
+mkdir -p data/outputs/llama2/smoke
 ```
+
+For Llama2-chat, diagnostics showed that the token immediately after `[/INST]` is often a leading-space token before the target token `Sure`. The default AIE behavior is still available, but first try the target-space correction for Llama2-chat by passing `--append_target_space`. This appends the same literal space to both original and jailbreak templated prompts so the intervention activation position and target-token position stay aligned.
+
+Recommended AutoDAN AIE command:
+
+```bash
+python compute_AIE.py \
+  --model /mnt/mp_nas_mks/labmember/h.kawakami/models/Llama-2-7b-chat-hf \
+  --jailbreak_prompts data/derived/llama2/autodan/jailbreak_prompts.jsonl \
+  --original_prompts data/derived/llama2/autodan/original_prompts.jsonl \
+  --output_file outputs/llama2/autodan/aie_target_space \
+  --append_target_space
+```
+
+Recommended AutoDAN10 smoke AIE command:
+
+```bash
+python compute_AIE.py \
+  --model /mnt/mp_nas_mks/labmember/h.kawakami/models/Llama-2-7b-chat-hf \
+  --jailbreak_prompts data/derived/llama2/autodan/jailbreak_prompts_10.jsonl \
+  --original_prompts data/derived/llama2/autodan/original_prompts_10.jsonl \
+  --output_file outputs/llama2/smoke/autodan10_aie_target_space \
+  --append_target_space
+```
+
+Default AIE command without the target-space correction:
 
 ```bash
 python compute_AIE.py \
@@ -175,6 +202,8 @@ Expected local output:
 
 ```text
 data/outputs/llama2/autodan/aie.pt
+data/outputs/llama2/autodan/aie_target_space.pt
+data/outputs/llama2/smoke/autodan10_aie_target_space.pt
 ```
 
 Do not commit this file.
