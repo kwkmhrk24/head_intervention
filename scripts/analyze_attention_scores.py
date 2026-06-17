@@ -108,10 +108,20 @@ def capture_self_attn_inputs(model, layers, inputs):
     for layer in sorted(set(layers)):
         self_attn = model.model.layers[layer].self_attn
 
-        def hook(module, module_inputs, layer=layer):
-            captured[layer] = module_inputs[0].detach()
+        def hook(module, module_inputs, module_kwargs, layer=layer):
+            if module_inputs:
+                hidden_states = module_inputs[0]
+            elif "hidden_states" in module_kwargs:
+                hidden_states = module_kwargs["hidden_states"]
+            else:
+                raise RuntimeError(
+                    f"Could not capture hidden_states for layer {layer}; "
+                    f"module_inputs length={len(module_inputs)}, "
+                    f"kwargs keys={list(module_kwargs.keys())}"
+                )
+            captured[layer] = hidden_states.detach()
 
-        handles.append(self_attn.register_forward_pre_hook(hook))
+        handles.append(self_attn.register_forward_pre_hook(hook, with_kwargs=True))
 
     try:
         with torch.no_grad():
