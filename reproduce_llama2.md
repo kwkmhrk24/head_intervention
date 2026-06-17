@@ -365,6 +365,38 @@ Suggested tail-window output names:
 - `attention_score_metrics_jailbreak130_tail20.csv`
 - `attention_score_metrics_safe20_tail20.csv`
 
+Use `--heads all` to analyze every layer/head pair. This is useful for comparing the all-head average against the paper heads and checking whether a score-structure change is broad or concentrated in important heads. Start with `--max_prompts 1`, then move to 10 prompts, and finally run the full 130-prompt set.
+
+```bash
+python scripts/analyze_attention_scores.py \
+  --model /mnt/mp_nas_mks/labmember/h.kawakami/models/Llama-2-7b-chat-hf \
+  --prompts_file data/derived/llama2/autodan/jailbreak_prompts_10.jsonl \
+  --heads all \
+  --output_csv data/outputs/llama2/analysis/attention_score_metrics_jailbreak1_all_heads_tail20_debug.csv \
+  --max_prompts 1 \
+  --tail_tokens 20 \
+  --debug
+```
+
+Suggested all-head tail-window output names:
+
+- `attention_score_metrics_original130_all_heads_tail20.csv`
+- `attention_score_metrics_jailbreak130_all_heads_tail20.csv`
+- `attention_score_metrics_safe20_all_heads_tail20.csv`
+
+Summarize all-head averages against selected paper heads:
+
+```bash
+python scripts/summarize_attention_score_metrics.py \
+  --original_csv data/outputs/llama2/analysis/attention_score_metrics_original130_all_heads_tail20.csv \
+  --jailbreak_csv data/outputs/llama2/analysis/attention_score_metrics_jailbreak130_all_heads_tail20.csv \
+  --safe_csv data/outputs/llama2/analysis/attention_score_metrics_safe20_all_heads_tail20.csv \
+  --heads "3,0;7,16;9,9;13,4;3,5" \
+  --output_csv data/outputs/llama2/analysis/summary_all_heads_vs_paper_heads_tail20.csv
+```
+
+In the summary CSV, `all_heads` is the average over every available head, `selected_heads_mean` is the average over the specified paper-head set, and rows like `layer13_head4` are individual selected heads. The `delta_jailbreak_minus_original` condition reports paired jailbreak - original differences, which helps check whether the selected heads change more strongly than the all-head average.
+
 Useful comparison inputs:
 
 - `data/derived/llama2/autodan/original_prompts_10.jsonl`

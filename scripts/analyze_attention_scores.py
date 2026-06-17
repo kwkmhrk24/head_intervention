@@ -76,6 +76,13 @@ def read_prompt_rows(path):
 
 
 def parse_heads(heads, model_config):
+    if heads.strip().lower() == "all":
+        return [
+            (layer, head)
+            for layer in range(model_config["n_layers"])
+            for head in range(model_config["n_heads"])
+        ]
+
     parsed = []
     for item in heads.split(";"):
         item = item.strip()
