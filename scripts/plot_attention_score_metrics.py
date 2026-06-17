@@ -97,6 +97,7 @@ def get_delta_rows(summary_csv, groups):
     missing = [group for group in groups if group not in set(delta["group"])]
     if missing:
         raise ValueError(f"{summary_csv}: requested groups not found: {missing}")
+    delta = delta[delta["group"].isin(groups)].copy()
     delta["group"] = pd.Categorical(delta["group"], categories=groups, ordered=True)
     return delta.sort_values("group")
 
