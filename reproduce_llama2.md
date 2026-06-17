@@ -397,6 +397,40 @@ python scripts/summarize_attention_score_metrics.py \
 
 In the summary CSV, `all_heads` is the average over every available head, `selected_heads_mean` is the average over the specified paper-head set, and rows like `layer13_head4` are individual selected heads. The `delta_jailbreak_minus_original` condition reports paired jailbreak - original differences, which helps check whether the selected heads change more strongly than the all-head average.
 
+Plot slide-ready summaries from the summary CSV:
+
+```bash
+python scripts/plot_attention_score_metrics.py \
+  --summary_csv data/outputs/llama2/analysis/summary_all_heads_vs_paper_heads_tail20.csv \
+  --output_dir data/outputs/llama2/analysis/figures \
+  --groups all_heads selected_heads_mean layer13_head4 layer3_head5 layer3_head0 layer7_head16 layer9_head9
+```
+
+If raw all-head original/jailbreak CSVs are available, also generate layer-by-head heatmaps:
+
+```bash
+python scripts/plot_attention_score_metrics.py \
+  --original_csv data/outputs/llama2/analysis/attention_score_metrics_original130_all_heads_tail20.csv \
+  --jailbreak_csv data/outputs/llama2/analysis/attention_score_metrics_jailbreak130_all_heads_tail20.csv \
+  --summary_csv data/outputs/llama2/analysis/summary_all_heads_vs_paper_heads_tail20.csv \
+  --output_dir data/outputs/llama2/analysis/figures \
+  --groups all_heads selected_heads_mean layer13_head4 layer3_head5 layer3_head0 layer7_head16 layer9_head9 \
+  --paper_heads "3,0;7,16;9,9;13,4;3,5"
+```
+
+For tail-window sensitivity, compare multiple summaries:
+
+```bash
+python scripts/plot_attention_score_metrics.py \
+  --summary_csvs \
+    data/outputs/llama2/analysis/summary_all_heads_vs_paper_heads_tail10.csv \
+    data/outputs/llama2/analysis/summary_all_heads_vs_paper_heads_tail16.csv \
+    data/outputs/llama2/analysis/summary_all_heads_vs_paper_heads_tail20.csv \
+    data/outputs/llama2/analysis/summary_all_heads_vs_paper_heads_tail32.csv \
+  --output_dir data/outputs/llama2/analysis/figures \
+  --groups all_heads selected_heads_mean layer13_head4 layer3_head5
+```
+
 Useful comparison inputs:
 
 - `data/derived/llama2/autodan/original_prompts_10.jsonl`
