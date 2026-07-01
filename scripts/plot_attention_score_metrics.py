@@ -111,6 +111,32 @@ def get_delta_rows(summary_csv, groups):
     return delta.sort_values("group")
 
 
+def get_condition_rows(summary_csv, groups, metric):
+    df = normalize_legacy_asym_columns(pd.read_csv(summary_csv))
+    required = ["group", "condition"]
+    require_columns(df, required, summary_csv)
+    if metric not in df.columns or not df[metric].notna().any():
+        return None
+
+    condition_rows = {}
+    for condition in ("original", "jailbreak"):
+        rows = df[
+            (df["condition"] == condition)
+            & (df["group"].isin(groups))
+        ].copy()
+        missing = [group for group in groups if group not in set(rows["group"])]
+        if missing:
+            raise ValueError(
+                f"{summary_csv}: requested groups not found for condition={condition!r}: {missing}"
+            )
+        rows = rows.set_index("group").loc[groups].reset_index()
+        if not rows[metric].notna().any():
+            return None
+        condition_rows[condition] = rows
+
+    return condition_rows
+
+
 def setup_slide_style():
     plt.rcParams.update({
         "font.size": 14,
@@ -167,6 +193,56 @@ def save_rate_plot(summary_csv, groups, output_dir):
     ax.grid(axis="y", alpha=0.25)
     fig.tight_layout()
     output_path = output_dir / f"{output_label}_sym_up_asym_down_rate_bar.png"
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+    return output_path
+
+
+def save_condition_comparison_bar(summary_csv, groups, output_dir):
+    metric = "asym_lower_pos_rate_mean"
+    condition_rows = get_condition_rows(summary_csv, groups, metric)
+    if condition_rows is None:
+        return None
+
+    original = condition_rows["original"]
+    jailbreak = condition_rows["jailbreak"]
+    window_label = infer_window_label(original, fallback="tail")
+    output_label = filename_window_label(window_label)
+    x = np.arange(len(groups))
+    width = 0.38
+
+    std_metric = "asym_lower_pos_rate_std"
+    original_error = original[std_metric].fillna(0) if std_metric in original.columns else None
+    jailbreak_error = jailbreak[std_metric].fillna(0) if std_metric in jailbreak.columns else None
+
+    fig, ax = plt.subplots(figsize=(max(10, len(groups) * 1.4), 6))
+    ax.bar(
+        x - width / 2,
+        original[metric],
+        width,
+        yerr=original_error,
+        capsize=3 if original_error is not None else 0,
+        label="original",
+        color="#4477AA",
+    )
+    ax.bar(
+        x + width / 2,
+        jailbreak[metric],
+        width,
+        yerr=jailbreak_error,
+        capsize=3 if jailbreak_error is not None else 0,
+        label="jailbreak",
+        color="#CC6677",
+    )
+    ax.set_ylim(0, 1)
+    ax.set_xticks(x)
+    ax.set_xticklabels(groups, rotation=30, ha="right")
+    ax.set_ylabel("asym_lower_pos_rate")
+    ax.set_title(f"Original vs Jailbreak: Lower-triangle Positive Rate in S_asym ({window_label})")
+    ax.legend()
+    ax.grid(axis="y", alpha=0.25)
+    fig.tight_layout()
+    output_path = output_dir / f"{output_label}_asym_lower_pos_rate_original_vs_jailbreak_bar.png"
     fig.savefig(output_path, dpi=200)
     plt.close(fig)
     return output_path
@@ -314,6 +390,11 @@ def main():
     if args.summary_csv:
         outputs.append(save_bar_plot(args.summary_csv, args.groups, output_dir))
         outputs.append(save_rate_plot(args.summary_csv, args.groups, output_dir))
+        condition_comparison = save_condition_comparison_bar(
+            args.summary_csv, args.groups, output_dir
+        )
+        if condition_comparison is not None:
+            outputs.append(condition_comparison)
         if summary_has_lower_triangle_metrics(args.summary_csv):
             outputs.append(save_lower_triangle_bar(
                 args.summary_csv,
