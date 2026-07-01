@@ -7,12 +7,19 @@ from pathlib import Path
 
 import torch
 from tqdm import tqdm
-from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
+from transformers.models.llama.modeling_llama import apply_rotary_pos_emb as llama_apply_rotary_pos_emb
 
 try:
-    from transformers.models.llama.modeling_llama import repeat_kv
+    from transformers.models.llama.modeling_llama import repeat_kv as llama_repeat_kv
 except ImportError:
-    repeat_kv = None
+    llama_repeat_kv = None
+
+try:
+    from transformers.models.mistral.modeling_mistral import apply_rotary_pos_emb as mistral_apply_rotary_pos_emb
+    from transformers.models.mistral.modeling_mistral import repeat_kv as mistral_repeat_kv
+except ImportError:
+    mistral_apply_rotary_pos_emb = None
+    mistral_repeat_kv = None
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -160,12 +167,24 @@ def get_rotary_cos_sin(self_attn, key_states, position_ids, seq_len):
             ) from exc
 
 
-def apply_rope(query_states, key_states, cos, sin, position_ids):
+def get_attention_helpers(model_name):
+    if model_name == "Llama":
+        return llama_apply_rotary_pos_emb, llama_repeat_kv
+    if model_name == "Mistral":
+        if mistral_apply_rotary_pos_emb is None or mistral_repeat_kv is None:
+            raise RuntimeError(
+                "Mistral attention helpers are unavailable in this transformers installation"
+            )
+        return mistral_apply_rotary_pos_emb, mistral_repeat_kv
+    raise ValueError(f"Unsupported model for attention score analysis: {model_name}")
+
+
+def apply_rope(query_states, key_states, cos, sin, position_ids, apply_rotary_pos_emb_fn):
     try:
-        return apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        return apply_rotary_pos_emb_fn(query_states, key_states, cos, sin, position_ids)
     except TypeError:
         try:
-            return apply_rotary_pos_emb(query_states, key_states, cos, sin)
+            return apply_rotary_pos_emb_fn(query_states, key_states, cos, sin)
         except TypeError as exc:
             raise RuntimeError(
                 "Unable to apply rotary position embedding. Refusing to fall back to pre-RoPE scores."
@@ -176,7 +195,13 @@ def apply_rope(query_states, key_states, cos, sin, position_ids):
         ) from exc
 
 
-def compute_post_rope_qk(self_attn, hidden_states, position_ids):
+def compute_post_rope_qk(
+    self_attn,
+    hidden_states,
+    position_ids,
+    apply_rotary_pos_emb_fn,
+    repeat_kv_fn,
+):
     batch_size, seq_len, _ = hidden_states.shape
     num_heads = self_attn.num_heads
     num_key_value_heads = getattr(self_attn, "num_key_value_heads", num_heads)
@@ -189,17 +214,24 @@ def compute_post_rope_qk(self_attn, hidden_states, position_ids):
     key_states = key_states.view(batch_size, seq_len, num_key_value_heads, head_dim).transpose(1, 2)
 
     cos, sin = get_rotary_cos_sin(self_attn, key_states, position_ids, seq_len)
-    query_states, key_states = apply_rope(query_states, key_states, cos, sin, position_ids)
+    query_states, key_states = apply_rope(
+        query_states,
+        key_states,
+        cos,
+        sin,
+        position_ids,
+        apply_rotary_pos_emb_fn,
+    )
 
     if key_states.shape[1] != query_states.shape[1]:
-        if repeat_kv is None:
+        if repeat_kv_fn is None:
             raise RuntimeError("repeat_kv is unavailable, but key/value heads differ from query heads")
         num_key_value_groups = getattr(
             self_attn,
             "num_key_value_groups",
             query_states.shape[1] // key_states.shape[1],
         )
-        key_states = repeat_kv(key_states, num_key_value_groups)
+        key_states = repeat_kv_fn(key_states, num_key_value_groups)
 
     return query_states, key_states
 
@@ -275,8 +307,7 @@ def main():
         rows = rows[:args.max_prompts]
 
     model, tokenizer, model_config = load_model_and_tokenizer(args.model)
-    if model_config["model_name"] != "Llama":
-        raise ValueError("analyze_attention_scores.py currently supports Llama models only")
+    apply_rotary_pos_emb_fn, repeat_kv_fn = get_attention_helpers(model_config["model_name"])
     model.eval()
 
     selected_heads = parse_heads(args.heads, model_config)
@@ -306,6 +337,8 @@ def main():
                 self_attn=self_attn,
                 hidden_states=captured_inputs[layer],
                 position_ids=position_ids,
+                apply_rotary_pos_emb_fn=apply_rotary_pos_emb_fn,
+                repeat_kv_fn=repeat_kv_fn,
             )
 
         for layer, head in selected_heads:
