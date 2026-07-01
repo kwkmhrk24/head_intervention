@@ -39,12 +39,12 @@ CSV_COLUMNS = [
     "window_size",
     "fro_norm",
     "sym_norm",
-    "skew_norm",
+    "asym_norm",
     "fro_norm_per_token",
     "sym_norm_per_token",
-    "skew_norm_per_token",
+    "asym_norm_per_token",
     "sym_ratio",
-    "skew_ratio",
+    "asym_ratio",
     "reconstruction_rel_error",
     "energy_rel_error",
 ]
@@ -254,23 +254,23 @@ def select_score_window(score_matrix, tail_tokens):
 def compute_metrics(score_matrix, eps=1e-12):
     seq_len = score_matrix.shape[-1]
     sym = (score_matrix + score_matrix.transpose(-1, -2)) / 2
-    skew = (score_matrix - score_matrix.transpose(-1, -2)) / 2
+    asym = (score_matrix - score_matrix.transpose(-1, -2)) / 2
 
     fro_norm = torch.linalg.matrix_norm(score_matrix, ord="fro")
     sym_norm = torch.linalg.matrix_norm(sym, ord="fro")
-    skew_norm = torch.linalg.matrix_norm(skew, ord="fro")
-    reconstruction_rel_error = torch.linalg.matrix_norm(score_matrix - (sym + skew), ord="fro") / (fro_norm + eps)
-    energy_rel_error = torch.abs(fro_norm ** 2 - sym_norm ** 2 - skew_norm ** 2) / (fro_norm ** 2 + eps)
+    asym_norm = torch.linalg.matrix_norm(asym, ord="fro")
+    reconstruction_rel_error = torch.linalg.matrix_norm(score_matrix - (sym + asym), ord="fro") / (fro_norm + eps)
+    energy_rel_error = torch.abs(fro_norm ** 2 - sym_norm ** 2 - asym_norm ** 2) / (fro_norm ** 2 + eps)
 
     return {
         "fro_norm": float(fro_norm.item()),
         "sym_norm": float(sym_norm.item()),
-        "skew_norm": float(skew_norm.item()),
+        "asym_norm": float(asym_norm.item()),
         "fro_norm_per_token": float((fro_norm / seq_len).item()),
         "sym_norm_per_token": float((sym_norm / seq_len).item()),
-        "skew_norm_per_token": float((skew_norm / seq_len).item()),
+        "asym_norm_per_token": float((asym_norm / seq_len).item()),
         "sym_ratio": float((sym_norm / (fro_norm + eps)).item()),
-        "skew_ratio": float((skew_norm / (fro_norm + eps)).item()),
+        "asym_ratio": float((asym_norm / (fro_norm + eps)).item()),
         "reconstruction_rel_error": float(reconstruction_rel_error.item()),
         "energy_rel_error": float(energy_rel_error.item()),
     }
@@ -288,7 +288,7 @@ def print_debug(metrics, full_score_matrix, score_window, selected_heads, window
     print(f"reconstruction_rel_error: {metrics['reconstruction_rel_error']}")
     print(f"energy_rel_error: {metrics['energy_rel_error']}")
     print(f"sym_ratio: {metrics['sym_ratio']}")
-    print(f"skew_ratio: {metrics['skew_ratio']}")
+    print(f"asym_ratio: {metrics['asym_ratio']}")
     if metrics["reconstruction_rel_error"] > 1e-5:
         print("WARNING: reconstruction_rel_error > 1e-5")
     if metrics["energy_rel_error"] > 1e-4:

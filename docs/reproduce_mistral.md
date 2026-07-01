@@ -53,6 +53,16 @@ The analysis uses the post-RoPE, pre-mask, pre-softmax score matrix
 `S = QK^T / sqrt(d_head)`. For Mistral GQA, key heads are repeated to match
 query heads in the same way as the Transformers Mistral attention implementation.
 
+The antisymmetric component is named `asym` in new outputs:
+
+```text
+S_asym = (S - S^T) / 2
+```
+
+New raw and summary CSVs use `asym_*` column names. The summarizer and plotter
+also accept legacy CSVs containing the former `skew_*` column names and normalize
+them to `asym_*` while reading.
+
 The existing argument for a tail window is `--tail_tokens`, and `--max_prompts 3`
 avoids creating separate three-row input files.
 

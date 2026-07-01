@@ -37,6 +37,15 @@ def require_columns(df, columns, label):
         raise ValueError(f"{label}: missing required columns: {missing}")
 
 
+def normalize_legacy_asym_columns(df):
+    rename_columns = {
+        column: column.replace("skew", "asym")
+        for column in df.columns
+        if "skew" in column and column.replace("skew", "asym") not in df.columns
+    }
+    return df.rename(columns=rename_columns)
+
+
 def parse_heads(heads):
     parsed = []
     for item in heads.split(";"):
@@ -81,14 +90,14 @@ def infer_window_label_from_path(path, fallback="tail20"):
 
 
 def get_delta_rows(summary_csv, groups):
-    df = pd.read_csv(summary_csv)
+    df = normalize_legacy_asym_columns(pd.read_csv(summary_csv))
     required = [
         "group",
         "condition",
         "delta_sym_ratio_mean",
-        "delta_skew_ratio_mean",
+        "delta_asym_ratio_mean",
         "sym_up_rate",
-        "skew_down_rate",
+        "asym_down_rate",
     ]
     require_columns(df, required, summary_csv)
     delta = df[df["condition"] == DELTA_CONDITION].copy()
@@ -123,16 +132,16 @@ def save_bar_plot(summary_csv, groups, output_dir):
 
     fig, ax = plt.subplots(figsize=(max(10, len(delta) * 1.4), 6))
     ax.bar(x - width / 2, delta["delta_sym_ratio_mean"], width, label="delta_sym_ratio_mean", color="#4477AA")
-    ax.bar(x + width / 2, delta["delta_skew_ratio_mean"], width, label="delta_skew_ratio_mean", color="#CC6677")
+    ax.bar(x + width / 2, delta["delta_asym_ratio_mean"], width, label="delta_asym_ratio_mean", color="#CC6677")
     ax.axhline(0, color="black", linewidth=1)
     ax.set_xticks(x)
     ax.set_xticklabels(delta["group"], rotation=30, ha="right")
     ax.set_ylabel("delta ratio")
-    ax.set_title(f"Jailbreak - Original: Symmetric / Skew Ratio Change ({window_label})")
+    ax.set_title(f"Jailbreak - Original: Symmetric / Asymmetric Ratio Change ({window_label})")
     ax.legend()
     ax.grid(axis="y", alpha=0.25)
     fig.tight_layout()
-    output_path = output_dir / f"{output_label}_delta_sym_skew_bar.png"
+    output_path = output_dir / f"{output_label}_delta_sym_asym_bar.png"
     fig.savefig(output_path, dpi=200)
     plt.close(fig)
     return output_path
@@ -147,7 +156,7 @@ def save_rate_plot(summary_csv, groups, output_dir):
 
     fig, ax = plt.subplots(figsize=(max(10, len(delta) * 1.4), 6))
     ax.bar(x - width / 2, delta["sym_up_rate"], width, label="sym_up_rate", color="#228833")
-    ax.bar(x + width / 2, delta["skew_down_rate"], width, label="skew_down_rate", color="#AA3377")
+    ax.bar(x + width / 2, delta["asym_down_rate"], width, label="asym_down_rate", color="#AA3377")
     ax.axhline(0.5, color="black", linewidth=1, linestyle="--")
     ax.set_ylim(0, 1)
     ax.set_xticks(x)
@@ -157,15 +166,15 @@ def save_rate_plot(summary_csv, groups, output_dir):
     ax.legend()
     ax.grid(axis="y", alpha=0.25)
     fig.tight_layout()
-    output_path = output_dir / f"{output_label}_sym_up_skew_down_rate_bar.png"
+    output_path = output_dir / f"{output_label}_sym_up_asym_down_rate_bar.png"
     fig.savefig(output_path, dpi=200)
     plt.close(fig)
     return output_path
 
 
 def load_raw_metrics(path, label):
-    df = pd.read_csv(path)
-    required = ["prompt_id", "source_index", "layer", "head", "sym_ratio", "skew_ratio"]
+    df = normalize_legacy_asym_columns(pd.read_csv(path))
+    required = ["prompt_id", "source_index", "layer", "head", "sym_ratio", "asym_ratio"]
     require_columns(df, required, label)
     return df
 
@@ -281,8 +290,8 @@ def main():
             window_label,
         ))
         outputs.append(save_heatmap(
-            compute_head_delta_grid(args.original_csv, args.jailbreak_csv, "skew_ratio"),
-            "skew_ratio",
+            compute_head_delta_grid(args.original_csv, args.jailbreak_csv, "asym_ratio"),
+            "asym_ratio",
             output_dir,
             paper_heads,
             window_label,
@@ -292,7 +301,7 @@ def main():
 
     if args.summary_csvs:
         outputs.append(save_window_comparison(args.summary_csvs, args.groups, output_dir, "sym_ratio"))
-        outputs.append(save_window_comparison(args.summary_csvs, args.groups, output_dir, "skew_ratio"))
+        outputs.append(save_window_comparison(args.summary_csvs, args.groups, output_dir, "asym_ratio"))
 
     if not outputs:
         raise ValueError("No plots requested. Provide --summary_csv, raw CSV pair, or --summary_csvs.")
