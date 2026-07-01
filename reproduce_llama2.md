@@ -323,10 +323,10 @@ Use the post-RoPE, pre-mask, pre-softmax score matrix so the analysis includes p
 
 ```text
 S_sym = (S + S^T) / 2
-S_skew = (S - S^T) / 2
+S_asym = (S - S^T) / 2
 ```
 
-The script saves scalar metrics such as Frobenius norms, symmetry/skew ratios, reconstruction error, and energy error to CSV. It does not save the score matrices themselves.
+The script saves scalar metrics such as Frobenius norms, symmetry/asymmetry ratios, reconstruction error, and energy error to CSV. It does not save the score matrices themselves.
 
 Start with the five paper heads:
 

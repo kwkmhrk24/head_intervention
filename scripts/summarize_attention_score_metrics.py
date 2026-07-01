@@ -14,9 +14,9 @@ REQUIRED_COLUMNS = {
     "window_size",
     "fro_norm_per_token",
     "sym_norm_per_token",
-    "skew_norm_per_token",
+    "asym_norm_per_token",
     "sym_ratio",
-    "skew_ratio",
+    "asym_ratio",
     "reconstruction_rel_error",
     "energy_rel_error",
 }
@@ -24,9 +24,9 @@ REQUIRED_COLUMNS = {
 SUMMARY_METRICS = [
     "fro_norm_per_token",
     "sym_norm_per_token",
-    "skew_norm_per_token",
+    "asym_norm_per_token",
     "sym_ratio",
-    "skew_ratio",
+    "asym_ratio",
 ]
 
 ERROR_METRICS = [
@@ -37,9 +37,9 @@ ERROR_METRICS = [
 DELTA_METRICS = [
     "fro_norm_per_token",
     "sym_norm_per_token",
-    "skew_norm_per_token",
+    "asym_norm_per_token",
     "sym_ratio",
-    "skew_ratio",
+    "asym_ratio",
 ]
 
 FIELDNAMES = [
@@ -55,26 +55,26 @@ FIELDNAMES = [
     "fro_norm_per_token_std",
     "sym_norm_per_token_mean",
     "sym_norm_per_token_std",
-    "skew_norm_per_token_mean",
-    "skew_norm_per_token_std",
+    "asym_norm_per_token_mean",
+    "asym_norm_per_token_std",
     "sym_ratio_mean",
     "sym_ratio_std",
-    "skew_ratio_mean",
-    "skew_ratio_std",
+    "asym_ratio_mean",
+    "asym_ratio_std",
     "reconstruction_rel_error_mean",
     "energy_rel_error_mean",
     "delta_fro_norm_per_token_mean",
     "delta_fro_norm_per_token_std",
     "delta_sym_norm_per_token_mean",
     "delta_sym_norm_per_token_std",
-    "delta_skew_norm_per_token_mean",
-    "delta_skew_norm_per_token_std",
+    "delta_asym_norm_per_token_mean",
+    "delta_asym_norm_per_token_std",
     "delta_sym_ratio_mean",
     "delta_sym_ratio_std",
-    "delta_skew_ratio_mean",
-    "delta_skew_ratio_std",
+    "delta_asym_ratio_mean",
+    "delta_asym_ratio_std",
     "sym_up_rate",
-    "skew_down_rate",
+    "asym_down_rate",
 ]
 
 
@@ -117,26 +117,38 @@ def to_float(value):
     return float(value)
 
 
+def normalize_legacy_asym_columns(row):
+    normalized = dict(row)
+    for column, value in row.items():
+        if "skew" in column:
+            normalized.setdefault(column.replace("skew", "asym"), value)
+    return normalized
+
+
 def read_metrics_csv(path):
     with Path(path).open(newline="") as f:
         reader = csv.DictReader(f)
         if reader.fieldnames is None:
             raise ValueError(f"{path}: empty CSV or missing header")
-        missing = REQUIRED_COLUMNS - set(reader.fieldnames)
+        available_columns = set(reader.fieldnames)
+        available_columns.update(
+            column.replace("skew", "asym")
+            for column in reader.fieldnames
+            if "skew" in column
+        )
+        missing = REQUIRED_COLUMNS - available_columns
         if missing:
             raise ValueError(f"{path}: missing required columns: {sorted(missing)}")
 
         rows = []
         for row in reader:
-            parsed = dict(row)
-            parsed["prompt_id"] = row["prompt_id"]
-            parsed["source_index"] = row["source_index"]
-            parsed["layer"] = int(row["layer"])
-            parsed["head"] = int(row["head"])
-            parsed["seq_len"] = to_float(row["seq_len"])
-            parsed["window_size"] = to_float(row["window_size"])
+            parsed = normalize_legacy_asym_columns(row)
+            parsed["layer"] = int(parsed["layer"])
+            parsed["head"] = int(parsed["head"])
+            parsed["seq_len"] = to_float(parsed["seq_len"])
+            parsed["window_size"] = to_float(parsed["window_size"])
             for metric in SUMMARY_METRICS + ERROR_METRICS:
-                parsed[metric] = to_float(row[metric])
+                parsed[metric] = to_float(parsed[metric])
             rows.append(parsed)
     return rows
 
@@ -275,8 +287,8 @@ def summarize_delta_group(rows, group, selected_heads):
     summary["sym_up_rate"] = rate_or_blank([
         row["delta_sym_ratio"] > 0 for row in selected_rows
     ])
-    summary["skew_down_rate"] = rate_or_blank([
-        row["delta_skew_ratio"] < 0 for row in selected_rows
+    summary["asym_down_rate"] = rate_or_blank([
+        row["delta_asym_ratio"] < 0 for row in selected_rows
     ])
     return summary
 
