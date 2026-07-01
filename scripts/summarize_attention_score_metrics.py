@@ -29,6 +29,14 @@ SUMMARY_METRICS = [
     "asym_ratio",
 ]
 
+LOWER_TRIANGLE_METRICS = [
+    "asym_lower_pos_rate",
+    "asym_lower_neg_rate",
+    "asym_lower_zero_rate",
+    "asym_lower_mean",
+    "asym_lower_abs_mean",
+]
+
 ERROR_METRICS = [
     "reconstruction_rel_error",
     "energy_rel_error",
@@ -61,6 +69,16 @@ FIELDNAMES = [
     "sym_ratio_std",
     "asym_ratio_mean",
     "asym_ratio_std",
+    "asym_lower_pos_rate_mean",
+    "asym_lower_pos_rate_std",
+    "asym_lower_neg_rate_mean",
+    "asym_lower_neg_rate_std",
+    "asym_lower_zero_rate_mean",
+    "asym_lower_zero_rate_std",
+    "asym_lower_mean_mean",
+    "asym_lower_mean_std",
+    "asym_lower_abs_mean_mean",
+    "asym_lower_abs_mean_std",
     "reconstruction_rel_error_mean",
     "energy_rel_error_mean",
     "delta_fro_norm_per_token_mean",
@@ -73,8 +91,20 @@ FIELDNAMES = [
     "delta_sym_ratio_std",
     "delta_asym_ratio_mean",
     "delta_asym_ratio_std",
+    "delta_asym_lower_pos_rate_mean",
+    "delta_asym_lower_pos_rate_std",
+    "delta_asym_lower_neg_rate_mean",
+    "delta_asym_lower_neg_rate_std",
+    "delta_asym_lower_zero_rate_mean",
+    "delta_asym_lower_zero_rate_std",
+    "delta_asym_lower_mean_mean",
+    "delta_asym_lower_mean_std",
+    "delta_asym_lower_abs_mean_mean",
+    "delta_asym_lower_abs_mean_std",
     "sym_up_rate",
     "asym_down_rate",
+    "asym_lower_pos_up_rate",
+    "asym_lower_mean_up_rate",
 ]
 
 
@@ -143,14 +173,31 @@ def read_metrics_csv(path):
         rows = []
         for row in reader:
             parsed = normalize_legacy_asym_columns(row)
+            present_lower_metrics = [
+                metric for metric in LOWER_TRIANGLE_METRICS if metric in parsed
+            ]
+            if present_lower_metrics and len(present_lower_metrics) != len(LOWER_TRIANGLE_METRICS):
+                missing_lower_metrics = sorted(
+                    set(LOWER_TRIANGLE_METRICS) - set(present_lower_metrics)
+                )
+                raise ValueError(
+                    f"{path}: row {reader.line_num} has incomplete lower-triangle metrics; "
+                    f"missing: {missing_lower_metrics}"
+                )
             parsed["layer"] = int(parsed["layer"])
             parsed["head"] = int(parsed["head"])
             parsed["seq_len"] = to_float(parsed["seq_len"])
             parsed["window_size"] = to_float(parsed["window_size"])
             for metric in SUMMARY_METRICS + ERROR_METRICS:
                 parsed[metric] = to_float(parsed[metric])
+            for metric in present_lower_metrics:
+                parsed[metric] = to_float(parsed[metric])
             rows.append(parsed)
     return rows
+
+
+def has_lower_triangle_metrics(rows):
+    return bool(rows) and all(metric in rows[0] for metric in LOWER_TRIANGLE_METRICS)
 
 
 def validate_heads_present(rows, heads, label):
@@ -216,11 +263,11 @@ def base_summary_row(rows, group, condition):
     }
 
 
-def summarize_condition(rows, group, condition):
+def summarize_condition(rows, group, condition, summary_metrics):
     selected_rows = group_rows(rows, group, [])
     summary = base_summary_row(selected_rows, group, condition)
 
-    for metric in SUMMARY_METRICS:
+    for metric in summary_metrics:
         summary[f"{metric}_mean"] = mean_or_blank([row[metric] for row in selected_rows])
         summary[f"{metric}_std"] = std_or_blank([row[metric] for row in selected_rows])
 
@@ -230,11 +277,11 @@ def summarize_condition(rows, group, condition):
     return summary
 
 
-def summarize_condition_group(rows, group, condition, selected_heads):
+def summarize_condition_group(rows, group, condition, selected_heads, summary_metrics):
     selected_rows = group_rows(rows, group, selected_heads)
     summary = base_summary_row(selected_rows, group, condition)
 
-    for metric in SUMMARY_METRICS:
+    for metric in summary_metrics:
         summary[f"{metric}_mean"] = mean_or_blank([row[metric] for row in selected_rows])
         summary[f"{metric}_std"] = std_or_blank([row[metric] for row in selected_rows])
 
@@ -248,7 +295,7 @@ def make_pair_key(row):
     return (row["prompt_id"], row["source_index"], row["layer"], row["head"])
 
 
-def compute_delta_rows(original_rows, jailbreak_rows):
+def compute_delta_rows(original_rows, jailbreak_rows, delta_metrics):
     original_by_key = {make_pair_key(row): row for row in original_rows}
     jailbreak_by_key = {make_pair_key(row): row for row in jailbreak_rows}
     shared_keys = sorted(set(original_by_key) & set(jailbreak_by_key))
@@ -268,18 +315,18 @@ def compute_delta_rows(original_rows, jailbreak_rows):
             "window_type": jailbreak["window_type"],
             "window_size": jailbreak["window_size"],
         }
-        for metric in DELTA_METRICS:
+        for metric in delta_metrics:
             row[f"delta_{metric}"] = jailbreak[metric] - original[metric]
         delta_rows.append(row)
 
     return delta_rows
 
 
-def summarize_delta_group(rows, group, selected_heads):
+def summarize_delta_group(rows, group, selected_heads, delta_metrics, include_lower_metrics):
     selected_rows = group_rows(rows, group, selected_heads)
     summary = base_summary_row(selected_rows, group, "delta_jailbreak_minus_original")
 
-    for metric in DELTA_METRICS:
+    for metric in delta_metrics:
         delta_metric = f"delta_{metric}"
         summary[f"{delta_metric}_mean"] = mean_or_blank([row[delta_metric] for row in selected_rows])
         summary[f"{delta_metric}_std"] = std_or_blank([row[delta_metric] for row in selected_rows])
@@ -290,6 +337,13 @@ def summarize_delta_group(rows, group, selected_heads):
     summary["asym_down_rate"] = rate_or_blank([
         row["delta_asym_ratio"] < 0 for row in selected_rows
     ])
+    if include_lower_metrics:
+        summary["asym_lower_pos_up_rate"] = rate_or_blank([
+            row["delta_asym_lower_pos_rate"] > 0 for row in selected_rows
+        ])
+        summary["asym_lower_mean_up_rate"] = rate_or_blank([
+            row["delta_asym_lower_mean"] > 0 for row in selected_rows
+        ])
     return summary
 
 
@@ -301,6 +355,18 @@ def main():
     jailbreak_rows = read_metrics_csv(args.jailbreak_csv)
     safe_rows = read_metrics_csv(args.safe_csv) if args.safe_csv else None
 
+    input_sets = [original_rows, jailbreak_rows]
+    if safe_rows is not None:
+        input_sets.append(safe_rows)
+    lower_metric_flags = [has_lower_triangle_metrics(rows) for rows in input_sets]
+    if len(set(lower_metric_flags)) != 1:
+        raise ValueError(
+            "Input CSVs must either all contain lower-triangle metrics or all omit them"
+        )
+    include_lower_metrics = lower_metric_flags[0]
+    summary_metrics = SUMMARY_METRICS + LOWER_TRIANGLE_METRICS if include_lower_metrics else SUMMARY_METRICS
+    delta_metrics = DELTA_METRICS + LOWER_TRIANGLE_METRICS if include_lower_metrics else DELTA_METRICS
+
     validate_heads_present(original_rows, selected_heads, args.original_csv)
     validate_heads_present(jailbreak_rows, selected_heads, args.jailbreak_csv)
     if safe_rows is not None:
@@ -310,14 +376,22 @@ def main():
     output_rows = []
 
     for group in groups:
-        output_rows.append(summarize_condition_group(original_rows, group, "original", selected_heads))
-        output_rows.append(summarize_condition_group(jailbreak_rows, group, "jailbreak", selected_heads))
+        output_rows.append(summarize_condition_group(
+            original_rows, group, "original", selected_heads, summary_metrics
+        ))
+        output_rows.append(summarize_condition_group(
+            jailbreak_rows, group, "jailbreak", selected_heads, summary_metrics
+        ))
         if safe_rows is not None:
-            output_rows.append(summarize_condition_group(safe_rows, group, "safe", selected_heads))
+            output_rows.append(summarize_condition_group(
+                safe_rows, group, "safe", selected_heads, summary_metrics
+            ))
 
-    delta_rows = compute_delta_rows(original_rows, jailbreak_rows)
+    delta_rows = compute_delta_rows(original_rows, jailbreak_rows, delta_metrics)
     for group in groups:
-        output_rows.append(summarize_delta_group(delta_rows, group, selected_heads))
+        output_rows.append(summarize_delta_group(
+            delta_rows, group, selected_heads, delta_metrics, include_lower_metrics
+        ))
 
     output_path = Path(args.output_csv)
     output_path.parent.mkdir(parents=True, exist_ok=True)
