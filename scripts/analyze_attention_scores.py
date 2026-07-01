@@ -45,6 +45,11 @@ CSV_COLUMNS = [
     "asym_norm_per_token",
     "sym_ratio",
     "asym_ratio",
+    "asym_lower_pos_rate",
+    "asym_lower_neg_rate",
+    "asym_lower_zero_rate",
+    "asym_lower_mean",
+    "asym_lower_abs_mean",
     "reconstruction_rel_error",
     "energy_rel_error",
 ]
@@ -259,6 +264,16 @@ def compute_metrics(score_matrix, eps=1e-12):
     fro_norm = torch.linalg.matrix_norm(score_matrix, ord="fro")
     sym_norm = torch.linalg.matrix_norm(sym, ord="fro")
     asym_norm = torch.linalg.matrix_norm(asym, ord="fro")
+    lower_indices = torch.tril_indices(seq_len, seq_len, offset=-1, device=score_matrix.device)
+    asym_lower = asym[lower_indices[0], lower_indices[1]]
+    if asym_lower.numel() == 0:
+        raise ValueError("Attention score window must contain at least two tokens")
+
+    asym_lower_pos_rate = (asym_lower > 0).float().mean()
+    asym_lower_neg_rate = (asym_lower < 0).float().mean()
+    asym_lower_zero_rate = (asym_lower == 0).float().mean()
+    asym_lower_mean = asym_lower.mean()
+    asym_lower_abs_mean = asym_lower.abs().mean()
     reconstruction_rel_error = torch.linalg.matrix_norm(score_matrix - (sym + asym), ord="fro") / (fro_norm + eps)
     energy_rel_error = torch.abs(fro_norm ** 2 - sym_norm ** 2 - asym_norm ** 2) / (fro_norm ** 2 + eps)
 
@@ -271,6 +286,11 @@ def compute_metrics(score_matrix, eps=1e-12):
         "asym_norm_per_token": float((asym_norm / seq_len).item()),
         "sym_ratio": float((sym_norm / (fro_norm + eps)).item()),
         "asym_ratio": float((asym_norm / (fro_norm + eps)).item()),
+        "asym_lower_pos_rate": float(asym_lower_pos_rate.item()),
+        "asym_lower_neg_rate": float(asym_lower_neg_rate.item()),
+        "asym_lower_zero_rate": float(asym_lower_zero_rate.item()),
+        "asym_lower_mean": float(asym_lower_mean.item()),
+        "asym_lower_abs_mean": float(asym_lower_abs_mean.item()),
         "reconstruction_rel_error": float(reconstruction_rel_error.item()),
         "energy_rel_error": float(energy_rel_error.item()),
     }
@@ -289,6 +309,8 @@ def print_debug(metrics, full_score_matrix, score_window, selected_heads, window
     print(f"energy_rel_error: {metrics['energy_rel_error']}")
     print(f"sym_ratio: {metrics['sym_ratio']}")
     print(f"asym_ratio: {metrics['asym_ratio']}")
+    print(f"asym_lower_pos_rate: {metrics['asym_lower_pos_rate']}")
+    print(f"asym_lower_mean: {metrics['asym_lower_mean']}")
     if metrics["reconstruction_rel_error"] > 1e-5:
         print("WARNING: reconstruction_rel_error > 1e-5")
     if metrics["energy_rel_error"] > 1e-4:

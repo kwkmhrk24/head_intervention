@@ -63,6 +63,19 @@ New raw and summary CSVs use `asym_*` column names. The summarizer and plotter
 also accept legacy CSVs containing the former `skew_*` column names and normalize
 them to `asym_*` while reading.
 
+For direction-sensitive analysis, the strict lower triangle (`i > j`) of
+`S_asym` is measured after the requested full or tail window has been selected.
+New raw CSVs include:
+
+- `asym_lower_pos_rate`, `asym_lower_neg_rate`, `asym_lower_zero_rate`
+- `asym_lower_mean`, `asym_lower_abs_mean`
+
+The summarizer reports mean/std, jailbreak-minus-original deltas, and the
+direction-agreement rates `asym_lower_pos_up_rate` and
+`asym_lower_mean_up_rate`. Legacy raw CSVs without the lower-triangle columns
+still produce the previous summaries, with the new summary columns left blank.
+Regenerate raw CSVs to use the new metrics.
+
 The existing argument for a tail window is `--tail_tokens`, and `--max_prompts 3`
 avoids creating separate three-row input files.
 
@@ -148,3 +161,27 @@ python scripts/plot_attention_score_metrics.py \
   --output_dir data/outputs/mistral/attention_scores/smoke/figures_aie_top10 \
   --groups all_heads selected_heads_mean
 ```
+
+For the AIE top-five comparison within the top-10 set:
+
+```bash
+python scripts/plot_attention_score_metrics.py \
+  --summary_csv data/outputs/mistral/attention_scores/autodan_tail20/summary_aie_top10_tail20.csv \
+  --output_dir data/outputs/mistral/attention_scores/autodan_tail20/figures_aie_top10_top5 \
+  --groups \
+    all_heads \
+    selected_heads_mean \
+    layer30_head3 \
+    layer16_head15 \
+    layer14_head27 \
+    layer24_head9 \
+    layer18_head11
+```
+
+In addition to the existing plots, a summary containing lower-triangle metrics
+produces:
+
+- `tail20_delta_asym_lower_pos_rate_bar.png`
+- `tail20_asym_lower_pos_up_rate_bar.png`
+- `tail20_delta_asym_lower_mean_bar.png`
+- `tail20_delta_asym_lower_abs_mean_bar.png`

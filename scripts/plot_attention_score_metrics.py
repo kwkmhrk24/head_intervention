@@ -172,6 +172,42 @@ def save_rate_plot(summary_csv, groups, output_dir):
     return output_path
 
 
+def save_lower_triangle_bar(summary_csv, groups, output_dir, metric, title, filename_suffix, color):
+    delta = get_delta_rows(summary_csv, groups)
+    require_columns(delta, [metric], summary_csv)
+    if delta[metric].isna().all():
+        raise ValueError(f"{summary_csv}: no values found for {metric}")
+
+    window_label = infer_window_label(delta, fallback="tail")
+    output_label = filename_window_label(window_label)
+    x = np.arange(len(delta))
+
+    fig, ax = plt.subplots(figsize=(max(10, len(delta) * 1.4), 6))
+    ax.bar(x, delta[metric], color=color)
+    ax.axhline(0, color="black", linewidth=1)
+    ax.set_xticks(x)
+    ax.set_xticklabels(delta["group"], rotation=30, ha="right")
+    ax.set_ylabel(metric)
+    ax.set_title(f"{title} ({window_label})")
+    ax.grid(axis="y", alpha=0.25)
+    fig.tight_layout()
+    output_path = output_dir / f"{output_label}_{filename_suffix}.png"
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+    return output_path
+
+
+def summary_has_lower_triangle_metrics(summary_csv):
+    df = normalize_legacy_asym_columns(pd.read_csv(summary_csv))
+    required = [
+        "delta_asym_lower_pos_rate_mean",
+        "asym_lower_pos_up_rate",
+        "delta_asym_lower_mean_mean",
+        "delta_asym_lower_abs_mean_mean",
+    ]
+    return all(column in df.columns and df[column].notna().any() for column in required)
+
+
 def load_raw_metrics(path, label):
     df = normalize_legacy_asym_columns(pd.read_csv(path))
     required = ["prompt_id", "source_index", "layer", "head", "sym_ratio", "asym_ratio"]
@@ -278,6 +314,43 @@ def main():
     if args.summary_csv:
         outputs.append(save_bar_plot(args.summary_csv, args.groups, output_dir))
         outputs.append(save_rate_plot(args.summary_csv, args.groups, output_dir))
+        if summary_has_lower_triangle_metrics(args.summary_csv):
+            outputs.append(save_lower_triangle_bar(
+                args.summary_csv,
+                args.groups,
+                output_dir,
+                "delta_asym_lower_pos_rate_mean",
+                "Jailbreak - Original: Lower-triangle Positive Rate in S_asym",
+                "delta_asym_lower_pos_rate_bar",
+                "#4477AA",
+            ))
+            outputs.append(save_lower_triangle_bar(
+                args.summary_csv,
+                args.groups,
+                output_dir,
+                "asym_lower_pos_up_rate",
+                "Prompt-wise Direction Agreement: Lower-triangle Positive Rate",
+                "asym_lower_pos_up_rate_bar",
+                "#228833",
+            ))
+            outputs.append(save_lower_triangle_bar(
+                args.summary_csv,
+                args.groups,
+                output_dir,
+                "delta_asym_lower_mean_mean",
+                "Jailbreak - Original: Lower-triangle Mean in S_asym",
+                "delta_asym_lower_mean_bar",
+                "#CC6677",
+            ))
+            outputs.append(save_lower_triangle_bar(
+                args.summary_csv,
+                args.groups,
+                output_dir,
+                "delta_asym_lower_abs_mean_mean",
+                "Jailbreak - Original: Lower-triangle Absolute Mean in S_asym",
+                "delta_asym_lower_abs_mean_bar",
+                "#AA3377",
+            ))
 
     if args.original_csv and args.jailbreak_csv:
         paper_heads = parse_heads(args.paper_heads)
