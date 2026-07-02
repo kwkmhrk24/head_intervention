@@ -44,7 +44,7 @@ Observed local data formats:
 
 AutoDAN is the primary prepared attack set for reproduction. `data/raw/llama2/AutoDAN_llama2.jsonl` has 130 records, and its indices correspond to `data/raw/advbench.jsonl`. The local `data/raw/llama2/llama2_AutoDAN.json` also matches the JSONL by count, index, and prompt.
 
-GCG is tentative. `data/raw/llama2/GCG_llama2.jsonl` indices exist in `data/raw/advbench.jsonl`, but its mapping to `data/raw/llama2/llama2_GCG.json` is not fully aligned. Do not treat generated GCG pairs as confirmed until this mapping is checked.
+GCG pairing is prepared by longest AdvBench prompt-prefix matching. The 157 matched rows all satisfy `advbench_index = raw_index + 60`; the three known wording variants fall back to AdvBench indices 63, 93, and 105 only after that invariant is validated.
 
 For refusal activations, use `data/raw/xstest.jsonl` as the first candidate and derive `data/derived/llama2/refusal/xstest_prompts.jsonl`.
 
@@ -83,17 +83,10 @@ After regeneration, keep the experiment-facing files at:
 - `data/derived/llama2/autodan/jailbreak_prompts.jsonl`
 - `data/derived/llama2/refusal/xstest_prompts.jsonl`
 
-Optional tentative GCG dry-run:
+Prepare canonical paired GCG data for both Llama2 and Mistral:
 
 ```bash
-python scripts/prepare_llama2_repro_data.py \
-  --advbench data/raw/advbench.jsonl \
-  --autodan data/raw/llama2/AutoDAN_llama2.jsonl \
-  --gcg data/raw/llama2/GCG_llama2.jsonl \
-  --xstest data/raw/xstest.jsonl \
-  --output-dir data/derived/llama2/gcg \
-  --include-gcg \
-  --dry-run
+python scripts/prepare_gcg_repro_data.py
 ```
 
 Expected derived files:
@@ -102,10 +95,12 @@ Expected derived files:
 - `data/derived/llama2/autodan/jailbreak_prompts.jsonl`
 - `data/derived/llama2/refusal/xstest_prompts.jsonl`
 
-Optional tentative GCG files:
+Canonical GCG files:
 
 - `data/derived/llama2/gcg/original_prompts.jsonl`
 - `data/derived/llama2/gcg/jailbreak_prompts.jsonl`
+- `data/derived/llama2/gcg/original_prompts_10.jsonl`
+- `data/derived/llama2/gcg/jailbreak_prompts_10.jsonl`
 
 ## Model Load Check
 

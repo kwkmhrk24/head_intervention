@@ -40,6 +40,16 @@ data/derived/mistral/gcg/original_prompts.jsonl
 data/derived/mistral/gcg/jailbreak_prompts.jsonl
 ```
 
+Prepare paired Llama2 and Mistral GCG datasets from the raw files:
+
+```bash
+python scripts/prepare_gcg_repro_data.py
+```
+
+For Mistral, every GCG prompt must match an AdvBench prompt prefix. The script
+writes the full 100-row pair and the first 10 paired rows to
+`data/derived/mistral/gcg/`. It also prepares the corresponding Llama2 files.
+
 ## Current cautions
 
 - Using Llama2 AutoDAN/GCG prompts with Mistral is a reference experiment, not a strict Mistral reproduction.
