@@ -49,12 +49,14 @@ python scripts/prepare_gcg_repro_data.py
 For Mistral, every GCG prompt must match an AdvBench prompt prefix. The script
 writes the full 100-row pair and the first 10 paired rows to
 `data/derived/mistral/gcg/`. It also prepares the corresponding Llama2 files.
+The Mistral GCG derived datasets have been created from
+`data/raw/mistral/GCG_mistral.jsonl` and are ready for Mistral-specific runs.
 
 ## Current cautions
 
-- Using Llama2 AutoDAN/GCG prompts with Mistral is a reference experiment, not a strict Mistral reproduction.
-- Confirm that paired Mistral AutoDAN/GCG original and jailbreak prompts exist before starting experiments.
-- If Mistral-specific data is unavailable, decide the data-preparation policy in the next phase.
+- Use `data/derived/mistral/gcg/` for the Mistral GCG reproduction condition.
+- Running Llama2-generated AutoDAN/GCG prompts against Mistral is a transfer/reference experiment, not the Mistral-specific reproduction condition.
+- Keep Mistral-derived and Llama2-derived attack results labeled separately when comparing models.
 - Decide whether to use `--append_target_space` only after reviewing the target-token diagnostics.
 
 ## Attention-score decomposition smoke test

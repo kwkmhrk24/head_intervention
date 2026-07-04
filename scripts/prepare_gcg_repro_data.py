@@ -4,7 +4,7 @@ from pathlib import Path
 
 
 LLAMA2_FALLBACK_OFFSET = 60
-EXPECTED_LLAMA2_FALLBACK_INDICES = {63, 93, 105}
+EXPECTED_LLAMA2_FALLBACK_INDICES = [63, 93, 105]
 
 
 def get_args():
@@ -176,10 +176,18 @@ def main():
         advbench_by_index,
         fallback_offset=LLAMA2_FALLBACK_OFFSET,
     )
-    if set(llama2_stats["fallback_advbench_indices"]) != EXPECTED_LLAMA2_FALLBACK_INDICES:
+    actual_fallback_indices = sorted(llama2_stats["fallback_advbench_indices"])
+    expected_fallback_count = len(EXPECTED_LLAMA2_FALLBACK_INDICES)
+    if (
+        llama2_stats["fallback"] != expected_fallback_count
+        or actual_fallback_indices != EXPECTED_LLAMA2_FALLBACK_INDICES
+    ):
         raise ValueError(
-            "llama2: unexpected fallback AdvBench indices: "
-            f"{llama2_stats['fallback_advbench_indices']}"
+            "llama2: unexpected fallback mapping: "
+            f"count={llama2_stats['fallback']} "
+            f"indices={actual_fallback_indices}; "
+            f"expected count={expected_fallback_count} "
+            f"indices={EXPECTED_LLAMA2_FALLBACK_INDICES}"
         )
 
     mistral_original, mistral_jailbreak, mistral_stats = build_pairs(
