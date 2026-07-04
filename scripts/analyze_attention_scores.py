@@ -21,6 +21,13 @@ except ImportError:
     mistral_apply_rotary_pos_emb = None
     mistral_repeat_kv = None
 
+try:
+    from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb as qwen_apply_rotary_pos_emb
+    from transformers.models.qwen2.modeling_qwen2 import repeat_kv as qwen_repeat_kv
+except ImportError:
+    qwen_apply_rotary_pos_emb = None
+    qwen_repeat_kv = None
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -159,7 +166,24 @@ def capture_self_attn_inputs(model, layers, inputs):
     return captured
 
 
-def get_rotary_cos_sin(self_attn, key_states, position_ids, seq_len):
+def get_rotary_cos_sin(self_attn, key_states, position_ids, seq_len, model_name):
+    if model_name == "Qwen":
+        try:
+            return self_attn.rotary_emb(key_states, seq_len=seq_len)
+        except TypeError:
+            try:
+                return self_attn.rotary_emb(key_states, position_ids)
+            except (TypeError, RuntimeError) as exc:
+                raise RuntimeError(
+                    "Unable to compute post-RoPE Q/K with the Qwen2 rotary embedding API. "
+                    "Refusing to fall back to pre-RoPE scores."
+                ) from exc
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "Unable to compute post-RoPE Q/K with the Qwen2 rotary embedding API. "
+                "Refusing to fall back to pre-RoPE scores."
+            ) from exc
+
     try:
         return self_attn.rotary_emb(key_states, position_ids)
     except TypeError:
@@ -181,6 +205,12 @@ def get_attention_helpers(model_name):
                 "Mistral attention helpers are unavailable in this transformers installation"
             )
         return mistral_apply_rotary_pos_emb, mistral_repeat_kv
+    if model_name == "Qwen":
+        if qwen_apply_rotary_pos_emb is None or qwen_repeat_kv is None:
+            raise RuntimeError(
+                "Qwen2 attention helpers are unavailable in this transformers installation"
+            )
+        return qwen_apply_rotary_pos_emb, qwen_repeat_kv
     raise ValueError(f"Unsupported model for attention score analysis: {model_name}")
 
 
@@ -206,11 +236,17 @@ def compute_post_rope_qk(
     position_ids,
     apply_rotary_pos_emb_fn,
     repeat_kv_fn,
+    model_name,
 ):
     batch_size, seq_len, _ = hidden_states.shape
     num_heads = self_attn.num_heads
     num_key_value_heads = getattr(self_attn, "num_key_value_heads", num_heads)
-    head_dim = self_attn.head_dim
+    head_dim = getattr(self_attn, "head_dim", None)
+    if head_dim is None:
+        q_proj_out_features = getattr(self_attn.q_proj, "out_features", None)
+        if q_proj_out_features is None or q_proj_out_features % num_heads != 0:
+            raise RuntimeError("Unable to determine attention head_dim from q_proj")
+        head_dim = q_proj_out_features // num_heads
 
     query_states = self_attn.q_proj(hidden_states)
     key_states = self_attn.k_proj(hidden_states)
@@ -218,7 +254,13 @@ def compute_post_rope_qk(
     query_states = query_states.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
     key_states = key_states.view(batch_size, seq_len, num_key_value_heads, head_dim).transpose(1, 2)
 
-    cos, sin = get_rotary_cos_sin(self_attn, key_states, position_ids, seq_len)
+    cos, sin = get_rotary_cos_sin(
+        self_attn,
+        key_states,
+        position_ids,
+        seq_len,
+        model_name,
+    )
     query_states, key_states = apply_rope(
         query_states,
         key_states,
@@ -361,6 +403,7 @@ def main():
                 position_ids=position_ids,
                 apply_rotary_pos_emb_fn=apply_rotary_pos_emb_fn,
                 repeat_kv_fn=repeat_kv_fn,
+                model_name=model_config["model_name"],
             )
 
         for layer, head in selected_heads:
