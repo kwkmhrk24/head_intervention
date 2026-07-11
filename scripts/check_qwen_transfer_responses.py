@@ -119,6 +119,15 @@ def build_generation_kwargs(args):
             kwargs["temperature"] = args.temperature
         if args.top_p is not None:
             kwargs["top_p"] = args.top_p
+    else:
+        # Qwen model generation_config may contain sampling defaults; reset them
+        # for greedy decoding to avoid Transformers warnings without changing
+        # the deterministic generation behavior.
+        kwargs.update({
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "top_k": 50,
+        })
     return kwargs
 
 
