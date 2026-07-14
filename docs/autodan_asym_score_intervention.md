@@ -108,7 +108,39 @@ The heads were selected from tail16 analysis, but intervention applies to the
 entire square score matrix at every forward call, not only the final 16×16
 window.
 
-The elementwise sets are loaded from:
+The default comparison uses the paper heads and three fixed
+`delta_asym_ratio` head sets selected from the 20-prompt seed-42 selection
+split:
+
+```text
+paper:
+  (3,0), (7,16), (9,9), (13,4), (3,5)
+
+positive:
+  (1,8), (7,25), (9,30), (12,27), (29,30)
+
+negative:
+  (13,5), (18,29), (6,1), (17,23), (24,13)
+
+absolute:
+  (1,8), (7,25), (13,5), (9,30), (12,27)
+```
+
+The paper set comes from the prior intervention setup. `positive` ranks heads
+by decreasing `mean_delta_asym_ratio`, `negative` ranks by increasing
+`mean_delta_asym_ratio`, and `absolute` ranks by decreasing
+`abs(mean_delta_asym_ratio)`. Positive and negative describe the direction of
+the metric change; they do not mean that a head is intrinsically safe or
+dangerous. The official condition name is `absolute`; `ab` is accepted only as
+a CLI alias and is normalized to `absolute` in condition names and outputs.
+
+These sets are fixed. They are not reranked using the 110-prompt evaluation
+split. Metadata identifies their family as `delta_asym_ratio`, their metric as
+`mean_delta_asym_ratio`, and their split as `selection_20_seed42`.
+
+The elementwise-consistency sets remain implemented for later experiments.
+They are loaded only when an `element_*` condition is explicitly selected,
+from:
 
 ```text
 data/outputs/llama2/autodan/holdout_seed42/
@@ -118,9 +150,6 @@ data/outputs/llama2/autodan/holdout_seed42/
 and fail-fast checked against:
 
 ```text
-paper:
-  (3,0), (7,16), (9,9), (13,4), (3,5)
-
 element_positive:
   (14,11), (11,24), (8,7), (7,22), (9,10)
 
@@ -130,6 +159,11 @@ element_negative:
 element_absolute:
   (31,22), (8,29), (10,30), (11,12), (9,15)
 ```
+
+`--elementwise-heads` is therefore optional for the default
+`paper,positive,negative,absolute` run and required for any `element_*` run.
+The ratio and elementwise names refer to different fixed head sets and are not
+interchangeable.
 
 ## Numerical diagnostics
 
@@ -199,7 +233,6 @@ cd /home/h.kawakami/ulab/m/head_intervention_defense-main
   --model /mnt/mp_nas_mks/labmember/h.kawakami/models/Llama-2-7b-chat-hf \
   --input-file data/derived/llama2/autodan/holdout_seed42/evaluation_jailbreak_prompts.jsonl \
   --split-manifest data/derived/llama2/autodan/holdout_seed42/split_manifest.json \
-  --elementwise-heads data/outputs/llama2/autodan/holdout_seed42/elementwise_head_metrics_tail16/top_heads_by_metric.json \
   --source-labels data/raw/llama2/llama2_AutoDAN.json \
   --historical-baseline-results data/outputs/llama2/autodan/baseline_alignment/no_intervention_prompt_results.jsonl \
   --conditions paper \
@@ -210,7 +243,93 @@ cd /home/h.kawakami/ulab/m/head_intervention_defense-main
   --output-dir data/outputs/llama2/autodan/holdout_seed42/asym_score_equivalence_smoke_v2
 ```
 
-## Three-prompt intervention smoke command
+## Three-prompt ratio-headset smoke command
+
+Run this later in the user GPU environment. The automatic one-prompt beta-zero
+equivalence preflight still runs before any positive-beta condition.
+
+```bash
+cd /home/h.kawakami/ulab/m/head_intervention_defense-main
+
+mkdir -p logs
+
+/home/h.kawakami/miniconda3/envs/head-intervention/bin/python \
+  scripts/evaluate_autodan_asym_score_intervention.py \
+  --model /mnt/mp_nas_mks/labmember/h.kawakami/models/Llama-2-7b-chat-hf \
+  --input-file data/derived/llama2/autodan/holdout_seed42/evaluation_jailbreak_prompts.jsonl \
+  --split-manifest data/derived/llama2/autodan/holdout_seed42/split_manifest.json \
+  --source-labels data/raw/llama2/llama2_AutoDAN.json \
+  --historical-baseline-results data/outputs/llama2/autodan/baseline_alignment/no_intervention_prompt_results.jsonl \
+  --conditions paper,positive,negative,absolute \
+  --betas 0.5,1.0 \
+  --max-prompts 3 \
+  --max-new-tokens 32 \
+  --seed 42 \
+  --output-dir data/outputs/llama2/autodan/holdout_seed42/asym_score_ratio_headsets_smoke \
+  2>&1 | tee logs/asym_score_ratio_headsets_smoke.log
+```
+
+After the GPU run, validate structural and numerical smoke criteria with:
+
+```bash
+/home/h.kawakami/miniconda3/envs/head-intervention/bin/python - <<'PY'
+import json
+from pathlib import Path
+
+root = Path(
+    "data/outputs/llama2/autodan/holdout_seed42/"
+    "asym_score_ratio_headsets_smoke"
+)
+conditions = [
+    "no_intervention",
+    "beta_zero_control",
+    "paper_beta_0.5",
+    "paper_beta_1",
+    "positive_beta_0.5",
+    "positive_beta_1",
+    "negative_beta_0.5",
+    "negative_beta_1",
+    "absolute_beta_0.5",
+    "absolute_beta_1",
+]
+
+with (root / "beta_zero_equivalence.json").open() as handle:
+    equivalence = json.load(handle)
+assert equivalence["passed"] is True
+assert equivalence["generation_score_diagnostics"][
+    "all_score_matrices_square"
+] is True
+
+for condition in conditions:
+    with (root / condition / "summary.json").open() as handle:
+        summary = json.load(handle)
+    with (root / condition / "prompt_results.jsonl").open() as handle:
+        rows = [json.loads(line) for line in handle if line.strip()]
+
+    assert summary["generation_failure_count"] == 0, condition
+    assert summary["max_intervention_identity_error"] <= 1e-5, condition
+    assert summary["max_symmetric_component_error"] <= 1e-5, condition
+    assert summary["max_unselected_head_error"] <= 1e-5, condition
+    assert all(
+        isinstance(row["response"], str) and row["response"].strip()
+        for row in rows
+    )
+
+    if condition != "no_intervention":
+        assert all(row["all_score_matrices_square"] is True for row in rows)
+    if summary["beta"] == 0.5:
+        assert abs(summary["mean_observed_asym_scale"] - 0.5) <= 1e-4
+    if summary["beta"] == 1.0:
+        assert abs(summary["mean_observed_asym_scale"] - 0.0) <= 1e-4
+
+print("ratio-headset smoke checks passed")
+PY
+```
+
+This validates execution only. Three prompts are insufficient for any ASR or
+defense-performance conclusion.
+
+## Three-prompt elementwise intervention smoke command
 
 Run only after beta-zero equivalence passes:
 
@@ -232,9 +351,9 @@ cd /home/h.kawakami/ulab/m/head_intervention_defense-main
   --output-dir data/outputs/llama2/autodan/holdout_seed42/asym_score_intervention_smoke
 ```
 
-The implementation host could not communicate with the NVIDIA driver, so the
-7B equivalence and intervention smoke commands were not run there. The model
-was not loaded on CPU.
+The user-side GPU beta-zero equivalence run passed. The Codex implementation
+host cannot communicate with the NVIDIA driver, so it did not load the 7B model
+or run either three-prompt smoke command. The model was not loaded on CPU.
 
 ## Research status
 

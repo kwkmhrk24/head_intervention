@@ -17,13 +17,19 @@ from utils.asym_score_intervention import (
     temporarily_disable_default_dynamic_cache,
 )
 from scripts.evaluate_autodan_asym_score_intervention import (
+    ABSOLUTE_HEADS,
+    DEFAULT_CONDITIONS,
     EXPECTED_ELEMENT_HEADS,
+    NEGATIVE_HEADS,
     PAPER_HEADS,
+    POSITIVE_HEADS,
     align_historical_baseline,
+    build_metadata,
     build_condition_plan,
     classify_transition,
     compare_historical_baseline,
     load_headsets,
+    parse_conditions,
     summarize_results,
 )
 
@@ -385,7 +391,7 @@ class EvaluationPipelineHelperTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "heads.json"
             path.write_text(json.dumps(self.head_payload()))
-            headsets = load_headsets(path)
+            headsets = load_headsets(path, ["element_positive"])
         self.assertEqual(headsets["paper"], PAPER_HEADS)
         self.assertEqual(
             headsets["element_positive"],
@@ -399,12 +405,57 @@ class EvaluationPipelineHelperTests(unittest.TestCase):
             path = Path(directory) / "heads.json"
             path.write_text(json.dumps(payload))
             with self.assertRaisesRegex(ValueError, "differs from the fixed"):
-                load_headsets(path)
+                load_headsets(path, ["element_positive"])
+
+    def test_fixed_ratio_headsets_match_expected_and_are_valid(self):
+        headsets = load_headsets(None, DEFAULT_CONDITIONS)
+        expected = {
+            "paper": [(3, 0), (7, 16), (9, 9), (13, 4), (3, 5)],
+            "positive": [(1, 8), (7, 25), (9, 30), (12, 27), (29, 30)],
+            "negative": [(13, 5), (18, 29), (6, 1), (17, 23), (24, 13)],
+            "absolute": [(1, 8), (7, 25), (13, 5), (9, 30), (12, 27)],
+        }
+        self.assertEqual(headsets, expected)
+        for name, pairs in headsets.items():
+            self.assertEqual(len(pairs), 5, name)
+            self.assertEqual(len(set(pairs)), 5, name)
+            self.assertTrue(
+                all(0 <= layer < 32 and 0 <= head < 32 for layer, head in pairs)
+            )
+        self.assertEqual(POSITIVE_HEADS, expected["positive"])
+        self.assertEqual(NEGATIVE_HEADS, expected["negative"])
+        self.assertEqual(ABSOLUTE_HEADS, expected["absolute"])
+
+    def test_condition_parser_normalizes_ab_and_rejects_errors(self):
+        self.assertEqual(
+            parse_conditions("paper,positive,negative,absolute"),
+            ["paper", "positive", "negative", "absolute"],
+        )
+        self.assertEqual(parse_conditions("paper,ab"), ["paper", "absolute"])
+        alias_conditions = parse_conditions("ab")
+        alias_plan = build_condition_plan(
+            alias_conditions,
+            [0.5],
+            load_headsets(None, alias_conditions),
+        )
+        self.assertEqual(alias_plan[-1]["condition"], "absolute_beta_0.5")
+        with self.assertRaisesRegex(ValueError, "duplicates"):
+            parse_conditions("absolute,ab")
+        with self.assertRaisesRegex(ValueError, "unknown"):
+            parse_conditions("paper,unknown")
+
+    def test_elementwise_file_is_conditionally_required_and_not_read_otherwise(self):
+        fixed = load_headsets(
+            "/path/that/must/not/be/read.json", DEFAULT_CONDITIONS
+        )
+        self.assertEqual(set(fixed), set(DEFAULT_CONDITIONS))
+        with self.assertRaisesRegex(ValueError, "--elementwise-heads is required"):
+            load_headsets(None, ["element_positive"])
 
     def test_condition_plan_has_regenerated_baseline_and_one_beta_zero_control(self):
-        headsets = {"paper": PAPER_HEADS, **EXPECTED_ELEMENT_HEADS}
+        headsets = load_headsets(None, DEFAULT_CONDITIONS)
         plan = build_condition_plan(
-            ["paper", "element_positive"], [0.0, 0.5, 1.0], headsets
+            list(DEFAULT_CONDITIONS), [0.5, 1.0], headsets
         )
         self.assertEqual(plan[0]["condition"], "no_intervention")
         self.assertFalse(plan[0]["patched"])
@@ -416,9 +467,122 @@ class EvaluationPipelineHelperTests(unittest.TestCase):
             [
                 "paper_beta_0.5",
                 "paper_beta_1",
-                "element_positive_beta_0.5",
-                "element_positive_beta_1",
+                "positive_beta_0.5",
+                "positive_beta_1",
+                "negative_beta_0.5",
+                "negative_beta_1",
+                "absolute_beta_0.5",
+                "absolute_beta_1",
             ],
+        )
+        for spec in plan[2:]:
+            self.assertEqual(
+                spec["layer_head_pairs"], headsets[spec["headset"]]
+            )
+
+    def test_beta_zero_plan_has_only_baseline_and_control(self):
+        headsets = load_headsets(None, DEFAULT_CONDITIONS)
+        plan = build_condition_plan(list(DEFAULT_CONDITIONS), [0.0], headsets)
+        self.assertEqual(
+            [spec["condition"] for spec in plan],
+            ["no_intervention", "beta_zero_control"],
+        )
+
+    def test_ratio_and_elementwise_headsets_remain_distinct(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "heads.json"
+            path.write_text(json.dumps(self.head_payload()))
+            headsets = load_headsets(path, list(EXPECTED_ELEMENT_HEADS))
+        self.assertNotEqual(headsets["positive"], headsets["element_positive"])
+        self.assertNotEqual(headsets["negative"], headsets["element_negative"])
+        self.assertNotEqual(headsets["absolute"], headsets["element_absolute"])
+
+    def test_ratio_metadata_records_family_metric_and_selection_split(self):
+        args = SimpleNamespace(
+            model="model",
+            input_file="input.jsonl",
+            split_manifest="manifest.json",
+            source_labels="source.json",
+            historical_baseline_results=None,
+            elementwise_heads=None,
+            max_new_tokens=32,
+            seed=42,
+            max_prompts=3,
+        )
+        attention = SimpleNamespace()
+        model = SimpleNamespace(
+            config=SimpleNamespace(_attn_implementation="eager"),
+            model=SimpleNamespace(
+                layers=[SimpleNamespace(self_attn=attention)]
+            ),
+            _supports_cache_class=True,
+        )
+        tokenizer = SimpleNamespace(chat_template="template")
+        spec = {
+            "condition": "positive_beta_0.5",
+            "headset": "positive",
+            "layer_head_pairs": POSITIVE_HEADS,
+            "beta": 0.5,
+        }
+        metadata = build_metadata(
+            args,
+            model,
+            tokenizer,
+            spec,
+            {"selection_size": 20, "evaluation_size": 110},
+            "command",
+            {"git_commit": "abc"},
+            True,
+        )
+        self.assertEqual(metadata["headset_family"], "delta_asym_ratio")
+        self.assertEqual(
+            metadata["head_selection_metric"], "mean_delta_asym_ratio"
+        )
+        self.assertEqual(
+            metadata["head_selection_split"], "selection_20_seed42"
+        )
+        self.assertIsNone(metadata["elementwise_heads"])
+
+        paper_spec = {
+            **spec,
+            "condition": "paper_beta_0.5",
+            "headset": "paper",
+            "layer_head_pairs": PAPER_HEADS,
+        }
+        paper_metadata = build_metadata(
+            args,
+            model,
+            tokenizer,
+            paper_spec,
+            {"selection_size": 20, "evaluation_size": 110},
+            "command",
+            {"git_commit": "abc"},
+            True,
+        )
+        self.assertEqual(paper_metadata["headset_family"], "paper")
+
+        args.elementwise_heads = "heads.json"
+        element_spec = {
+            **spec,
+            "condition": "element_positive_beta_0.5",
+            "headset": "element_positive",
+            "layer_head_pairs": EXPECTED_ELEMENT_HEADS["element_positive"],
+        }
+        element_metadata = build_metadata(
+            args,
+            model,
+            tokenizer,
+            element_spec,
+            {"selection_size": 20, "evaluation_size": 110},
+            "command",
+            {"git_commit": "abc"},
+            True,
+        )
+        self.assertEqual(
+            element_metadata["headset_family"], "elementwise_consistency"
+        )
+        self.assertEqual(
+            element_metadata["head_selection_metric"], "consistent_positive"
         )
 
     def test_transition_and_summary_use_new_baseline(self):

@@ -46,6 +46,15 @@ from utils.prompt_utils import apply_template  # noqa: E402
 
 
 PAPER_HEADS = [(3, 0), (7, 16), (9, 9), (13, 4), (3, 5)]
+POSITIVE_HEADS = [(1, 8), (7, 25), (9, 30), (12, 27), (29, 30)]
+NEGATIVE_HEADS = [(13, 5), (18, 29), (6, 1), (17, 23), (24, 13)]
+ABSOLUTE_HEADS = [(1, 8), (7, 25), (13, 5), (9, 30), (12, 27)]
+FIXED_HEADSETS = {
+    "paper": PAPER_HEADS,
+    "positive": POSITIVE_HEADS,
+    "negative": NEGATIVE_HEADS,
+    "absolute": ABSOLUTE_HEADS,
+}
 EXPECTED_ELEMENT_HEADS = {
     "element_positive": [(14, 11), (11, 24), (8, 7), (7, 22), (9, 10)],
     "element_negative": [(31, 22), (10, 30), (8, 29), (10, 31), (9, 15)],
@@ -56,12 +65,54 @@ ELEMENT_RANKING_KEYS = {
     "element_negative": "consistent_negative_top",
     "element_absolute": "consistent_absolute_top",
 }
-HEADSET_CONDITIONS = (
-    "paper",
-    "element_positive",
-    "element_negative",
-    "element_absolute",
-)
+DEFAULT_CONDITIONS = ("paper", "positive", "negative", "absolute")
+ELEMENT_CONDITIONS = tuple(EXPECTED_ELEMENT_HEADS)
+HEADSET_CONDITIONS = DEFAULT_CONDITIONS + ELEMENT_CONDITIONS
+CONDITION_ALIASES = {"ab": "absolute"}
+HEADSET_PROVENANCE = {
+    "paper": {
+        "headset_family": "paper",
+        "head_selection_metric": "paper_fixed_heads",
+        "head_selection_split": None,
+        "head_selection_ranking": None,
+    },
+    "positive": {
+        "headset_family": "delta_asym_ratio",
+        "head_selection_metric": "mean_delta_asym_ratio",
+        "head_selection_split": "selection_20_seed42",
+        "head_selection_ranking": "positive_top5",
+    },
+    "negative": {
+        "headset_family": "delta_asym_ratio",
+        "head_selection_metric": "mean_delta_asym_ratio",
+        "head_selection_split": "selection_20_seed42",
+        "head_selection_ranking": "negative_bottom5",
+    },
+    "absolute": {
+        "headset_family": "delta_asym_ratio",
+        "head_selection_metric": "mean_delta_asym_ratio",
+        "head_selection_split": "selection_20_seed42",
+        "head_selection_ranking": "absolute_top5",
+    },
+    "element_positive": {
+        "headset_family": "elementwise_consistency",
+        "head_selection_metric": "consistent_positive",
+        "head_selection_split": "selection_20_seed42",
+        "head_selection_ranking": "positive_top5",
+    },
+    "element_negative": {
+        "headset_family": "elementwise_consistency",
+        "head_selection_metric": "consistent_negative",
+        "head_selection_split": "selection_20_seed42",
+        "head_selection_ranking": "negative_top5",
+    },
+    "element_absolute": {
+        "headset_family": "elementwise_consistency",
+        "head_selection_metric": "consistent_absolute",
+        "head_selection_split": "selection_20_seed42",
+        "head_selection_ranking": "absolute_top5",
+    },
+}
 COMPARISON_COLUMNS = [
     "condition",
     "head_list",
@@ -103,7 +154,14 @@ def parse_args(argv=None):
     parser.add_argument("--model", required=True)
     parser.add_argument("--input-file", required=True)
     parser.add_argument("--split-manifest", required=True)
-    parser.add_argument("--elementwise-heads", required=True)
+    parser.add_argument(
+        "--elementwise-heads",
+        default=None,
+        help=(
+            "Required only when an element_positive, element_negative, or "
+            "element_absolute condition is selected."
+        ),
+    )
     parser.add_argument("--source-labels", required=True)
     parser.add_argument(
         "--historical-baseline-results",
@@ -114,7 +172,7 @@ def parse_args(argv=None):
         ),
     )
     parser.add_argument(
-        "--conditions", default=",".join(HEADSET_CONDITIONS)
+        "--conditions", default=",".join(DEFAULT_CONDITIONS)
     )
     parser.add_argument("--betas", default="0.5,1.0")
     parser.add_argument("--output-dir", required=True)
@@ -127,7 +185,8 @@ def parse_args(argv=None):
 
 
 def parse_conditions(value):
-    conditions = [item.strip() for item in value.split(",") if item.strip()]
+    requested = [item.strip().lower() for item in value.split(",") if item.strip()]
+    conditions = [CONDITION_ALIASES.get(item, item) for item in requested]
     if not conditions:
         raise ValueError("--conditions must select at least one head set")
     unknown = [item for item in conditions if item not in HEADSET_CONDITIONS]
@@ -155,12 +214,26 @@ def validate_head_pairs(name, pairs):
     return list(pairs)
 
 
-def load_headsets(path):
+def load_headsets(path=None, conditions=DEFAULT_CONDITIONS):
+    conditions = tuple(conditions)
+    headsets = {
+        name: validate_head_pairs(name, pairs)
+        for name, pairs in FIXED_HEADSETS.items()
+    }
+    requested_elementwise = [
+        name for name in conditions if name in ELEMENT_CONDITIONS
+    ]
+    if not requested_elementwise:
+        return headsets
+    if path is None:
+        raise ValueError(
+            "--elementwise-heads is required for elementwise conditions: "
+            + ", ".join(requested_elementwise)
+        )
     with Path(path).open() as handle:
         payload = json.load(handle)
     if not isinstance(payload, dict):
         raise ValueError(f"{path}: expected a JSON object")
-    headsets = {"paper": validate_head_pairs("paper", PAPER_HEADS)}
     for name, ranking_key in ELEMENT_RANKING_KEYS.items():
         rows = payload.get(ranking_key)
         if not isinstance(rows, list) or len(rows) < 5:
@@ -759,6 +832,7 @@ def build_metadata(
     git_metadata,
     cache_support_original,
 ):
+    provenance = HEADSET_PROVENANCE.get(spec["headset"], {})
     return {
         "model_path": str(Path(args.model).resolve()),
         "model_type": "Llama",
@@ -779,9 +853,17 @@ def build_metadata(
             if args.historical_baseline_results
             else None
         ),
-        "elementwise_heads": str(Path(args.elementwise_heads).resolve()),
+        "elementwise_heads": (
+            str(Path(args.elementwise_heads).resolve())
+            if args.elementwise_heads
+            else None
+        ),
         "condition": spec["condition"],
         "headset": spec["headset"],
+        "headset_family": provenance.get("headset_family"),
+        "head_selection_metric": provenance.get("head_selection_metric"),
+        "head_selection_split": provenance.get("head_selection_split"),
+        "head_selection_ranking": provenance.get("head_selection_ranking"),
         "layer_head_pairs": [
             {"layer": layer, "head": head}
             for layer, head in spec["layer_head_pairs"]
@@ -857,7 +939,7 @@ def main(argv=None):
         raise ValueError("--max-new-tokens must be positive")
     if not math.isfinite(args.equivalence_tolerance) or args.equivalence_tolerance < 0:
         raise ValueError("--equivalence-tolerance must be finite and non-negative")
-    headsets = load_headsets(args.elementwise_heads)
+    headsets = load_headsets(args.elementwise_heads, conditions)
     plan = build_condition_plan(conditions, betas, headsets)
     paths = output_paths(args.output_dir, plan)
     check_outputs(paths, args.overwrite)
