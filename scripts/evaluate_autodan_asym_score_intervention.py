@@ -34,6 +34,7 @@ from utils.asym_score_intervention import (  # noqa: E402
     SUPPORTED_TRANSFORMERS_VERSION,
     UnsupportedAttentionCacheError,
     patch_llama_attention_scores,
+    temporarily_disable_default_dynamic_cache,
     validate_beta,
     validate_layer_head_pairs,
 )
@@ -85,6 +86,10 @@ RESEARCH_NOTE = (
     "The head sets were selected after exploratory analysis of the full AutoDAN "
     "dataset. Any 110-prompt evaluation is a post-hoc internal analysis, not a "
     "fully untouched external test."
+)
+CACHE_POLICY = (
+    "Transformers default DynamicCache initialization is temporarily disabled; "
+    "use_cache=False and past_key_values=None are enforced."
 )
 
 
@@ -354,7 +359,8 @@ def generate_response(model, tokenizer, formatted_prompt, generation_config):
     ).to(model.device)
     input_length = inputs.input_ids.shape[-1]
     with torch.inference_mode():
-        outputs = model.generate(inputs.input_ids, **generation_config)
+        with temporarily_disable_default_dynamic_cache(model):
+            outputs = model.generate(inputs.input_ids, **generation_config)
     response_ids = outputs[0, input_length:]
     return tokenizer.decode(response_ids), int(response_ids.numel())
 
@@ -648,6 +654,7 @@ def run_equivalence_preflight(
     generation_config,
     tolerance,
 ):
+    cache_support_before = model._supports_cache_class
     inputs = tokenizer(
         formatted_prompt,
         return_tensors="pt",
@@ -684,6 +691,15 @@ def run_equivalence_preflight(
         "transformers_version": transformers.__version__,
         "attention_class": type(model.model.layers[0].self_attn).__name__,
         "use_cache": False,
+        "generation_default_dynamic_cache_disabled": True,
+        "generation_model_supports_cache_class_original": cache_support_before,
+        "generation_model_supports_cache_class_after_generation": (
+            model._supports_cache_class
+        ),
+        "generation_model_supports_cache_class_restored": (
+            model._supports_cache_class == cache_support_before
+        ),
+        "generation_cache_policy": CACHE_POLICY,
         "beta": 0.0,
         "layer_head_pairs": [
             {"layer": layer, "head": head} for layer, head in layer_head_pairs
@@ -733,7 +749,16 @@ def check_outputs(paths, overwrite):
         raise FileExistsError("refusing to overwrite: " + ", ".join(existing))
 
 
-def build_metadata(args, model, tokenizer, spec, manifest, command, git_metadata):
+def build_metadata(
+    args,
+    model,
+    tokenizer,
+    spec,
+    manifest,
+    command,
+    git_metadata,
+    cache_support_original,
+):
     return {
         "model_path": str(Path(args.model).resolve()),
         "model_type": "Llama",
@@ -785,6 +810,15 @@ def build_metadata(args, model, tokenizer, spec, manifest, command, git_metadata
             "system_prompt": None,
             "batch_size": 1,
         },
+        "generation_default_dynamic_cache_disabled": True,
+        "generation_model_supports_cache_class_original": cache_support_original,
+        "generation_model_supports_cache_class_after_generation": (
+            model._supports_cache_class
+        ),
+        "generation_model_supports_cache_class_restored": (
+            model._supports_cache_class == cache_support_original
+        ),
+        "generation_cache_policy": CACHE_POLICY,
         "chat_template": getattr(tokenizer, "chat_template", None),
         "success_checker": "utils.evaluate_utils.check_success_with_details",
         "refusal_substring_count": len(REFUSAL_SUBSTRINGS),
@@ -870,6 +904,11 @@ def main(argv=None):
     )
     model.eval()
     model.config.use_cache = False
+    if not hasattr(model, "_supports_cache_class"):
+        raise AttributeError("loaded model lacks _supports_cache_class")
+    if type(model._supports_cache_class) is not bool:
+        raise TypeError("loaded model _supports_cache_class must be boolean")
+    cache_support_original = model._supports_cache_class
     if model.config._attn_implementation != "eager":
         raise ValueError("model attention implementation is not eager")
     if type(model.model.layers[0].self_attn).__name__ != "LlamaAttention":
@@ -944,6 +983,7 @@ def main(argv=None):
             manifest,
             command,
             git_metadata,
+            cache_support_original,
         )
         condition_dir = Path(args.output_dir) / spec["condition"]
         write_jsonl(condition_dir / "prompt_results.jsonl", results)
@@ -960,6 +1000,17 @@ def main(argv=None):
             "historical_baseline_used_for_transitions": False,
             "historical_baseline_comparison": historical_comparison,
             "use_cache": False,
+            "generation_default_dynamic_cache_disabled": True,
+            "generation_model_supports_cache_class_original": (
+                cache_support_original
+            ),
+            "generation_model_supports_cache_class_after_generation": (
+                model._supports_cache_class
+            ),
+            "generation_model_supports_cache_class_restored": (
+                model._supports_cache_class == cache_support_original
+            ),
+            "generation_cache_policy": CACHE_POLICY,
             "beta_zero_equivalence_passed": True,
             "research_context_note": RESEARCH_NOTE,
         },

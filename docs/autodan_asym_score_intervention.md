@@ -73,10 +73,30 @@ patched forward: use_cache=False and past_key_value=None
 query_length == key_length
 ```
 
-Transformers 4.42.3 `LlamaForCausalLM.prepare_inputs_for_generation` was
-inspected: when no past cache exists, it passes the full growing `input_ids`
-sequence. Any cache state or non-square score fails immediately; the code does
-not broadcast, add a query cache, or provide a q-length-one shortcut.
+There is an additional Transformers 4.42.3 behavior to account for. Its
+`GenerationMixin.generate()` sets `model_kwargs["use_cache"]` from the
+generation config, but can subsequently create an empty `DynamicCache()` when
+`model._supports_default_dynamic_cache()` is true. Consequently, the first
+real-model equivalence attempt reached the patched attention with a non-null
+`past_key_value` even though `use_cache=False`, and correctly failed with
+`UnsupportedAttentionCacheError`.
+
+The patched attention's cache rejection was not relaxed. Instead, every call
+to `model.generate()` in this pipeline—including regenerated no-intervention,
+beta-zero control, and all positive-beta conditions—is wrapped in
+`temporarily_disable_default_dynamic_cache(model)`. The context temporarily
+sets the model instance's private `_supports_cache_class` flag to `False`, then
+restores both its original value and instance/class attribute state after
+normal or exceptional exit. This prevents `generate()` from creating the empty
+default cache; an explicit cache, `use_cache=True`, or a non-square score still
+fails immediately in the patched forward.
+
+Transformers 4.42.3 `LlamaForCausalLM.prepare_inputs_for_generation` was also
+inspected: with no past cache, it passes the full growing `input_ids` sequence.
+The context uses a private Transformers attribute and is therefore deliberately
+version-pinned to 4.42.3. It modifies only the model instance during generation,
+not the model class or installed package. The code does not broadcast, add a
+query cache, or provide a q-length-one shortcut.
 
 Disabling the KV cache recomputes the full sequence at every decoding step and
 is substantially slower and more memory/computation intensive than ordinary
@@ -187,7 +207,7 @@ cd /home/h.kawakami/ulab/m/head_intervention_defense-main
   --max-prompts 1 \
   --max-new-tokens 32 \
   --seed 42 \
-  --output-dir data/outputs/llama2/autodan/holdout_seed42/asym_score_equivalence_smoke
+  --output-dir data/outputs/llama2/autodan/holdout_seed42/asym_score_equivalence_smoke_v2
 ```
 
 ## Three-prompt intervention smoke command

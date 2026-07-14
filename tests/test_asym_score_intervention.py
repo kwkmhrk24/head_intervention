@@ -6,11 +6,15 @@ from types import SimpleNamespace
 
 import torch
 from transformers.models.llama.configuration_llama import LlamaConfig
-from transformers.models.llama.modeling_llama import LlamaAttention
+from transformers.models.llama.modeling_llama import (
+    LlamaAttention,
+    LlamaForCausalLM,
+)
 
 from utils.asym_score_intervention import (
     patch_llama_attention_scores,
     suppress_antisymmetric_component,
+    temporarily_disable_default_dynamic_cache,
 )
 from scripts.evaluate_autodan_asym_score_intervention import (
     EXPECTED_ELEMENT_HEADS,
@@ -195,6 +199,169 @@ class PatchContextTests(unittest.TestCase):
                     position_ids=position_ids,
                     use_cache=True,
                 )
+
+    def test_patched_forward_still_rejects_past_key_value(self):
+        model, attention = self.make_tiny_model()
+        hidden_states = torch.randn(1, 3, 32)
+        position_ids = torch.arange(3).unsqueeze(0)
+        with patch_llama_attention_scores(model, [(0, 0)], 0.5):
+            with self.assertRaisesRegex(ValueError, "past_key_value"):
+                attention(
+                    hidden_states,
+                    position_ids=position_ids,
+                    past_key_value=object(),
+                    use_cache=False,
+                )
+
+
+class DynamicCacheDisableContextTests(unittest.TestCase):
+    def test_temporarily_disables_and_restores_normal_exit(self):
+        model = SimpleNamespace(_supports_cache_class=True)
+        with temporarily_disable_default_dynamic_cache(model) as state:
+            self.assertFalse(model._supports_cache_class)
+            self.assertTrue(
+                state["generation_model_supports_cache_class_original"]
+            )
+        self.assertTrue(model._supports_cache_class)
+        self.assertTrue(
+            state["generation_model_supports_cache_class_restored"]
+        )
+
+    def test_restores_after_exception(self):
+        model = SimpleNamespace(_supports_cache_class=True)
+        with self.assertRaisesRegex(RuntimeError, "synthetic failure"):
+            with temporarily_disable_default_dynamic_cache(model):
+                self.assertFalse(model._supports_cache_class)
+                raise RuntimeError("synthetic failure")
+        self.assertTrue(model._supports_cache_class)
+
+    def test_nested_contexts_restore_each_observed_state(self):
+        model = SimpleNamespace(_supports_cache_class=True)
+        with temporarily_disable_default_dynamic_cache(model):
+            self.assertFalse(model._supports_cache_class)
+            with temporarily_disable_default_dynamic_cache(model):
+                self.assertFalse(model._supports_cache_class)
+            self.assertFalse(model._supports_cache_class)
+        self.assertTrue(model._supports_cache_class)
+
+    def test_rejects_missing_or_non_boolean_attribute(self):
+        with self.assertRaisesRegex(AttributeError, "lacks"):
+            with temporarily_disable_default_dynamic_cache(SimpleNamespace()):
+                pass
+        with self.assertRaisesRegex(TypeError, "must be a bool"):
+            with temporarily_disable_default_dynamic_cache(
+                SimpleNamespace(_supports_cache_class=1)
+            ):
+                pass
+
+
+class TinyLlamaGenerationIntegrationTests(unittest.TestCase):
+    def make_model(self):
+        torch.manual_seed(42)
+        config = LlamaConfig(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=32,
+            bos_token_id=1,
+            eos_token_id=None,
+            pad_token_id=0,
+            attention_dropout=0.0,
+            use_cache=False,
+        )
+        config._attn_implementation = "eager"
+        return LlamaForCausalLM(config).eval()
+
+    def setUp(self):
+        self.model = self.make_model()
+        self.input_ids = torch.tensor([[1, 5, 6, 7]])
+        self.generation_kwargs = {
+            "use_cache": False,
+            "do_sample": False,
+            "max_new_tokens": 3,
+            "pad_token_id": 0,
+        }
+
+    def test_no_intervention_generation_receives_no_past_key_values(self):
+        seen_past = []
+
+        def capture_past(_module, _args, kwargs):
+            seen_past.append(kwargs.get("past_key_values"))
+
+        hook = self.model.register_forward_pre_hook(
+            capture_past, with_kwargs=True
+        )
+        original = self.model._supports_cache_class
+        try:
+            with temporarily_disable_default_dynamic_cache(self.model):
+                self.assertFalse(self.model._supports_cache_class)
+                output = self.model.generate(
+                    self.input_ids, **self.generation_kwargs
+                )
+        finally:
+            hook.remove()
+        self.assertEqual(output.shape[-1], self.input_ids.shape[-1] + 3)
+        self.assertTrue(seen_past)
+        self.assertTrue(all(past is None for past in seen_past))
+        self.assertEqual(self.model._supports_cache_class, original)
+
+    def test_patched_generation_has_square_growing_scores_and_restores_flag(self):
+        original = self.model._supports_cache_class
+        had_instance_attribute = "_supports_cache_class" in vars(self.model)
+        with patch_llama_attention_scores(
+            self.model, [(0, 1)], 0.5
+        ) as diagnostics:
+            with temporarily_disable_default_dynamic_cache(self.model):
+                output = self.model.generate(
+                    self.input_ids, **self.generation_kwargs
+                )
+            summary = diagnostics.summary()
+        self.assertEqual(output.shape[-1], self.input_ids.shape[-1] + 3)
+        self.assertGreater(summary["call_count"], 0)
+        self.assertEqual(summary["query_lengths"], [4, 5, 6])
+        self.assertEqual(summary["query_lengths"], summary["key_lengths"])
+        self.assertTrue(summary["all_score_matrices_square"])
+        self.assertEqual(self.model._supports_cache_class, original)
+        self.assertEqual(
+            "_supports_cache_class" in vars(self.model), had_instance_attribute
+        )
+
+    def test_beta_zero_generation_and_argmax_match_no_intervention(self):
+        with torch.inference_mode():
+            baseline_logits = self.model(
+                input_ids=self.input_ids, use_cache=False
+            ).logits
+        with temporarily_disable_default_dynamic_cache(self.model):
+            baseline_output = self.model.generate(
+                self.input_ids, **self.generation_kwargs
+            )
+
+        with patch_llama_attention_scores(
+            self.model, [(0, 1)], 0.0
+        ) as diagnostics:
+            with torch.inference_mode():
+                patched_logits = self.model(
+                    input_ids=self.input_ids, use_cache=False
+                ).logits
+            diagnostics.clear()
+            with temporarily_disable_default_dynamic_cache(self.model):
+                patched_output = self.model.generate(
+                    self.input_ids, **self.generation_kwargs
+                )
+            summary = diagnostics.summary()
+
+        self.assertTrue(torch.equal(baseline_output, patched_output))
+        self.assertTrue(torch.equal(baseline_logits, patched_logits))
+        self.assertEqual(
+            baseline_logits[:, -1].argmax(dim=-1).item(),
+            patched_logits[:, -1].argmax(dim=-1).item(),
+        )
+        self.assertEqual(summary["max_intervention_identity_error"], 0.0)
+        self.assertTrue(summary["all_score_matrices_square"])
+        self.assertEqual(summary["query_lengths"], [4, 5, 6])
 
 
 class EvaluationPipelineHelperTests(unittest.TestCase):

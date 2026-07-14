@@ -24,6 +24,51 @@ class UnsupportedAttentionCacheError(ValueError):
     """Raised when cache state reaches the primary no-cache implementation."""
 
 
+@contextmanager
+def temporarily_disable_default_dynamic_cache(model):
+    """Prevent Transformers 4.42.3 ``generate`` from creating DynamicCache.
+
+    Only the model instance is changed. The original effective value and
+    whether it was stored directly on the instance are both restored, including
+    on exceptional exit. Nested use is safe because each level restores the
+    state it observed on entry.
+    """
+
+    if transformers.__version__ != SUPPORTED_TRANSFORMERS_VERSION:
+        raise RuntimeError(
+            "default DynamicCache suppression supports Transformers "
+            f"{SUPPORTED_TRANSFORMERS_VERSION}, found {transformers.__version__}"
+        )
+    if not hasattr(model, "_supports_cache_class"):
+        raise AttributeError(
+            "model lacks the Transformers _supports_cache_class attribute"
+        )
+    original = model._supports_cache_class
+    if type(original) is not bool:
+        raise TypeError("model._supports_cache_class must be a bool")
+
+    instance_attributes = vars(model)
+    had_instance_attribute = "_supports_cache_class" in instance_attributes
+    previous_instance_value = instance_attributes.get("_supports_cache_class")
+    state = {
+        "generation_default_dynamic_cache_disabled": True,
+        "generation_model_supports_cache_class_original": original,
+        "generation_model_supports_cache_class_during_context": False,
+        "generation_model_supports_cache_class_restored": None,
+    }
+    model._supports_cache_class = False
+    try:
+        yield state
+    finally:
+        if had_instance_attribute:
+            model._supports_cache_class = previous_instance_value
+        else:
+            delattr(model, "_supports_cache_class")
+        state["generation_model_supports_cache_class_restored"] = (
+            model._supports_cache_class == original
+        )
+
+
 def validate_beta(beta: float) -> float:
     if isinstance(beta, bool) or not isinstance(beta, (int, float)):
         raise TypeError("beta must be a real number")
