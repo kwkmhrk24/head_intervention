@@ -87,3 +87,8 @@ AutoDAN pairs had already been used for exploratory attention-score analysis
 before this split was defined. Therefore, the 20/110 split is an internal
 AutoDAN hold-out validation and the 110-prompt evaluation subset must not be
 described as a fully unseen test set.
+
+The distinction between the stored AutoDAN source labels (84/130) and the
+current no-intervention evaluation (17/130), together with prompt-level
+diagnostic output, is documented in
+[`docs/autodan_baseline_alignment.md`](docs/autodan_baseline_alignment.md).
