@@ -78,3 +78,12 @@ Key arguments:
 1. `--interpolation_rate`: Interpolation rate (referred to as $\lambda$ in the paper).
 
 If you want to change the specific heads to be intervened on, please modify the `intervention_location` variable directly inside `evaluate.py`.
+
+## AutoDAN internal hold-out head selection
+
+The Llama2 AutoDAN selection pipeline is documented in
+[`docs/autodan_selection_holdout.md`](docs/autodan_selection_holdout.md). All 130
+AutoDAN pairs had already been used for exploratory attention-score analysis
+before this split was defined. Therefore, the 20/110 split is an internal
+AutoDAN hold-out validation and the 110-prompt evaluation subset must not be
+described as a fully unseen test set.
