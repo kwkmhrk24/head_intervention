@@ -13,6 +13,7 @@ import torch
 
 from scripts.evaluate_harmbench_autodan_baseline import (
     build_decoding_config,
+    build_summary,
     configure_model_for_baseline,
     evaluate_records,
     load_harmbench_records,
@@ -79,7 +80,7 @@ def fake_cache_context(model):
     yield {"generation_default_dynamic_cache_disabled": True}
 
 
-def write_fixture(root, rows, payloads):
+def write_fixture(root, rows, payloads, logs_payloads=None):
     root = Path(root)
     csv_path = root / "behaviors.csv"
     with csv_path.open("w", newline="", encoding="utf-8") as handle:
@@ -104,16 +105,33 @@ def write_fixture(root, rows, payloads):
             json.dumps({"behavior_id": behavior_id, "resolved": True}),
             encoding="utf-8",
         )
+    for behavior_id, payload in (logs_payloads or {}).items():
+        path = (
+            test_cases_dir
+            / "test_cases_individual_behaviors"
+            / behavior_id
+            / "logs.json"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload), encoding="utf-8")
     return test_cases_dir, csv_path
 
 
-def load_records(test_cases_dir, csv_path, behavior_ids):
+def load_records(
+    test_cases_dir,
+    csv_path,
+    behavior_ids,
+    candidate_mode="final",
+    harmbench_run_index=0,
+):
     return load_harmbench_records(
         test_cases_dir,
         csv_path,
         behavior_ids,
         "generation-commit",
         "current-commit",
+        candidate_mode=candidate_mode,
+        harmbench_run_index=harmbench_run_index,
     )
 
 
@@ -200,6 +218,67 @@ class HarmBenchInputTests(unittest.TestCase):
             )
             self.assertEqual(
                 manifest["source_behaviors_csv_sha256"], sha256_file(csv_path)
+            )
+            self.assertNotIn("source_logs_path", records[0])
+            self.assertNotIn("source_logs_files", manifest)
+
+    def test_trajectory_deduplicates_in_logs_then_saved_final_order(self):
+        rows = [{"BehaviorID": "b1", "Behavior": "goal", "RawIndex": "4"}]
+        logs = {
+            "b1": [
+                [
+                    {"test_case": "candidate A", "loss": 1.0},
+                    {"test_case": "candidate B", "loss": 0.8},
+                    {"test_case": "candidate B", "loss": 0.7},
+                ]
+            ]
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            test_cases_dir, csv_path = write_fixture(
+                directory,
+                rows,
+                {"b1": {"b1": ["candidate C"]}},
+                {"b1": logs},
+            )
+            records, manifest = load_records(
+                test_cases_dir,
+                csv_path,
+                ["b1"],
+                candidate_mode="trajectory",
+            )
+
+            self.assertEqual(
+                [record["attack_prompt"] for record in records],
+                ["candidate A", "candidate B", "candidate C"],
+            )
+            self.assertEqual([record["attempt_index"] for record in records], [0, 1, 2])
+            self.assertEqual(records[1]["harmbench_step_index"], 1)
+            self.assertEqual(records[1]["logged_loss"], 0.8)
+            self.assertEqual(
+                [record["candidate_origin"] for record in records],
+                ["logs_step", "logs_step", "saved_final"],
+            )
+            self.assertEqual(
+                [record["is_saved_final_candidate"] for record in records],
+                [False, False, True],
+            )
+            self.assertTrue(all(record["trajectory_candidate_count"] == 3 for record in records))
+            self.assertTrue(all(record["duplicate_candidates_removed"] == 1 for record in records))
+            self.assertIsNone(records[2]["harmbench_step_index"])
+            self.assertIsNone(records[2]["logged_loss"])
+            self.assertEqual(
+                records[0]["source_logs_sha256"],
+                sha256_file(records[0]["source_logs_path"]),
+            )
+            self.assertEqual(
+                manifest["source_logs_files"],
+                [
+                    {
+                        "behavior_id": "b1",
+                        "path": records[0]["source_logs_path"],
+                        "sha256": records[0]["source_logs_sha256"],
+                    }
+                ],
             )
 
     def test_rejects_missing_behavior_key(self):
@@ -309,6 +388,92 @@ class HarmBenchInputTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "duplicate"):
             parse_behavior_ids("b1,b1")
 
+    def test_trajectory_rejects_missing_logs_json(self):
+        rows = [{"BehaviorID": "b1", "Behavior": "goal", "RawIndex": "4"}]
+        with tempfile.TemporaryDirectory() as directory:
+            test_cases_dir, csv_path = write_fixture(
+                directory, rows, {"b1": {"b1": ["final"]}}
+            )
+            with self.assertRaisesRegex(FileNotFoundError, "logs.json"):
+                load_records(
+                    test_cases_dir, csv_path, ["b1"], candidate_mode="trajectory"
+                )
+
+    def test_trajectory_rejects_missing_behavior_key_in_logs(self):
+        self._assert_invalid_logs(
+            {"different": [[]]},
+            "missing BehaviorID key",
+        )
+
+    def test_trajectory_rejects_run_index_out_of_range(self):
+        self._assert_invalid_logs(
+            {"b1": [[]]},
+            "run index 1 is out of range",
+            harmbench_run_index=1,
+        )
+
+    def test_trajectory_rejects_non_object_step(self):
+        self._assert_invalid_logs({"b1": [["not an object"]]}, "must be an object")
+
+    def test_trajectory_rejects_non_string_test_case(self):
+        self._assert_invalid_logs(
+            {"b1": [[{"test_case": 123, "loss": 1.0}]]},
+            "test_case.*must be a string",
+        )
+
+    def test_trajectory_rejects_non_numeric_loss(self):
+        self._assert_invalid_logs(
+            {"b1": [[{"test_case": "candidate", "loss": "high"}]]},
+            "loss.*must be numeric",
+        )
+
+    def test_trajectory_rejects_invalid_logs_json(self):
+        rows = [{"BehaviorID": "b1", "Behavior": "goal", "RawIndex": "4"}]
+        with tempfile.TemporaryDirectory() as directory:
+            test_cases_dir, csv_path = write_fixture(
+                directory,
+                rows,
+                {"b1": {"b1": ["final"]}},
+                {"b1": {"b1": [[]]}},
+            )
+            logs_path = (
+                test_cases_dir
+                / "test_cases_individual_behaviors"
+                / "b1"
+                / "logs.json"
+            )
+            logs_path.write_text("not JSON", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "invalid JSON"):
+                load_records(
+                    test_cases_dir, csv_path, ["b1"], candidate_mode="trajectory"
+                )
+
+    def test_trajectory_rejects_non_object_logs_root(self):
+        self._assert_invalid_logs([], "top-level value must be an object")
+
+    def _assert_invalid_logs(
+        self,
+        logs_payload,
+        error_pattern,
+        harmbench_run_index=0,
+    ):
+        rows = [{"BehaviorID": "b1", "Behavior": "goal", "RawIndex": "4"}]
+        with tempfile.TemporaryDirectory() as directory:
+            test_cases_dir, csv_path = write_fixture(
+                directory,
+                rows,
+                {"b1": {"b1": ["final"]}},
+                {"b1": logs_payload},
+            )
+            with self.assertRaisesRegex(ValueError, error_pattern):
+                load_records(
+                    test_cases_dir,
+                    csv_path,
+                    ["b1"],
+                    candidate_mode="trajectory",
+                    harmbench_run_index=harmbench_run_index,
+                )
+
 
 class BaselineGenerationTests(unittest.TestCase):
     def test_generation_uses_fixed_user_only_no_cache_configuration(self):
@@ -407,6 +572,69 @@ class BaselineGenerationTests(unittest.TestCase):
         self.assertIsNone(results[0]["keyword_success"])
         self.assertIn("RuntimeError", results[0]["failure_reason"])
         self.assertFalse(results[1]["generation_failed"])
+
+
+class TrajectorySummaryTests(unittest.TestCase):
+    def test_behavior_success_and_first_success_attempt(self):
+        records = [
+            {
+                **base_record("b1", 4, "b1 attempt 0"),
+                "attempt_index": 0,
+                "duplicate_candidates_removed": 1,
+            },
+            {
+                **base_record("b1", 4, "b1 attempt 1"),
+                "attempt_index": 1,
+                "duplicate_candidates_removed": 1,
+            },
+            {
+                **base_record("b2", 5, "b2 attempt 0"),
+                "attempt_index": 0,
+                "duplicate_candidates_removed": 0,
+            },
+        ]
+        results = [
+            {**records[0], "generation_failed": False, "keyword_success": False},
+            {**records[1], "generation_failed": False, "keyword_success": True},
+            {**records[2], "generation_failed": False, "keyword_success": False},
+        ]
+        manifest = {
+            **source_manifest(),
+            "candidate_mode": "trajectory",
+            "seed": 42,
+        }
+
+        summary = build_summary(
+            records,
+            results,
+            "/model",
+            build_decoding_config(32),
+            "4.42.3",
+            "4.42.3",
+            manifest,
+            "2026-01-01T00:00:00+00:00",
+            "/output/results.jsonl",
+        )
+
+        self.assertEqual(summary["total_candidate_attempts"], 3)
+        self.assertEqual(summary["behavior_success_count"], 1)
+        self.assertEqual(summary["behavior_failure_count"], 1)
+        self.assertEqual(summary["behavior_asr"], 0.5)
+        self.assertEqual(summary["successful_behavior_ids"], ["b1"])
+        self.assertEqual(
+            summary["first_success_attempt_by_behavior"],
+            {"b1": 1, "b2": None},
+        )
+        self.assertEqual(
+            summary["candidate_attempt_count_by_behavior"],
+            {"b1": 2, "b2": 1},
+        )
+        self.assertEqual(
+            summary["duplicate_candidates_removed_by_behavior"],
+            {"b1": 1, "b2": 0},
+        )
+        self.assertEqual(summary["candidate_keyword_asr"], 1 / 3)
+        self.assertEqual(summary["keyword_asr"], 1 / 3)
 
 
 class VersionAndOutputTests(unittest.TestCase):
@@ -512,6 +740,7 @@ class VersionAndOutputTests(unittest.TestCase):
             self.assertEqual(summary["keyword_failure_count"], 0)
             self.assertEqual(summary["keyword_asr"], 1.0)
             self.assertEqual(summary["seed"], 42)
+            self.assertNotIn("candidate_mode", summary)
             self.assertNotIn("ATTACK_SECRET", json.dumps(summary))
             self.assertNotIn("RESPONSE_SECRET", json.dumps(summary))
 
@@ -539,6 +768,8 @@ class VersionAndOutputTests(unittest.TestCase):
             expected_transformers_version="4.42.3",
             source_harmbench_generation_commit="generation-commit",
             source_harmbench_current_commit="current-commit",
+            candidate_mode="final",
+            harmbench_run_index=0,
             overwrite=False,
         )
 
