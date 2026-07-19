@@ -31,6 +31,7 @@ from utils.prompt_utils import apply_template  # noqa: E402
 
 
 CANDIDATE_SELECTION_RULE = "last"
+TRAJECTORY_SELECTION_RULE = "logs_run_then_saved_final_sha256_deduplicated"
 
 
 def parse_args(argv=None):
@@ -55,6 +56,12 @@ def parse_args(argv=None):
     parser.add_argument("--expected-transformers-version", default=None)
     parser.add_argument("--source-harmbench-generation-commit", required=True)
     parser.add_argument("--source-harmbench-current-commit", required=True)
+    parser.add_argument(
+        "--candidate-mode",
+        choices=("final", "trajectory"),
+        default="final",
+    )
+    parser.add_argument("--harmbench-run-index", type=int, default=0)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args(argv)
 
@@ -129,14 +136,20 @@ def load_harmbench_records(
     behavior_ids,
     source_harmbench_generation_commit,
     source_harmbench_current_commit,
+    candidate_mode="final",
+    harmbench_run_index=0,
 ):
-    """Load final test cases in CSV order without consulting AutoDAN logs."""
+    """Load saved-final or trajectory candidates in behavior CSV order."""
 
     requested = list(behavior_ids)
     if not requested:
         raise ValueError("at least one BehaviorID must be requested")
     if len(requested) != len(set(requested)):
         raise ValueError("requested BehaviorIDs contain duplicates")
+    if candidate_mode not in {"final", "trajectory"}:
+        raise ValueError(f"unknown candidate mode: {candidate_mode!r}")
+    if harmbench_run_index < 0:
+        raise ValueError("HarmBench run index must be non-negative")
 
     test_cases_dir = Path(harmbench_test_cases_dir).resolve()
     if not test_cases_dir.is_dir():
@@ -166,8 +179,18 @@ def load_harmbench_records(
         "source_test_case_files": [],
         "source_method_config_files": [],
     }
+    if candidate_mode == "trajectory":
+        source_manifest.update(
+            {
+                "candidate_mode": candidate_mode,
+                "harmbench_run_index": harmbench_run_index,
+                "candidate_selection_rule": TRAJECTORY_SELECTION_RULE,
+                "source_logs_files": [],
+            }
+        )
 
     records = []
+    processed_behavior_ids = set()
     requested_set = set(requested)
     for csv_row in csv_rows:
         behavior_id = csv_row["behavior_id"]
@@ -247,33 +270,150 @@ def load_harmbench_records(
                 "sha256": method_config_sha256,
             }
         )
-        records.append(
+        provenance = {
+            "attack_source": "HarmBench",
+            "attack_method": "AutoDAN",
+            "selection_split": "selection",
+            "source_test_cases_path": str(test_cases_path),
+            "source_test_cases_sha256": test_cases_sha256,
+            "source_method_config_path": str(method_config_path),
+            "source_method_config_sha256": method_config_sha256,
+            "source_behaviors_csv_path": str(csv_path),
+            "source_behaviors_csv_sha256": source_manifest[
+                "source_behaviors_csv_sha256"
+            ],
+            "source_harmbench_generation_commit": (
+                source_harmbench_generation_commit
+            ),
+            "source_harmbench_current_commit": source_harmbench_current_commit,
+        }
+
+        if candidate_mode == "final":
+            records.append(
+                {
+                    **csv_row,
+                    "attack_prompt": attack_prompt,
+                    "attack_prompt_sha256": sha256_text(attack_prompt),
+                    "candidate_index": candidate_index,
+                    "candidate_count": len(candidates),
+                    "candidate_selection_rule": CANDIDATE_SELECTION_RULE,
+                    **provenance,
+                }
+            )
+            processed_behavior_ids.add(behavior_id)
+            continue
+
+        logs_path = test_cases_path.with_name("logs.json")
+        if not logs_path.is_file():
+            raise FileNotFoundError(
+                f"logs.json does not exist for {behavior_id!r}: {logs_path}"
+            )
+        try:
+            logs_payload = json.loads(logs_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid JSON in {logs_path}: {exc}") from exc
+        if not isinstance(logs_payload, dict):
+            raise ValueError(f"{logs_path}: top-level value must be an object")
+        if behavior_id not in logs_payload:
+            raise ValueError(f"{logs_path}: missing BehaviorID key {behavior_id!r}")
+        runs = logs_payload[behavior_id]
+        if not isinstance(runs, list):
+            raise ValueError(f"{logs_path}: runs for {behavior_id!r} must be a list")
+        if not runs:
+            raise ValueError(f"{logs_path}: run list for {behavior_id!r} is empty")
+        if harmbench_run_index >= len(runs):
+            raise ValueError(
+                f"{logs_path}: run index {harmbench_run_index} is out of range "
+                f"for {len(runs)} run(s)"
+            )
+        steps = runs[harmbench_run_index]
+        if not isinstance(steps, list):
+            raise ValueError(
+                f"{logs_path}: run {harmbench_run_index} for {behavior_id!r} "
+                "must be a list"
+            )
+
+        chronological_candidates = []
+        for step_index, step in enumerate(steps):
+            if not isinstance(step, dict):
+                raise ValueError(
+                    f"{logs_path}: step {step_index} in run "
+                    f"{harmbench_run_index} must be an object"
+                )
+            logged_test_case = step.get("test_case")
+            if not isinstance(logged_test_case, str):
+                raise ValueError(
+                    f"{logs_path}: test_case at step {step_index} must be a string"
+                )
+            logged_loss = step.get("loss")
+            if isinstance(logged_loss, bool) or not isinstance(
+                logged_loss, (int, float)
+            ):
+                raise ValueError(
+                    f"{logs_path}: loss at step {step_index} must be numeric"
+                )
+            chronological_candidates.append(
+                {
+                    "attack_prompt": logged_test_case,
+                    "candidate_origin": "logs_step",
+                    "harmbench_step_index": step_index,
+                    "logged_loss": logged_loss,
+                    "is_saved_final_candidate": False,
+                }
+            )
+        chronological_candidates.append(
             {
-                **csv_row,
                 "attack_prompt": attack_prompt,
-                "attack_prompt_sha256": sha256_text(attack_prompt),
-                "candidate_index": candidate_index,
-                "candidate_count": len(candidates),
-                "candidate_selection_rule": CANDIDATE_SELECTION_RULE,
-                "attack_source": "HarmBench",
-                "attack_method": "AutoDAN",
-                "selection_split": "selection",
-                "source_test_cases_path": str(test_cases_path),
-                "source_test_cases_sha256": test_cases_sha256,
-                "source_method_config_path": str(method_config_path),
-                "source_method_config_sha256": method_config_sha256,
-                "source_behaviors_csv_path": str(csv_path),
-                "source_behaviors_csv_sha256": source_manifest[
-                    "source_behaviors_csv_sha256"
-                ],
-                "source_harmbench_generation_commit": (
-                    source_harmbench_generation_commit
-                ),
-                "source_harmbench_current_commit": source_harmbench_current_commit,
+                "candidate_origin": "saved_final",
+                "harmbench_step_index": None,
+                "logged_loss": None,
+                "is_saved_final_candidate": True,
             }
         )
 
-    if len(records) != len(requested):
+        unique_candidates = []
+        seen_prompt_hashes = set()
+        duplicate_candidates_removed = 0
+        for item in chronological_candidates:
+            prompt_hash = sha256_text(item["attack_prompt"])
+            if prompt_hash in seen_prompt_hashes:
+                duplicate_candidates_removed += 1
+                continue
+            seen_prompt_hashes.add(prompt_hash)
+            unique_candidates.append(
+                {**item, "attack_prompt_sha256": prompt_hash}
+            )
+        if not unique_candidates:
+            raise ValueError(
+                f"{logs_path}: trajectory for {behavior_id!r} has no candidates"
+            )
+
+        logs_sha256 = sha256_file(logs_path)
+        source_manifest["source_logs_files"].append(
+            {
+                "behavior_id": behavior_id,
+                "path": str(logs_path),
+                "sha256": logs_sha256,
+            }
+        )
+        trajectory_candidate_count = len(unique_candidates)
+        for attempt_index, item in enumerate(unique_candidates):
+            records.append(
+                {
+                    **csv_row,
+                    **item,
+                    "attempt_index": attempt_index,
+                    "harmbench_run_index": harmbench_run_index,
+                    "trajectory_candidate_count": trajectory_candidate_count,
+                    "duplicate_candidates_removed": duplicate_candidates_removed,
+                    "source_logs_path": str(logs_path),
+                    "source_logs_sha256": logs_sha256,
+                    **provenance,
+                }
+            )
+        processed_behavior_ids.add(behavior_id)
+
+    if processed_behavior_ids != requested_set:
         raise ValueError("not every requested BehaviorID was selected exactly once")
     return records, source_manifest
 
@@ -455,7 +595,11 @@ def build_summary(
     keyword_failure_count = sum(
         row["keyword_success"] is False for row in generated
     )
-    return {
+    behavior_ids = list(dict.fromkeys(record["behavior_id"] for record in records))
+    raw_index_by_behavior = {
+        record["behavior_id"]: record["raw_index"] for record in records
+    }
+    summary = {
         "total": len(results),
         "generation_success_count": len(generated),
         "generation_failed_count": len(results) - len(generated),
@@ -464,8 +608,8 @@ def build_summary(
         "keyword_asr": (
             keyword_success_count / len(generated) if generated else None
         ),
-        "behavior_ids": [record["behavior_id"] for record in records],
-        "raw_indices": [record["raw_index"] for record in records],
+        "behavior_ids": behavior_ids,
+        "raw_indices": [raw_index_by_behavior[item] for item in behavior_ids],
         "model_path": str(Path(model_path).resolve()),
         "decoding_config": dict(decoding_config),
         "transformers_version": transformers_version,
@@ -487,6 +631,63 @@ def build_summary(
         "output_jsonl_path": str(Path(output_jsonl).resolve()),
         "source_manifest": source_manifest,
     }
+    if source_manifest.get("candidate_mode") == "trajectory":
+        results_by_behavior = {behavior_id: [] for behavior_id in behavior_ids}
+        for row in results:
+            results_by_behavior[row["behavior_id"]].append(row)
+        successful_behavior_ids = [
+            behavior_id
+            for behavior_id in behavior_ids
+            if any(
+                row["keyword_success"] is True
+                for row in results_by_behavior[behavior_id]
+            )
+        ]
+        first_success_attempt_by_behavior = {}
+        for behavior_id in behavior_ids:
+            successful_attempts = [
+                row["attempt_index"]
+                for row in results_by_behavior[behavior_id]
+                if row["keyword_success"] is True
+            ]
+            first_success_attempt_by_behavior[behavior_id] = (
+                min(successful_attempts) if successful_attempts else None
+            )
+        duplicate_candidates_removed_by_behavior = {
+            behavior_id: results_by_behavior[behavior_id][0][
+                "duplicate_candidates_removed"
+            ]
+            for behavior_id in behavior_ids
+        }
+        behavior_success_count = len(successful_behavior_ids)
+        summary.update(
+            {
+                "candidate_mode": "trajectory",
+                "total_candidate_attempts": len(results),
+                "candidate_keyword_asr": summary["keyword_asr"],
+                "behavior_success_count": behavior_success_count,
+                "behavior_failure_count": (
+                    len(behavior_ids) - behavior_success_count
+                ),
+                "behavior_asr": (
+                    behavior_success_count / len(behavior_ids)
+                    if behavior_ids
+                    else None
+                ),
+                "successful_behavior_ids": successful_behavior_ids,
+                "first_success_attempt_by_behavior": (
+                    first_success_attempt_by_behavior
+                ),
+                "candidate_attempt_count_by_behavior": {
+                    behavior_id: len(results_by_behavior[behavior_id])
+                    for behavior_id in behavior_ids
+                },
+                "duplicate_candidates_removed_by_behavior": (
+                    duplicate_candidates_removed_by_behavior
+                ),
+            }
+        )
+    return summary
 
 
 def run(
@@ -504,12 +705,16 @@ def run(
         actual_transformers_version,
     )
     behavior_ids = parse_behavior_ids(args.behavior_ids)
+    candidate_mode = getattr(args, "candidate_mode", "final")
+    harmbench_run_index = getattr(args, "harmbench_run_index", 0)
     records, source_manifest = load_harmbench_records(
         args.harmbench_test_cases_dir,
         args.behaviors_csv,
         behavior_ids,
         args.source_harmbench_generation_commit,
         args.source_harmbench_current_commit,
+        candidate_mode=candidate_mode,
+        harmbench_run_index=harmbench_run_index,
     )
     source_manifest["seed"] = args.seed
 
