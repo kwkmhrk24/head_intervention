@@ -4,7 +4,7 @@ import io
 import json
 import tempfile
 import unittest
-from contextlib import contextmanager, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -17,7 +17,9 @@ from scripts.evaluate_harmbench_autodan_baseline import (
     configure_model_for_baseline,
     evaluate_records,
     load_harmbench_records,
+    parse_args,
     parse_behavior_ids,
+    parse_harmbench_run_indices,
     run,
     sha256_file,
     sha256_text,
@@ -80,7 +82,13 @@ def fake_cache_context(model):
     yield {"generation_default_dynamic_cache_disabled": True}
 
 
-def write_fixture(root, rows, payloads, logs_payloads=None):
+def write_fixture(
+    root,
+    rows,
+    payloads,
+    logs_payloads=None,
+    method_config_payloads=None,
+):
     root = Path(root)
     csv_path = root / "behaviors.csv"
     with csv_path.open("w", newline="", encoding="utf-8") as handle:
@@ -101,8 +109,12 @@ def write_fixture(root, rows, payloads, logs_payloads=None):
         )
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload), encoding="utf-8")
+        method_config = (method_config_payloads or {}).get(
+            behavior_id,
+            {"behavior_id": behavior_id, "resolved": True},
+        )
         (path.parent / "method_config.json").write_text(
-            json.dumps({"behavior_id": behavior_id, "resolved": True}),
+            json.dumps(method_config),
             encoding="utf-8",
         )
     for behavior_id, payload in (logs_payloads or {}).items():
@@ -123,6 +135,7 @@ def load_records(
     behavior_ids,
     candidate_mode="final",
     harmbench_run_index=0,
+    harmbench_run_indices=None,
 ):
     return load_harmbench_records(
         test_cases_dir,
@@ -132,7 +145,34 @@ def load_records(
         "current-commit",
         candidate_mode=candidate_mode,
         harmbench_run_index=harmbench_run_index,
+        harmbench_run_indices=harmbench_run_indices,
     )
+
+
+def v2_step(run_index, run_seed, step_index, test_case, loss):
+    return {
+        "log_schema_version": 2,
+        "run_index": run_index,
+        "run_seed": run_seed,
+        "step_index": step_index,
+        "test_case": test_case,
+        "loss": loss,
+        "candidate_role": "population_best",
+    }
+
+
+def three_v2_runs(prompts=None):
+    prompts = prompts or (("A", "B"), ("C", "D"), ("E", "F"))
+    seeds = (100, 200, 300)
+    return [
+        [
+            v2_step(run_index, seeds[run_index], step_index, prompt, loss)
+            for step_index, (prompt, loss) in enumerate(
+                zip(run_prompts, (1.0 + run_index, 0.5 + run_index))
+            )
+        ]
+        for run_index, run_prompts in enumerate(prompts)
+    ]
 
 
 def base_record(behavior_id="b1", raw_index=4, attack_prompt="ATTACK_SECRET"):
@@ -166,6 +206,68 @@ def source_manifest():
         "source_behaviors_csv_path": "/source/behaviors.csv",
         "source_behaviors_csv_sha256": "behaviors-sha",
     }
+
+
+class HarmBenchRunIndicesCLITests(unittest.TestCase):
+    @staticmethod
+    def _required_args():
+        return [
+            "--model", "/model",
+            "--harmbench-test-cases-dir", "/test-cases",
+            "--behaviors-csv", "/behaviors.csv",
+            "--behavior-ids", "b1",
+            "--output-jsonl", "/output.jsonl",
+            "--summary-json", "/summary.json",
+            "--source-harmbench-generation-commit", "generation",
+            "--source-harmbench-current-commit", "current",
+        ]
+
+    def test_parses_multiple_run_indices_in_given_order(self):
+        args = parse_args(
+            self._required_args()
+            + [
+                "--candidate-mode", "trajectory",
+                "--harmbench-run-indices", "2,0,1",
+            ]
+        )
+        self.assertEqual(args.harmbench_run_indices, [2, 0, 1])
+        self.assertEqual(args.harmbench_run_index, 0)
+
+    def test_existing_single_run_default_is_preserved(self):
+        args = parse_args(self._required_args())
+        self.assertEqual(args.harmbench_run_index, 0)
+        self.assertIsNone(args.harmbench_run_indices)
+        self.assertEqual(args.candidate_mode, "final")
+
+    def test_run_indices_parser_rejects_invalid_values(self):
+        for value, pattern in (
+            ("", "at least one"),
+            ("0,,1", "empty run index"),
+            ("0,-1", "non-negative"),
+            ("0,1,0", "duplicate"),
+            ("0,x", "integers"),
+        ):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(Exception, pattern):
+                    parse_harmbench_run_indices(value)
+
+    def test_cli_rejects_explicit_single_and_multiple_run_options(self):
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            parse_args(
+                self._required_args()
+                + [
+                    "--candidate-mode", "trajectory",
+                    "--harmbench-run-index", "0",
+                    "--harmbench-run-indices", "0,1,2",
+                ]
+            )
+
+    def test_cli_rejects_multiple_runs_in_final_mode(self):
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            parse_args(
+                self._required_args()
+                + ["--harmbench-run-indices", "0,1,2"]
+            )
 
 
 class HarmBenchInputTests(unittest.TestCase):
@@ -475,6 +577,210 @@ class HarmBenchInputTests(unittest.TestCase):
                 )
 
 
+class SchemaV2MultirunInputTests(unittest.TestCase):
+    @staticmethod
+    def _load(
+        runs,
+        finals=("B", "D", "F"),
+        *,
+        method_run_count=3,
+        run_indices=(0, 1, 2),
+    ):
+        rows = [{"BehaviorID": "b1", "Behavior": "goal", "RawIndex": "4"}]
+        with tempfile.TemporaryDirectory() as directory:
+            test_cases_dir, csv_path = write_fixture(
+                directory,
+                rows,
+                {"b1": {"b1": list(finals)}},
+                {"b1": {"b1": runs}},
+                {
+                    "b1": {
+                        "num_test_cases_per_behavior": method_run_count,
+                        "resolved": True,
+                    }
+                },
+            )
+            return load_records(
+                test_cases_dir,
+                csv_path,
+                ["b1"],
+                candidate_mode="trajectory",
+                harmbench_run_indices=list(run_indices),
+            )
+
+    def test_three_runs_follow_run_then_step_order(self):
+        records, manifest = self._load(three_v2_runs())
+
+        self.assertEqual(
+            [record["attack_prompt"] for record in records],
+            ["A", "B", "C", "D", "E", "F"],
+        )
+        self.assertEqual([record["attempt_index"] for record in records], list(range(6)))
+        self.assertEqual(
+            [record["harmbench_run_index"] for record in records],
+            [0, 0, 1, 1, 2, 2],
+        )
+        self.assertEqual(
+            [record["harmbench_step_index"] for record in records],
+            [0, 1, 0, 1, 0, 1],
+        )
+        self.assertEqual(
+            [record["run_seed"] for record in records],
+            [100, 100, 200, 200, 300, 300],
+        )
+        self.assertEqual(
+            [record["logged_loss"] for record in records],
+            [1.0, 0.5, 2.0, 1.5, 3.0, 2.5],
+        )
+        self.assertEqual(
+            [record["is_saved_final_candidate"] for record in records],
+            [False, True, False, True, False, True],
+        )
+        self.assertTrue(all(record["log_schema_version"] == 2 for record in records))
+        self.assertTrue(
+            all(record["candidate_role"] == "population_best" for record in records)
+        )
+        self.assertTrue(all(record["candidate_origin"] == "logs_step" for record in records))
+        self.assertEqual(manifest["selected_harmbench_run_indices"], [0, 1, 2])
+        self.assertEqual(manifest["run_evaluation_order"], "run_then_step")
+        self.assertEqual(manifest["logs_schema_version"], 2)
+        self.assertEqual(
+            manifest["run_seeds_by_behavior"],
+            {"b1": {"0": 100, "1": 200, "2": 300}},
+        )
+        self.assertEqual(manifest["raw_candidate_count_by_behavior"], {"b1": 6})
+        self.assertEqual(
+            manifest["candidate_count_after_dedup_by_behavior"], {"b1": 6}
+        )
+
+    def test_requested_run_order_is_preserved(self):
+        records, manifest = self._load(
+            three_v2_runs(), run_indices=(2, 0, 1)
+        )
+        self.assertEqual(
+            [record["attack_prompt"] for record in records],
+            ["E", "F", "A", "B", "C", "D"],
+        )
+        self.assertEqual(
+            [record["harmbench_run_index"] for record in records],
+            [2, 2, 0, 0, 1, 1],
+        )
+        self.assertEqual(manifest["selected_harmbench_run_indices"], [2, 0, 1])
+
+    def test_cross_run_dedup_preserves_first_metadata_and_final_appearance(self):
+        runs = three_v2_runs((("A", "B"), ("B", "C"), ("A", "D")))
+        records, manifest = self._load(runs, finals=("B", "C", "D"))
+
+        self.assertEqual(
+            [record["attack_prompt"] for record in records],
+            ["A", "B", "C", "D"],
+        )
+        self.assertEqual([record["attempt_index"] for record in records], [0, 1, 2, 3])
+        self.assertEqual(records[0]["harmbench_run_index"], 0)
+        self.assertEqual(records[0]["harmbench_step_index"], 0)
+        self.assertEqual(records[0]["run_seed"], 100)
+        self.assertEqual(records[0]["logged_loss"], 1.0)
+        self.assertFalse(records[0]["is_saved_final_candidate"])
+        self.assertFalse(records[0]["appears_as_saved_final"])
+        self.assertTrue(records[1]["is_saved_final_candidate"])
+        self.assertTrue(records[1]["appears_as_saved_final"])
+        self.assertEqual(records[0]["raw_candidate_count_before_dedup"], 6)
+        self.assertEqual(records[0]["candidate_count_after_dedup"], 4)
+        self.assertEqual(records[0]["duplicate_candidates_removed"], 2)
+        self.assertEqual(
+            records[0]["duplicate_candidates_removed_by_run"],
+            {"0": 0, "1": 1, "2": 1},
+        )
+        self.assertEqual(
+            manifest["duplicate_candidates_removed_by_behavior"], {"b1": 2}
+        )
+        self.assertEqual(
+            manifest["duplicate_candidates_removed_by_run_and_behavior"],
+            {"b1": {"0": 0, "1": 1, "2": 1}},
+        )
+
+    def test_later_saved_final_duplicate_is_recorded_without_replacing_metadata(self):
+        runs = three_v2_runs((("A", "B"), ("C", "A"), ("D", "E")))
+        records, _ = self._load(runs, finals=("B", "A", "E"))
+        first_a = records[0]
+
+        self.assertEqual(first_a["attack_prompt"], "A")
+        self.assertEqual(first_a["harmbench_run_index"], 0)
+        self.assertEqual(first_a["harmbench_step_index"], 0)
+        self.assertFalse(first_a["is_saved_final_candidate"])
+        self.assertTrue(first_a["appears_as_saved_final"])
+        self.assertEqual(first_a["saved_final_run_indices"], [1])
+
+    def test_schema_v2_single_run_uses_aligned_logs_without_appending_final(self):
+        runs = [three_v2_runs()[0]]
+        records, manifest = self._load(
+            runs,
+            finals=("B",),
+            method_run_count=1,
+            run_indices=(0,),
+        )
+        self.assertEqual([record["attack_prompt"] for record in records], ["A", "B"])
+        self.assertEqual(len(records), 2)
+        self.assertTrue(records[-1]["is_saved_final_candidate"])
+        self.assertEqual(manifest["logs_schema_version"], 2)
+
+    def test_rejects_invalid_schema_v2_records(self):
+        cases = []
+
+        runs = three_v2_runs()
+        runs[1][0]["run_index"] = 0
+        cases.append(("run index mismatch", runs, ("B", "D", "F"), 3, (0, 1, 2), "run 1, step 0.*run_index"))
+
+        runs = three_v2_runs()
+        runs[1][1]["run_seed"] = 201
+        cases.append(("seed changes", runs, ("B", "D", "F"), 3, (0, 1, 2), "run 1, step 1.*run_seed changed"))
+
+        runs = three_v2_runs()
+        runs[1][1]["step_index"] = 2
+        cases.append(("step gap", runs, ("B", "D", "F"), 3, (0, 1, 2), "run 1, step 1.*step_index"))
+
+        runs = three_v2_runs()
+        runs[1][0]["log_schema_version"] = 1
+        cases.append(("wrong version", runs, ("B", "D", "F"), 3, (0, 1, 2), "run 1, step 0.*schema v2"))
+
+        runs = three_v2_runs()
+        runs[1][0]["candidate_role"] = "other"
+        cases.append(("wrong role", runs, ("B", "D", "F"), 3, (0, 1, 2), "run 1, step 0.*candidate_role"))
+
+        runs = three_v2_runs()
+        runs[1][0]["loss"] = True
+        cases.append(("bool loss", runs, ("B", "D", "F"), 3, (0, 1, 2), "run 1, step 0.*loss"))
+
+        runs = three_v2_runs()
+        runs[1][0]["run_seed"] = True
+        cases.append(("bool seed", runs, ("B", "D", "F"), 3, (0, 1, 2), "run 1, step 0.*run_seed"))
+
+        runs = three_v2_runs()
+        cases.append(("final mismatch", runs, ("B", "not-D", "F"), 3, (0, 1, 2), "run 1.*saved final"))
+
+        runs = three_v2_runs()
+        cases.append(("final missing", runs, ("B", "D"), 3, (0, 1, 2), "run 2.*saved final is missing"))
+
+        runs = three_v2_runs()
+        cases.append(("method count", runs, ("B", "D", "F"), 2, (0, 1, 2), "run 2.*num_test_cases_per_behavior"))
+
+        runs = three_v2_runs()[:2]
+        cases.append(("run out of range", runs, ("B", "D"), 3, (0, 1, 2), "run index 2 is out of range.*BehaviorID 'b1'.*run 2"))
+
+        runs = three_v2_runs()
+        runs[1] = []
+        cases.append(("empty run", runs, ("B", "D", "F"), 3, (0, 1, 2), "BehaviorID 'b1', run 1.*non-empty schema v2"))
+
+        for name, runs, finals, method_count, indices, pattern in cases:
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, pattern):
+                self._load(
+                    runs,
+                    finals,
+                    method_run_count=method_count,
+                    run_indices=indices,
+                )
+
+
 class BaselineGenerationTests(unittest.TestCase):
     def test_generation_uses_fixed_user_only_no_cache_configuration(self):
         model = FakeModel()
@@ -635,6 +941,108 @@ class TrajectorySummaryTests(unittest.TestCase):
         )
         self.assertEqual(summary["candidate_keyword_asr"], 1 / 3)
         self.assertEqual(summary["keyword_asr"], 1 / 3)
+
+    def test_multirun_first_success_metadata_and_aggregate_counts(self):
+        def record(
+            behavior_id,
+            raw_index,
+            attempt_index,
+            run_index,
+            step_index,
+            run_seed,
+            loss,
+            prompt,
+            is_final=False,
+            duplicates=0,
+        ):
+            return {
+                **base_record(behavior_id, raw_index, prompt),
+                "attempt_index": attempt_index,
+                "harmbench_run_index": run_index,
+                "harmbench_step_index": step_index,
+                "run_seed": run_seed,
+                "logged_loss": loss,
+                "is_saved_final_candidate": is_final,
+                "duplicate_candidates_removed": duplicates,
+                "duplicate_candidates_removed_by_run": {
+                    "0": 0,
+                    "1": duplicates,
+                    "2": 0,
+                },
+            }
+
+        records = [
+            record("b1", 4, 0, 0, 0, 100, 1.0, "b1-r0-s0"),
+            record("b1", 4, 1, 1, 0, 200, 0.9, "b1-r1-s0"),
+            record("b1", 4, 2, 1, 1, 200, 0.8, "b1-r1-s1", True),
+            record("b1", 4, 3, 2, 0, 300, 0.7, "b1-r2-s0", False, 1),
+            record("b2", 5, 0, 0, 0, 400, 1.2, "b2-r0-s0"),
+        ]
+        success_values = [False, False, True, True, False]
+        results = [
+            {
+                **record_item,
+                "generation_failed": False,
+                "keyword_success": keyword_success,
+            }
+            for record_item, keyword_success in zip(records, success_values)
+        ]
+        manifest = {
+            **source_manifest(),
+            "candidate_mode": "trajectory",
+            "seed": 42,
+            "selected_harmbench_run_indices": [0, 1, 2],
+            "run_evaluation_order": "run_then_step",
+            "logs_schema_version": 2,
+            "raw_candidate_count_by_behavior": {"b1": 5, "b2": 1},
+            "candidate_count_after_dedup_by_behavior": {"b1": 4, "b2": 1},
+            "duplicate_candidates_removed_by_behavior": {"b1": 1, "b2": 0},
+            "duplicate_candidates_removed_by_run_and_behavior": {
+                "b1": {"0": 0, "1": 1, "2": 0},
+                "b2": {"0": 0, "1": 0, "2": 0},
+            },
+        }
+
+        summary = build_summary(
+            records,
+            results,
+            "/model",
+            build_decoding_config(32),
+            "4.42.3",
+            "4.42.3",
+            manifest,
+            "2026-01-01T00:00:00+00:00",
+            "/output/results.jsonl",
+        )
+
+        self.assertEqual(summary["behavior_success_count"], 1)
+        self.assertEqual(summary["behavior_failure_count"], 1)
+        self.assertEqual(summary["behavior_asr"], 0.5)
+        self.assertEqual(summary["successful_behavior_ids"], ["b1"])
+        self.assertEqual(
+            summary["first_success_attempt_by_behavior"],
+            {"b1": 2, "b2": None},
+        )
+        first = summary["first_success_candidate_by_behavior"]["b1"]
+        self.assertEqual(first["attempt_index"], 2)
+        self.assertEqual(first["harmbench_run_index"], 1)
+        self.assertEqual(first["harmbench_step_index"], 1)
+        self.assertEqual(first["run_seed"], 200)
+        self.assertEqual(first["logged_loss"], 0.8)
+        self.assertTrue(first["is_saved_final_candidate"])
+        self.assertEqual(
+            first["attack_prompt_sha256"], sha256_text("b1-r1-s1")
+        )
+        self.assertNotIn("attack_prompt", first)
+        self.assertIsNone(summary["first_success_candidate_by_behavior"]["b2"])
+        self.assertEqual(summary["total_raw_candidate_attempts"], 6)
+        self.assertEqual(summary["total_candidate_attempts"], 5)
+        self.assertEqual(summary["total_duplicates_removed"], 1)
+        self.assertEqual(
+            summary["candidate_attempt_count_by_behavior"], {"b1": 4, "b2": 1}
+        )
+        self.assertEqual(len(results), 5)
+        self.assertTrue(results[3]["keyword_success"])
 
 
 class VersionAndOutputTests(unittest.TestCase):

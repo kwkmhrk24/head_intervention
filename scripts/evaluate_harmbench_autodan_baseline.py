@@ -32,6 +32,36 @@ from utils.prompt_utils import apply_template  # noqa: E402
 
 CANDIDATE_SELECTION_RULE = "last"
 TRAJECTORY_SELECTION_RULE = "logs_run_then_saved_final_sha256_deduplicated"
+MULTIRUN_TRAJECTORY_SELECTION_RULE = (
+    "logs_schema_v2_run_then_step_sha256_deduplicated"
+)
+
+
+def parse_harmbench_run_indices(value):
+    if value is None or not value.strip():
+        raise argparse.ArgumentTypeError(
+            "--harmbench-run-indices must contain at least one run index"
+        )
+    items = [item.strip() for item in value.split(",")]
+    if any(not item for item in items):
+        raise argparse.ArgumentTypeError(
+            "--harmbench-run-indices contains an empty run index"
+        )
+    try:
+        indices = [int(item) for item in items]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "--harmbench-run-indices must be comma-separated integers"
+        ) from exc
+    if any(index < 0 for index in indices):
+        raise argparse.ArgumentTypeError(
+            "--harmbench-run-indices must contain only non-negative integers"
+        )
+    if len(indices) != len(set(indices)):
+        raise argparse.ArgumentTypeError(
+            "--harmbench-run-indices contains duplicate run indices"
+        )
+    return indices
 
 
 def parse_args(argv=None):
@@ -61,9 +91,28 @@ def parse_args(argv=None):
         choices=("final", "trajectory"),
         default="final",
     )
-    parser.add_argument("--harmbench-run-index", type=int, default=0)
+    run_group = parser.add_mutually_exclusive_group()
+    # Use None while parsing so argparse can distinguish an explicit ``0`` from
+    # the backward-compatible default when enforcing mutual exclusion.
+    run_group.add_argument("--harmbench-run-index", type=int, default=None)
+    run_group.add_argument(
+        "--harmbench-run-indices",
+        type=parse_harmbench_run_indices,
+        default=None,
+        help=(
+            "Comma-separated 0-based HarmBench run indices. Valid only with "
+            "--candidate-mode trajectory; evaluation follows the given order."
+        ),
+    )
     parser.add_argument("--overwrite", action="store_true")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.harmbench_run_index is None:
+        args.harmbench_run_index = 0
+    if args.harmbench_run_indices is not None and args.candidate_mode != "trajectory":
+        parser.error(
+            "--harmbench-run-indices is valid only with --candidate-mode trajectory"
+        )
+    return args
 
 
 def sha256_bytes(value):
@@ -130,6 +179,141 @@ def _read_behavior_rows(behaviors_csv):
     return behaviors_csv, prepared
 
 
+def _step_error(logs_path, behavior_id, run_index, step_index, message):
+    return ValueError(
+        f"{logs_path}: BehaviorID {behavior_id!r}, run {run_index}, "
+        f"step {step_index}: {message}"
+    )
+
+
+def _validate_schema_v2_run(
+    *,
+    logs_path,
+    behavior_id,
+    run_index,
+    steps,
+    saved_final,
+):
+    if not isinstance(steps, list) or not steps:
+        raise ValueError(
+            f"{logs_path}: BehaviorID {behavior_id!r}, run {run_index} "
+            "must be a non-empty list"
+        )
+
+    run_seed = None
+    candidates = []
+    last_step_index = len(steps) - 1
+    for expected_step_index, step in enumerate(steps):
+        if not isinstance(step, dict):
+            raise _step_error(
+                logs_path,
+                behavior_id,
+                run_index,
+                expected_step_index,
+                "record must be an object",
+            )
+        if type(step.get("log_schema_version")) is not int or step.get(
+            "log_schema_version"
+        ) != 2:
+            raise _step_error(
+                logs_path,
+                behavior_id,
+                run_index,
+                expected_step_index,
+                "log_schema_version must be 2",
+            )
+        if type(step.get("run_index")) is not int or step.get(
+            "run_index"
+        ) != run_index:
+            raise _step_error(
+                logs_path,
+                behavior_id,
+                run_index,
+                expected_step_index,
+                f"record run_index must equal selected run {run_index}",
+            )
+        step_run_seed = step.get("run_seed")
+        if type(step_run_seed) is not int:
+            raise _step_error(
+                logs_path,
+                behavior_id,
+                run_index,
+                expected_step_index,
+                "run_seed must be an integer",
+            )
+        if run_seed is None:
+            run_seed = step_run_seed
+        elif step_run_seed != run_seed:
+            raise _step_error(
+                logs_path,
+                behavior_id,
+                run_index,
+                expected_step_index,
+                f"run_seed changed from {run_seed} to {step_run_seed}",
+            )
+        if type(step.get("step_index")) is not int or step.get(
+            "step_index"
+        ) != expected_step_index:
+            raise _step_error(
+                logs_path,
+                behavior_id,
+                run_index,
+                expected_step_index,
+                f"step_index must equal {expected_step_index}",
+            )
+        test_case = step.get("test_case")
+        if not isinstance(test_case, str):
+            raise _step_error(
+                logs_path,
+                behavior_id,
+                run_index,
+                expected_step_index,
+                "test_case must be a string",
+            )
+        loss = step.get("loss")
+        if isinstance(loss, bool) or not isinstance(loss, (int, float)):
+            raise _step_error(
+                logs_path,
+                behavior_id,
+                run_index,
+                expected_step_index,
+                "loss must be numeric and not bool",
+            )
+        if step.get("candidate_role") != "population_best":
+            raise _step_error(
+                logs_path,
+                behavior_id,
+                run_index,
+                expected_step_index,
+                "candidate_role must be 'population_best'",
+            )
+        candidates.append(
+            {
+                "attack_prompt": test_case,
+                "candidate_origin": "logs_step",
+                "harmbench_run_index": run_index,
+                "harmbench_step_index": expected_step_index,
+                "run_seed": run_seed,
+                "logged_loss": loss,
+                "log_schema_version": 2,
+                "candidate_role": "population_best",
+                "is_saved_final_candidate": (
+                    expected_step_index == last_step_index
+                ),
+            }
+        )
+
+    if saved_final != steps[-1]["test_case"]:
+        raise _step_error(
+            logs_path,
+            behavior_id,
+            run_index,
+            last_step_index,
+            "saved final does not match the last schema v2 log candidate",
+        )
+    return candidates, run_seed
+
+
 def load_harmbench_records(
     harmbench_test_cases_dir,
     behaviors_csv,
@@ -138,6 +322,7 @@ def load_harmbench_records(
     source_harmbench_current_commit,
     candidate_mode="final",
     harmbench_run_index=0,
+    harmbench_run_indices=None,
 ):
     """Load saved-final or trajectory candidates in behavior CSV order."""
 
@@ -150,6 +335,29 @@ def load_harmbench_records(
         raise ValueError(f"unknown candidate mode: {candidate_mode!r}")
     if harmbench_run_index < 0:
         raise ValueError("HarmBench run index must be non-negative")
+    if harmbench_run_indices is not None:
+        if candidate_mode != "trajectory":
+            raise ValueError(
+                "harmbench_run_indices is valid only in trajectory mode"
+            )
+        if not harmbench_run_indices:
+            raise ValueError("harmbench_run_indices must not be empty")
+        if any(
+            isinstance(index, bool) or not isinstance(index, int)
+            for index in harmbench_run_indices
+        ):
+            raise ValueError("harmbench_run_indices must contain only integers")
+        if any(index < 0 for index in harmbench_run_indices):
+            raise ValueError("harmbench_run_indices must be non-negative")
+        if len(harmbench_run_indices) != len(set(harmbench_run_indices)):
+            raise ValueError("harmbench_run_indices contains duplicate run indices")
+
+    selected_run_indices = (
+        list(harmbench_run_indices)
+        if harmbench_run_indices is not None
+        else [harmbench_run_index]
+    )
+    multirun_requested = harmbench_run_indices is not None
 
     test_cases_dir = Path(harmbench_test_cases_dir).resolve()
     if not test_cases_dir.is_dir():
@@ -183,11 +391,30 @@ def load_harmbench_records(
         source_manifest.update(
             {
                 "candidate_mode": candidate_mode,
-                "harmbench_run_index": harmbench_run_index,
-                "candidate_selection_rule": TRAJECTORY_SELECTION_RULE,
+                "harmbench_run_index": (
+                    None if multirun_requested else harmbench_run_index
+                ),
+                "selected_harmbench_run_indices": selected_run_indices,
+                "run_evaluation_order": "run_then_step",
+                "candidate_selection_rule": (
+                    MULTIRUN_TRAJECTORY_SELECTION_RULE
+                    if multirun_requested
+                    else TRAJECTORY_SELECTION_RULE
+                ),
                 "source_logs_files": [],
             }
         )
+        if multirun_requested:
+            source_manifest.update(
+                {
+                    "logs_schema_version": 2,
+                    "run_seeds_by_behavior": {},
+                    "raw_candidate_count_by_behavior": {},
+                    "candidate_count_after_dedup_by_behavior": {},
+                    "duplicate_candidates_removed_by_behavior": {},
+                    "duplicate_candidates_removed_by_run_and_behavior": {},
+                }
+            )
 
     records = []
     processed_behavior_ids = set()
@@ -321,68 +548,182 @@ def load_harmbench_records(
             raise ValueError(f"{logs_path}: runs for {behavior_id!r} must be a list")
         if not runs:
             raise ValueError(f"{logs_path}: run list for {behavior_id!r} is empty")
-        if harmbench_run_index >= len(runs):
-            raise ValueError(
-                f"{logs_path}: run index {harmbench_run_index} is out of range "
-                f"for {len(runs)} run(s)"
-            )
-        steps = runs[harmbench_run_index]
-        if not isinstance(steps, list):
-            raise ValueError(
-                f"{logs_path}: run {harmbench_run_index} for {behavior_id!r} "
-                "must be a list"
-            )
-
         chronological_candidates = []
-        for step_index, step in enumerate(steps):
-            if not isinstance(step, dict):
+        run_seeds = {}
+        schema_v2_used = False
+        for selected_run_index in selected_run_indices:
+            if selected_run_index >= len(runs):
                 raise ValueError(
-                    f"{logs_path}: step {step_index} in run "
-                    f"{harmbench_run_index} must be an object"
+                    f"{logs_path}: run index {selected_run_index} is out of "
+                    f"range for {len(runs)} run(s) (BehaviorID "
+                    f"{behavior_id!r}, run {selected_run_index})"
                 )
-            logged_test_case = step.get("test_case")
-            if not isinstance(logged_test_case, str):
+            steps = runs[selected_run_index]
+            if not isinstance(steps, list):
                 raise ValueError(
-                    f"{logs_path}: test_case at step {step_index} must be a string"
+                    f"{logs_path}: BehaviorID {behavior_id!r}, run "
+                    f"{selected_run_index} must be a list"
                 )
-            logged_loss = step.get("loss")
-            if isinstance(logged_loss, bool) or not isinstance(
-                logged_loss, (int, float)
-            ):
+
+            schema_markers = [
+                step.get("log_schema_version")
+                if isinstance(step, dict)
+                else None
+                for step in steps
+            ]
+            run_is_schema_v2 = bool(steps) and all(
+                type(marker) is int and marker == 2 for marker in schema_markers
+            )
+            run_is_legacy = all(marker is None for marker in schema_markers)
+            if multirun_requested and not run_is_schema_v2:
+                if steps:
+                    first_bad_step = next(
+                        (
+                            index
+                            for index, marker in enumerate(schema_markers)
+                            if type(marker) is not int or marker != 2
+                        ),
+                        0,
+                    )
+                    raise _step_error(
+                        logs_path,
+                        behavior_id,
+                        selected_run_index,
+                        first_bad_step,
+                        "--harmbench-run-indices requires schema v2 logs",
+                    )
                 raise ValueError(
-                    f"{logs_path}: loss at step {step_index} must be numeric"
+                    f"{logs_path}: BehaviorID {behavior_id!r}, run "
+                    f"{selected_run_index}: --harmbench-run-indices requires "
+                    "non-empty schema v2 logs for every selected run"
+                )
+            if not run_is_schema_v2 and not run_is_legacy:
+                first_bad_step = next(
+                    index
+                    for index, marker in enumerate(schema_markers)
+                    if type(marker) is not int or marker != 2
+                )
+                raise _step_error(
+                    logs_path,
+                    behavior_id,
+                    selected_run_index,
+                    first_bad_step,
+                    "mixed or unsupported log schema version",
+                )
+
+            if run_is_schema_v2:
+                schema_v2_used = True
+                if selected_run_index >= len(candidates):
+                    raise _step_error(
+                        test_cases_path,
+                        behavior_id,
+                        selected_run_index,
+                        len(steps) - 1,
+                        "saved final is missing",
+                    )
+                run_candidates, run_seed = _validate_schema_v2_run(
+                    logs_path=logs_path,
+                    behavior_id=behavior_id,
+                    run_index=selected_run_index,
+                    steps=steps,
+                    saved_final=candidates[selected_run_index],
+                )
+                chronological_candidates.extend(run_candidates)
+                run_seeds[str(selected_run_index)] = run_seed
+                continue
+
+            # Backward-compatible legacy single-run trajectory: logs store the
+            # previous candidate, so append the separately saved final.
+            if multirun_requested:
+                raise AssertionError("legacy multirun should have been rejected")
+            for step_index, step in enumerate(steps):
+                if not isinstance(step, dict):
+                    raise ValueError(
+                        f"{logs_path}: step {step_index} in run "
+                        f"{selected_run_index} must be an object"
+                    )
+                logged_test_case = step.get("test_case")
+                if not isinstance(logged_test_case, str):
+                    raise ValueError(
+                        f"{logs_path}: test_case at step {step_index} "
+                        "must be a string"
+                    )
+                logged_loss = step.get("loss")
+                if isinstance(logged_loss, bool) or not isinstance(
+                    logged_loss, (int, float)
+                ):
+                    raise ValueError(
+                        f"{logs_path}: loss at step {step_index} must be numeric"
+                    )
+                chronological_candidates.append(
+                    {
+                        "attack_prompt": logged_test_case,
+                        "candidate_origin": "logs_step",
+                        "harmbench_run_index": selected_run_index,
+                        "harmbench_step_index": step_index,
+                        "logged_loss": logged_loss,
+                        "is_saved_final_candidate": False,
+                    }
                 )
             chronological_candidates.append(
                 {
-                    "attack_prompt": logged_test_case,
-                    "candidate_origin": "logs_step",
-                    "harmbench_step_index": step_index,
-                    "logged_loss": logged_loss,
-                    "is_saved_final_candidate": False,
+                    "attack_prompt": attack_prompt,
+                    "candidate_origin": "saved_final",
+                    "harmbench_run_index": selected_run_index,
+                    "harmbench_step_index": None,
+                    "logged_loss": None,
+                    "is_saved_final_candidate": True,
                 }
             )
-        chronological_candidates.append(
-            {
-                "attack_prompt": attack_prompt,
-                "candidate_origin": "saved_final",
-                "harmbench_step_index": None,
-                "logged_loss": None,
-                "is_saved_final_candidate": True,
-            }
-        )
+
+        if schema_v2_used:
+            configured_runs = method_config.get("num_test_cases_per_behavior")
+            required_runs = max(selected_run_indices) + 1
+            if (
+                isinstance(configured_runs, bool)
+                or not isinstance(configured_runs, int)
+                or configured_runs < required_runs
+            ):
+                raise ValueError(
+                    f"{method_config_path}: BehaviorID {behavior_id!r}, run "
+                    f"{max(selected_run_indices)}: num_test_cases_per_behavior "
+                    f"must be an integer >= {required_runs}"
+                )
 
         unique_candidates = []
-        seen_prompt_hashes = set()
+        candidates_by_hash = {}
         duplicate_candidates_removed = 0
+        duplicate_candidates_removed_by_run = {
+            str(run_index): 0 for run_index in selected_run_indices
+        }
         for item in chronological_candidates:
             prompt_hash = sha256_text(item["attack_prompt"])
-            if prompt_hash in seen_prompt_hashes:
+            if prompt_hash in candidates_by_hash:
                 duplicate_candidates_removed += 1
+                duplicate_run = str(item["harmbench_run_index"])
+                duplicate_candidates_removed_by_run[duplicate_run] += 1
+                retained = candidates_by_hash[prompt_hash]
+                if item["is_saved_final_candidate"]:
+                    retained["appears_as_saved_final"] = True
+                    if item["harmbench_run_index"] not in retained[
+                        "saved_final_run_indices"
+                    ]:
+                        retained["saved_final_run_indices"].append(
+                            item["harmbench_run_index"]
+                        )
                 continue
-            seen_prompt_hashes.add(prompt_hash)
-            unique_candidates.append(
-                {**item, "attack_prompt_sha256": prompt_hash}
-            )
+            retained = {
+                **item,
+                "attack_prompt_sha256": prompt_hash,
+                "appears_as_saved_final": item["is_saved_final_candidate"],
+                "saved_final_run_indices": (
+                    [item["harmbench_run_index"]]
+                    if item["is_saved_final_candidate"]
+                    else []
+                ),
+            }
+            candidates_by_hash[prompt_hash] = retained
+            unique_candidates.append(retained)
         if not unique_candidates:
             raise ValueError(
                 f"{logs_path}: trajectory for {behavior_id!r} has no candidates"
@@ -397,15 +738,40 @@ def load_harmbench_records(
             }
         )
         trajectory_candidate_count = len(unique_candidates)
+        raw_candidate_count = len(chronological_candidates)
+        if schema_v2_used:
+            source_manifest["candidate_selection_rule"] = (
+                MULTIRUN_TRAJECTORY_SELECTION_RULE
+            )
+            source_manifest.setdefault("logs_schema_version", 2)
+            source_manifest.setdefault("run_seeds_by_behavior", {})[
+                behavior_id
+            ] = run_seeds
+            source_manifest.setdefault("raw_candidate_count_by_behavior", {})[
+                behavior_id
+            ] = raw_candidate_count
+            source_manifest.setdefault(
+                "candidate_count_after_dedup_by_behavior", {}
+            )[behavior_id] = trajectory_candidate_count
+            source_manifest.setdefault(
+                "duplicate_candidates_removed_by_behavior", {}
+            )[behavior_id] = duplicate_candidates_removed
+            source_manifest.setdefault(
+                "duplicate_candidates_removed_by_run_and_behavior", {}
+            )[behavior_id] = duplicate_candidates_removed_by_run
         for attempt_index, item in enumerate(unique_candidates):
             records.append(
                 {
                     **csv_row,
                     **item,
                     "attempt_index": attempt_index,
-                    "harmbench_run_index": harmbench_run_index,
                     "trajectory_candidate_count": trajectory_candidate_count,
+                    "raw_candidate_count_before_dedup": raw_candidate_count,
+                    "candidate_count_after_dedup": trajectory_candidate_count,
                     "duplicate_candidates_removed": duplicate_candidates_removed,
+                    "duplicate_candidates_removed_by_run": (
+                        duplicate_candidates_removed_by_run
+                    ),
                     "source_logs_path": str(logs_path),
                     "source_logs_sha256": logs_sha256,
                     **provenance,
@@ -644,26 +1010,87 @@ def build_summary(
             )
         ]
         first_success_attempt_by_behavior = {}
+        first_success_candidate_by_behavior = {}
         for behavior_id in behavior_ids:
-            successful_attempts = [
-                row["attempt_index"]
+            successful_rows = [
+                row
                 for row in results_by_behavior[behavior_id]
                 if row["keyword_success"] is True
             ]
             first_success_attempt_by_behavior[behavior_id] = (
-                min(successful_attempts) if successful_attempts else None
+                successful_rows[0]["attempt_index"] if successful_rows else None
             )
-        duplicate_candidates_removed_by_behavior = {
-            behavior_id: results_by_behavior[behavior_id][0][
-                "duplicate_candidates_removed"
-            ]
+            first_success_candidate_by_behavior[behavior_id] = (
+                {
+                    "attempt_index": successful_rows[0]["attempt_index"],
+                    "harmbench_run_index": successful_rows[0].get(
+                        "harmbench_run_index"
+                    ),
+                    "harmbench_step_index": successful_rows[0].get(
+                        "harmbench_step_index"
+                    ),
+                    "run_seed": successful_rows[0].get("run_seed"),
+                    "attack_prompt_sha256": successful_rows[0][
+                        "attack_prompt_sha256"
+                    ],
+                    "logged_loss": successful_rows[0].get("logged_loss"),
+                    "is_saved_final_candidate": successful_rows[0].get(
+                        "is_saved_final_candidate", False
+                    ),
+                }
+                if successful_rows
+                else None
+            )
+        duplicate_candidates_removed_by_behavior = source_manifest.get(
+            "duplicate_candidates_removed_by_behavior",
+            {
+                behavior_id: results_by_behavior[behavior_id][0][
+                    "duplicate_candidates_removed"
+                ]
+                for behavior_id in behavior_ids
+            },
+        )
+        raw_candidate_count_by_behavior = source_manifest.get(
+            "raw_candidate_count_by_behavior",
+            {
+                behavior_id: (
+                    len(results_by_behavior[behavior_id])
+                    + duplicate_candidates_removed_by_behavior[behavior_id]
+                )
+                for behavior_id in behavior_ids
+            },
+        )
+        candidate_attempt_count_by_behavior = {
+            behavior_id: len(results_by_behavior[behavior_id])
             for behavior_id in behavior_ids
         }
+        duplicate_by_run_and_behavior = source_manifest.get(
+            "duplicate_candidates_removed_by_run_and_behavior",
+            {
+                behavior_id: results_by_behavior[behavior_id][0].get(
+                    "duplicate_candidates_removed_by_run", {}
+                )
+                for behavior_id in behavior_ids
+            },
+        )
         behavior_success_count = len(successful_behavior_ids)
         summary.update(
             {
                 "candidate_mode": "trajectory",
+                "selected_harmbench_run_indices": source_manifest.get(
+                    "selected_harmbench_run_indices",
+                    [source_manifest.get("harmbench_run_index", 0)],
+                ),
+                "run_evaluation_order": source_manifest.get(
+                    "run_evaluation_order", "run_then_step"
+                ),
+                "total_raw_candidate_attempts": sum(
+                    raw_candidate_count_by_behavior.values()
+                ),
                 "total_candidate_attempts": len(results),
+                "total_duplicates_removed": sum(
+                    duplicate_candidates_removed_by_behavior.values()
+                ),
                 "candidate_keyword_asr": summary["keyword_asr"],
                 "behavior_success_count": behavior_success_count,
                 "behavior_failure_count": (
@@ -678,12 +1105,20 @@ def build_summary(
                 "first_success_attempt_by_behavior": (
                     first_success_attempt_by_behavior
                 ),
-                "candidate_attempt_count_by_behavior": {
-                    behavior_id: len(results_by_behavior[behavior_id])
-                    for behavior_id in behavior_ids
-                },
+                "first_success_candidate_by_behavior": (
+                    first_success_candidate_by_behavior
+                ),
+                "raw_candidate_count_by_behavior": (
+                    raw_candidate_count_by_behavior
+                ),
+                "candidate_attempt_count_by_behavior": (
+                    candidate_attempt_count_by_behavior
+                ),
                 "duplicate_candidates_removed_by_behavior": (
                     duplicate_candidates_removed_by_behavior
+                ),
+                "duplicate_candidates_removed_by_run_and_behavior": (
+                    duplicate_by_run_and_behavior
                 ),
             }
         )
@@ -707,6 +1142,11 @@ def run(
     behavior_ids = parse_behavior_ids(args.behavior_ids)
     candidate_mode = getattr(args, "candidate_mode", "final")
     harmbench_run_index = getattr(args, "harmbench_run_index", 0)
+    harmbench_run_indices = getattr(args, "harmbench_run_indices", None)
+    if harmbench_run_indices is not None and candidate_mode != "trajectory":
+        raise ValueError(
+            "harmbench_run_indices is valid only in trajectory mode"
+        )
     records, source_manifest = load_harmbench_records(
         args.harmbench_test_cases_dir,
         args.behaviors_csv,
@@ -715,6 +1155,7 @@ def run(
         args.source_harmbench_current_commit,
         candidate_mode=candidate_mode,
         harmbench_run_index=harmbench_run_index,
+        harmbench_run_indices=harmbench_run_indices,
     )
     source_manifest["seed"] = args.seed
 
