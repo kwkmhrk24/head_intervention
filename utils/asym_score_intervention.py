@@ -1,4 +1,4 @@
-"""Direct antisymmetric attention-score suppression for Transformers 4.42.3 Llama."""
+"""Direct antisymmetric attention-score suppression for Transformers 4.42.3."""
 
 import math
 import types
@@ -11,6 +11,7 @@ import transformers
 from torch import nn
 from transformers.cache_utils import Cache
 from transformers.models.llama import modeling_llama
+from transformers.models.mistral import modeling_mistral
 
 
 SUPPORTED_TRANSFORMERS_VERSION = "4.42.3"
@@ -498,3 +499,165 @@ def patch_llama_attention_scores(
                 module.forward = previous_instance_forward
             else:
                 module.__dict__.pop("forward", None)
+
+
+def _patched_mistral_attention_forward(
+    selected_heads: Sequence[int],
+    beta: float,
+    diagnostics: ScoreInterventionDiagnostics,
+):
+    """Return the audited Transformers 4.42.3 eager Mistral forward."""
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        if use_cache:
+            raise UnsupportedAttentionCacheError(
+                "asym score intervention requires use_cache=False"
+            )
+        if past_key_value is not None:
+            raise UnsupportedAttentionCacheError(
+                "asym score intervention does not support past_key_value"
+            )
+        bsz, q_len, _ = hidden_states.size()
+
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+        query_states = query_states.view(
+            bsz, q_len, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+        key_states = key_states.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
+        value_states = value_states.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
+
+        cos, sin = self.rotary_emb(value_states, position_ids)
+        query_states, key_states = modeling_mistral.apply_rotary_pos_emb(
+            query_states, key_states, cos, sin
+        )
+        key_states = modeling_mistral.repeat_kv(
+            key_states, self.num_key_value_groups
+        )
+        value_states = modeling_mistral.repeat_kv(
+            value_states, self.num_key_value_groups
+        )
+        attn_weights = torch.matmul(
+            query_states, key_states.transpose(2, 3)
+        ) / math.sqrt(self.head_dim)
+
+        # The sole semantic change: post-RoPE/repeat_kv raw scores are edited
+        # before sliding-window/causal masks and before softmax.
+        attn_weights, call_diagnostics = suppress_antisymmetric_component(
+            attn_weights, selected_heads, beta, return_diagnostics=True
+        )
+        diagnostics.record(self.layer_idx, call_diagnostics)
+
+        if attention_mask is not None:
+            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+            attn_weights = attn_weights + causal_mask
+        attn_weights = nn.functional.softmax(
+            attn_weights, dim=-1, dtype=torch.float32
+        ).to(query_states.dtype)
+        attn_weights = nn.functional.dropout(
+            attn_weights, p=self.attention_dropout, training=self.training
+        )
+        attn_output = torch.matmul(attn_weights, value_states)
+        expected_shape = (bsz, self.num_heads, q_len, self.head_dim)
+        if attn_output.size() != expected_shape:
+            raise ValueError(
+                f"`attn_output` should be of size {expected_shape}, but is "
+                f"{attn_output.size()}"
+            )
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+        attn_output = self.o_proj(attn_output)
+        if not output_attentions:
+            attn_weights = None
+        return attn_output, attn_weights, past_key_value
+
+    return forward
+
+
+@contextmanager
+def patch_mistral_attention_scores(
+    model,
+    layer_head_pairs: Sequence[Tuple[int, int]],
+    beta: float,
+):
+    """Temporarily patch selected eager Mistral attention layers."""
+
+    beta = validate_beta(beta)
+    if transformers.__version__ != SUPPORTED_TRANSFORMERS_VERSION:
+        raise RuntimeError(
+            "audited MistralAttention forward supports Transformers "
+            f"{SUPPORTED_TRANSFORMERS_VERSION}, found {transformers.__version__}"
+        )
+    layers = model.model.layers
+    if not layers:
+        raise ValueError("model has no decoder layers")
+    first_attention = layers[0].self_attn
+    grouped = validate_layer_head_pairs(
+        layer_head_pairs,
+        layer_count=len(layers),
+        head_count=first_attention.num_heads,
+    )
+    diagnostics = ScoreInterventionDiagnostics(beta)
+    patched = []
+    try:
+        for layer_index, selected_heads in grouped.items():
+            module = layers[layer_index].self_attn
+            if type(module) is not modeling_mistral.MistralAttention:
+                raise TypeError(
+                    "score intervention requires eager MistralAttention; "
+                    f"layer={layer_index}, found={type(module).__name__}"
+                )
+            if module.layer_idx != layer_index:
+                raise ValueError(
+                    f"attention layer_idx mismatch at layer {layer_index}"
+                )
+            had_instance_forward = "forward" in module.__dict__
+            previous_instance_forward = module.__dict__.get("forward")
+            module.forward = types.MethodType(
+                _patched_mistral_attention_forward(
+                    selected_heads, beta, diagnostics
+                ),
+                module,
+            )
+            patched.append(
+                (module, had_instance_forward, previous_instance_forward)
+            )
+        yield diagnostics
+    finally:
+        for module, had_instance_forward, previous_instance_forward in reversed(
+            patched
+        ):
+            if had_instance_forward:
+                module.forward = previous_instance_forward
+            else:
+                module.__dict__.pop("forward", None)
+
+
+def patch_attention_scores(
+    model,
+    model_family: str,
+    layer_head_pairs: Sequence[Tuple[int, int]],
+    beta: float,
+):
+    """Dispatch to the audited model-specific eager attention adapter."""
+
+    family = model_family.strip().lower()
+    if family == "llama":
+        return patch_llama_attention_scores(model, layer_head_pairs, beta)
+    if family == "mistral":
+        return patch_mistral_attention_scores(model, layer_head_pairs, beta)
+    raise ValueError(f"unsupported model family: {model_family!r}")
