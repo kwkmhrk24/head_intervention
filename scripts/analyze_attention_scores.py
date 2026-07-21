@@ -72,6 +72,25 @@ def get_args():
     parser.add_argument("--tail_tokens", type=int, default=None, help="Analyze only the final N tokens using S[-N:, -N:].")
     parser.add_argument("--system_prompt", type=str, default=None, help="Optional system prompt passed to apply_template().")
     parser.add_argument("--debug", action="store_true", help="Print shape and decomposition diagnostics for the first prompt/head.")
+    parser.add_argument(
+        "--prompt_manifest",
+        default=None,
+        help=(
+            "Optional prompt_manifest.csv from all-head raw extraction; only "
+            "included input rows are analyzed."
+        ),
+    )
+    parser.add_argument(
+        "--condition",
+        choices=("original", "jailbreak"),
+        default=None,
+        help="Condition represented by --prompts_file when using --prompt_manifest.",
+    )
+    parser.add_argument(
+        "--require_exact_tail_window",
+        action="store_true",
+        help="Fail instead of silently shortening a requested tail window.",
+    )
     return parser.parse_args()
 
 
@@ -92,6 +111,101 @@ def read_prompt_rows(path):
                 raise ValueError(f"{path}: line {line_no} missing required key: prompt")
             rows.append(row)
     return rows
+
+
+def _manifest_bool(value, row_number):
+    normalized = str(value).strip().lower()
+    if normalized in {"true", "1"}:
+        return True
+    if normalized in {"false", "0"}:
+        return False
+    raise ValueError(
+        f"prompt manifest has invalid included value at row={row_number}"
+    )
+
+
+def select_rows_from_prompt_manifest(rows, manifest_path, condition):
+    if condition not in {"original", "jailbreak"}:
+        raise ValueError(
+            "--condition original|jailbreak is required with --prompt_manifest"
+        )
+    required = {
+        "raw_prompt_index",
+        "input_row_index",
+        "prompt_id",
+        "source_index",
+        "original_source_index",
+        "jailbreak_source_index",
+        "included",
+    }
+    with Path(manifest_path).open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        missing = sorted(required - set(reader.fieldnames or []))
+        if missing:
+            raise ValueError(f"prompt manifest missing required columns: {missing}")
+        manifest_rows = list(reader)
+    if not manifest_rows:
+        raise ValueError("prompt manifest contains no rows")
+
+    selected = []
+    raw_indices = []
+    source_indices = []
+    for manifest_row_number, manifest_row in enumerate(manifest_rows, start=2):
+        if not _manifest_bool(manifest_row["included"], manifest_row_number):
+            continue
+        try:
+            input_row_index = int(manifest_row["input_row_index"])
+            prompt_id = int(manifest_row["prompt_id"])
+            raw_prompt_index = int(manifest_row["raw_prompt_index"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "prompt manifest contains a non-integer included index: "
+                f"row={manifest_row_number}"
+            ) from exc
+        if input_row_index < 0 or input_row_index >= len(rows):
+            raise ValueError(
+                "prompt manifest input_row_index is out of range: "
+                f"row={manifest_row_number}, input_row_index={input_row_index}, "
+                f"prompt_rows={len(rows)}"
+            )
+        original_source_index = manifest_row["original_source_index"]
+        jailbreak_source_index = manifest_row["jailbreak_source_index"]
+        if original_source_index != jailbreak_source_index:
+            raise ValueError(
+                "prompt manifest source indices differ: "
+                f"prompt_id={prompt_id}"
+            )
+        source_index = manifest_row["source_index"]
+        if source_index != original_source_index:
+            raise ValueError(
+                "prompt manifest canonical source_index differs from condition IDs: "
+                f"prompt_id={prompt_id}"
+            )
+        input_source_index = rows[input_row_index].get(
+            "source_index", rows[input_row_index].get("index", input_row_index)
+        )
+        if str(input_source_index) != source_index:
+            raise ValueError(
+                "prompt JSONL source_index does not match manifest: "
+                f"prompt_id={prompt_id}, condition={condition}"
+            )
+        selected.append(
+            {
+                "row": rows[input_row_index],
+                "prompt_id": prompt_id,
+                "source_index": source_index,
+                "raw_prompt_index": raw_prompt_index,
+            }
+        )
+        raw_indices.append(raw_prompt_index)
+        source_indices.append(source_index)
+    if not selected:
+        raise ValueError("prompt manifest contains no included rows")
+    if raw_indices != list(range(len(selected))):
+        raise ValueError("prompt manifest raw_prompt_index must be contiguous from zero")
+    if len(source_indices) != len(set(source_indices)):
+        raise ValueError("prompt manifest included source_index values are not unique")
+    return selected
 
 
 def parse_heads(heads, model_config):
@@ -365,10 +479,30 @@ def main():
         raise ValueError("--max_prompts must be positive when specified")
     if args.tail_tokens is not None and args.tail_tokens <= 0:
         raise ValueError("--tail_tokens must be positive when specified")
+    if bool(args.prompt_manifest) != bool(args.condition):
+        raise ValueError("--prompt_manifest and --condition must be specified together")
+    if args.require_exact_tail_window and args.tail_tokens is None:
+        raise ValueError("--require_exact_tail_window requires --tail_tokens")
 
     rows = read_prompt_rows(args.prompts_file)
+    if args.prompt_manifest:
+        selected_prompt_rows = select_rows_from_prompt_manifest(
+            rows, args.prompt_manifest, args.condition
+        )
+    else:
+        selected_prompt_rows = [
+            {
+                "row": row,
+                "prompt_id": prompt_id,
+                "source_index": row.get(
+                    "source_index", row.get("index", prompt_id)
+                ),
+                "raw_prompt_index": prompt_id,
+            }
+            for prompt_id, row in enumerate(rows)
+        ]
     if args.max_prompts is not None:
-        rows = rows[:args.max_prompts]
+        selected_prompt_rows = selected_prompt_rows[:args.max_prompts]
 
     model, tokenizer, model_config = load_model_and_tokenizer(args.model)
     apply_rotary_pos_emb_fn, repeat_kv_fn = get_attention_helpers(model_config["model_name"])
@@ -382,7 +516,10 @@ def main():
 
     output_rows = []
     debug_printed = False
-    for prompt_id, row in enumerate(tqdm(rows)):
+    for selected_prompt in tqdm(selected_prompt_rows):
+        row = selected_prompt["row"]
+        prompt_id = selected_prompt["prompt_id"]
+        source_index = selected_prompt["source_index"]
         templated_prompt = apply_template(
             prompts=[row["prompt"]],
             system_prompt=args.system_prompt,
@@ -391,6 +528,17 @@ def main():
         )[0]
         inputs = tokenizer(templated_prompt, return_tensors="pt", add_special_tokens=False).to(model.device)
         seq_len = inputs.input_ids.shape[-1]
+        if (
+            args.require_exact_tail_window
+            and args.tail_tokens is not None
+            and seq_len < args.tail_tokens
+        ):
+            raise ValueError(
+                "Sequence shorter than required tail window: "
+                f"condition={args.condition or 'unspecified'}, "
+                f"prompt_id={prompt_id}, source_index={source_index}, "
+                f"seq_len={seq_len}, tail_tokens={args.tail_tokens}"
+            )
         position_ids = torch.arange(seq_len, device=model.device).unsqueeze(0)
 
         captured_inputs = capture_self_attn_inputs(model, selected_layers, inputs)
@@ -410,6 +558,12 @@ def main():
             query_states, key_states = qk_by_layer[layer]
             score_matrix = compute_score_matrix(query_states, key_states, head)
             score_window, window_type, window_size = select_score_window(score_matrix, args.tail_tokens)
+            if args.require_exact_tail_window and window_size != args.tail_tokens:
+                raise RuntimeError(
+                    "Unexpected shortened attention window: "
+                    f"prompt_id={prompt_id}, source_index={source_index}, "
+                    f"window_size={window_size}, tail_tokens={args.tail_tokens}"
+                )
             metrics = compute_metrics(score_window)
             if args.debug and not debug_printed:
                 print_debug(
@@ -425,7 +579,7 @@ def main():
 
             output_rows.append({
                 "prompt_id": prompt_id,
-                "source_index": row.get("index", ""),
+                "source_index": source_index,
                 "layer": layer,
                 "head": head,
                 "seq_len": seq_len,

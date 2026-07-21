@@ -91,6 +91,16 @@ def get_args() -> argparse.Namespace:
         help="Directory for selected-head summaries and histograms.",
     )
     parser.add_argument(
+        "--model_name",
+        default=None,
+        help="Optional plot label overriding model metadata.",
+    )
+    parser.add_argument(
+        "--attack_name",
+        default=None,
+        help="Optional plot label overriding attack metadata.",
+    )
+    parser.add_argument(
         "--bins",
         type=int,
         default=100,
@@ -129,7 +139,7 @@ def read_head_metrics(path: Path, metric: str) -> pd.DataFrame:
         ) from exc
     if frame.empty:
         raise ValueError(f"Head metrics CSV contains no rows: {path}")
-    required = {"layer", "head", "delta_asym_ratio", metric}
+    required = {"layer", "head", metric}
     missing = sorted(required - set(frame.columns))
     if missing:
         raise ValueError(f"Head metrics CSV missing required columns: {missing}")
@@ -138,7 +148,7 @@ def read_head_metrics(path: Path, metric: str) -> pd.DataFrame:
         raise ValueError(
             f"Head metrics contains duplicate layer/head keys: count={duplicate_count}"
         )
-    for column in dict.fromkeys(("layer", "head", "delta_asym_ratio", metric)):
+    for column in dict.fromkeys(("layer", "head", metric)):
         try:
             values = pd.to_numeric(frame[column], errors="raise").to_numpy(np.float64)
         except Exception as exc:
@@ -219,7 +229,9 @@ def validate_raw_metadata(metadata: Mapping[str, Any]) -> Tuple[int, int, int, i
     if missing:
         raise ValueError(f"Raw metadata missing required keys: {missing}")
 
-    prompt_count = int(metadata["processed_prompt_count"])
+    prompt_count = int(
+        metadata.get("included_pair_count", metadata["processed_prompt_count"])
+    )
     window_size = int(metadata["window_size"])
     elements_per_head = int(metadata["elements_per_head"])
     num_layers = int(metadata["num_layers"])
@@ -253,6 +265,81 @@ def validate_raw_metadata(metadata: Mapping[str, Any]) -> Tuple[int, int, int, i
             f"Unexpected delta definition: {metadata['delta_definition']}"
         )
     return prompt_count, elements_per_head, num_layers, num_heads
+
+
+def _parse_manifest_included(values: pd.Series) -> pd.Series:
+    normalized = values.astype(str).str.strip().str.lower()
+    invalid = ~normalized.isin({"true", "false", "1", "0"})
+    if invalid.any():
+        raise ValueError("Prompt manifest contains invalid included values")
+    return normalized.isin({"true", "1"})
+
+
+def validate_prompt_manifest(
+    raw_output_dir: Path,
+    metadata: Mapping[str, Any],
+    prompt_count: int,
+) -> Tuple[int, int]:
+    manifest_value = metadata.get("prompt_manifest_path")
+    if not manifest_value:
+        return prompt_count, int(metadata.get("excluded_pair_count", 0))
+    manifest_path = Path(str(manifest_value))
+    if not manifest_path.is_absolute():
+        manifest_path = raw_output_dir / manifest_path
+    try:
+        manifest = pd.read_csv(manifest_path)
+    except Exception as exc:
+        raise ValueError(
+            f"Failed to read prompt manifest: path={manifest_path}, "
+            f"error_type={type(exc).__name__}"
+        ) from exc
+    required = {
+        "raw_prompt_index",
+        "input_row_index",
+        "prompt_id",
+        "source_index",
+        "original_source_index",
+        "jailbreak_source_index",
+        "included",
+        "exclusion_reason",
+    }
+    missing = sorted(required - set(manifest.columns))
+    if missing:
+        raise ValueError(f"Prompt manifest missing required columns: {missing}")
+    included_mask = _parse_manifest_included(manifest["included"])
+    included = manifest.loc[included_mask].copy()
+    excluded = manifest.loc[~included_mask].copy()
+    if len(included) != prompt_count:
+        raise ValueError(
+            "Prompt manifest included count does not match raw prompt axis: "
+            f"manifest={len(included)}, raw={prompt_count}"
+        )
+    raw_indices = pd.to_numeric(
+        included["raw_prompt_index"], errors="raise"
+    ).to_numpy(np.int64)
+    if not np.array_equal(raw_indices, np.arange(prompt_count)):
+        raise ValueError("Prompt manifest raw_prompt_index must be contiguous from zero")
+    if included["source_index"].duplicated().any():
+        raise ValueError("Prompt manifest included source_index values are not unique")
+    original_ids = included["original_source_index"].astype(str).to_numpy()
+    jailbreak_ids = included["jailbreak_source_index"].astype(str).to_numpy()
+    canonical_ids = included["source_index"].astype(str).to_numpy()
+    if not (
+        np.array_equal(original_ids, jailbreak_ids)
+        and np.array_equal(canonical_ids, original_ids)
+    ):
+        raise ValueError("Prompt manifest source_index columns do not match")
+    expected_input = metadata.get("input_pair_count")
+    if expected_input is not None and len(manifest) != int(expected_input):
+        raise ValueError(
+            "Prompt manifest row count does not match metadata input_pair_count"
+        )
+    expected_excluded = metadata.get("excluded_pair_count")
+    if expected_excluded is not None and len(excluded) != int(expected_excluded):
+        raise ValueError(
+            "Prompt manifest excluded count does not match metadata"
+        )
+    return len(included), len(excluded)
 
 
 def load_and_validate_raw_arrays(
@@ -349,6 +436,7 @@ def build_summary_row(
     values_per_prompt: int,
     delta_max_abs_error: float,
     output_directory: str,
+    excluded_pair_count: int = 0,
 ) -> Dict[str, Any]:
     row: Dict[str, Any] = {
         "group": selected_row.group,
@@ -358,13 +446,16 @@ def build_summary_row(
         "head_label": selected_row.head_label,
         "selection_metric": metric,
         "selection_metric_value": float(getattr(selected_row, metric)),
-        "delta_asym_ratio": float(selected_row.delta_asym_ratio),
         "prompt_count": prompt_count,
+        "included_pair_count": prompt_count,
+        "excluded_pair_count": excluded_pair_count,
         "values_per_prompt": values_per_prompt,
         "total_values": int(arrays["original"].size),
         "output_directory": output_directory,
         "delta_max_abs_error": delta_max_abs_error,
     }
+    if hasattr(selected_row, "delta_asym_ratio"):
+        row["delta_asym_ratio"] = float(selected_row.delta_asym_ratio)
     for condition in ("original", "jailbreak", "delta"):
         row.update(distribution_statistics(arrays[condition], condition))
     row["std_shift"] = row["jailbreak_std"] - row["original_std"]
@@ -402,14 +493,34 @@ def validate_raw_means(selected_row: Any, summary: Mapping[str, Any]) -> None:
             )
 
 
-def infer_plot_labels(metadata: Mapping[str, Any]) -> Tuple[str, str]:
-    model_path = str(metadata.get("model", metadata.get("model_name", "Model")))
+def infer_plot_labels(
+    metadata: Mapping[str, Any],
+    model_override: str | None = None,
+    attack_override: str | None = None,
+) -> Tuple[str, str]:
+    model_path = str(
+        model_override
+        or metadata.get("model_path")
+        or metadata.get("model")
+        or metadata.get("model_name", "Model")
+    )
     model_label = Path(model_path.rstrip("/")).name or model_path
     if model_label.lower() == "llama-2-7b-chat-hf":
         model_label = "Llama-2-7B-chat"
-    jailbreak_prompts = str(metadata.get("jailbreak_prompts", ""))
-    attack_name = Path(jailbreak_prompts).parent.name
-    attack_label = "AutoDAN" if attack_name.lower() == "autodan" else attack_name
+    jailbreak_prompts = str(
+        metadata.get(
+            "jailbreak_prompts_path", metadata.get("jailbreak_prompts", "")
+        )
+    )
+    attack_name = str(
+        attack_override
+        or metadata.get("attack_name")
+        or Path(jailbreak_prompts).parent.name
+    )
+    attack_label = {
+        "autodan": "AutoDAN",
+        "gcg": "GCG",
+    }.get(attack_name.lower(), attack_name)
     return model_label, attack_label or "Attack"
 
 
@@ -448,7 +559,7 @@ def save_histograms(
         f"{selected_row.head_label} | {metric}={selection_value:+.6f}"
     )
     experiment = (
-        f"S_asym strict lower | tail{window_size} | full {prompt_count} prompts"
+        f"S_asym strict lower | tail{window_size} | {prompt_count} included prompts"
     )
 
     fig, ax = plt.subplots(figsize=(9, 6))
@@ -600,6 +711,9 @@ def main() -> None:
     prompt_count, elements_per_head, num_layers, num_heads = validate_raw_metadata(
         metadata
     )
+    included_pair_count, excluded_pair_count = validate_prompt_manifest(
+        Path(args.raw_output_dir), metadata, prompt_count
+    )
     arrays = load_and_validate_raw_arrays(Path(args.raw_output_dir), metadata)
     if selected["layer"].max() >= num_layers or selected["head"].max() >= num_heads:
         raise ValueError(
@@ -607,7 +721,9 @@ def main() -> None:
             f"num_layers={num_layers}, num_heads={num_heads}"
         )
 
-    model_label, attack_label = infer_plot_labels(metadata)
+    model_label, attack_label = infer_plot_labels(
+        metadata, args.model_name, args.attack_name
+    )
     expected_shape = (prompt_count, elements_per_head)
     summary_rows: List[Dict[str, Any]] = []
     png_paths: List[Path] = []
@@ -635,6 +751,7 @@ def main() -> None:
             elements_per_head,
             delta_error,
             subdirectory_name,
+            excluded_pair_count,
         )
         validate_raw_means(selected_row, summary)
         summary_rows.append(summary)
@@ -677,6 +794,8 @@ def main() -> None:
             f"{row.head_label}, {args.metric}={float(getattr(row, args.metric)):+.6f}"
         )
     print(f"raw array shape: {arrays['original'].shape}")
+    print(f"included prompt pairs: {included_pair_count}")
+    print(f"excluded prompt pairs: {excluded_pair_count}")
     print(f"extracted shape per head: {expected_shape}")
     print(f"values per condition/head: {expected_total}")
     print(f"delta max absolute error: {maximum_delta_error:.9g}")

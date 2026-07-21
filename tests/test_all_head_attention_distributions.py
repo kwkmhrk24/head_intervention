@@ -2,16 +2,20 @@ import csv
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
 
 from scripts.analyze_attention_score_all_heads_distributions import (
+    apply_short_sequence_policy,
+    build_common_metadata,
     compute_mean_distributions,
     mean_over_layer_heads,
     prepare_line_indexed_prompt_pairs,
     require_tail_window,
     strict_lower_positions,
+    validate_prompt_axis,
     validate_output_directories,
 )
 from scripts.plot_attention_score_all_heads_distributions import (
@@ -24,17 +28,18 @@ from scripts.plot_attention_score_all_heads_distributions import (
     symmetric_delta_bin_edges,
     write_mean_quantile_summary,
 )
+from scripts.analyze_attention_scores import select_rows_from_prompt_manifest
 
 
 class AllHeadAttentionDistributionTests(unittest.TestCase):
-    def test_prompt_ids_and_source_indices_use_row_numbers(self):
+    def test_prompt_ids_use_rows_and_source_indices_are_preserved(self):
         original_rows = [
             {"prompt": "original zero", "source_index": 99},
             {"prompt": "original one", "index": 88},
         ]
         jailbreak_rows = [
-            {"prompt": "jailbreak zero", "source_index": 77},
-            {"prompt": "jailbreak one", "index": 66},
+            {"prompt": "jailbreak zero", "source_index": 99},
+            {"prompt": "jailbreak one", "index": 88},
         ]
         with patch(
             "scripts.analyze_attention_score_all_heads_distributions.read_prompt_rows",
@@ -46,13 +51,160 @@ class AllHeadAttentionDistributionTests(unittest.TestCase):
                 max_prompts=None,
             )
         self.assertEqual([pair["prompt_id"] for pair in pairs], [0, 1])
-        self.assertEqual([pair["source_index"] for pair in pairs], [0, 1])
+        self.assertEqual([pair["source_index"] for pair in pairs], [99, 88])
+
+    def test_source_index_mismatch_is_rejected(self):
+        with patch(
+            "scripts.analyze_attention_score_all_heads_distributions.read_prompt_rows",
+            side_effect=[
+                [{"prompt": "original", "index": 10}],
+                [{"prompt": "jailbreak", "index": 11}],
+            ],
+        ):
+            with self.assertRaisesRegex(ValueError, "source_index mismatch"):
+                prepare_line_indexed_prompt_pairs(
+                    "original.jsonl", "jailbreak.jsonl", max_prompts=None
+                )
+
+    @staticmethod
+    def _pairs(count=4):
+        return [
+            {
+                "prompt_id": index,
+                "input_row_index": index,
+                "source_index": 60 + index,
+                "original_source_index": 60 + index,
+                "jailbreak_source_index": 60 + index,
+                "original_prompt": f"o{index}",
+                "jailbreak_prompt": f"j{index}",
+            }
+            for index in range(count)
+        ]
+
+    def test_exclude_pair_policy_handles_each_short_sequence_case(self):
+        included, manifest = apply_short_sequence_policy(
+            self._pairs(),
+            original_seq_lengths=[16, 15, 16, 15],
+            jailbreak_seq_lengths=[16, 16, 15, 15],
+            tail_tokens=16,
+            policy="exclude_pair",
+            expected_included_prompts=1,
+        )
+        self.assertEqual([pair["source_index"] for pair in included], [60])
+        self.assertEqual([row["included"] for row in manifest], [True, False, False, False])
+        self.assertEqual(
+            [row["exclusion_reason"] for row in manifest[1:]],
+            [
+                "original_shorter_than_tail_tokens",
+                "jailbreak_shorter_than_tail_tokens",
+                "original_and_jailbreak_shorter_than_tail_tokens",
+            ],
+        )
+        self.assertEqual(manifest[0]["raw_prompt_index"], 0)
+        self.assertEqual([row["raw_prompt_index"] for row in manifest[1:]], ["", "", ""])
+        validate_prompt_axis(included, manifest, raw_prompt_count=1)
+
+    def test_error_policy_rejects_short_pair(self):
+        with self.assertRaisesRegex(ValueError, "Sequence shorter than tail window"):
+            apply_short_sequence_policy(
+                self._pairs(1),
+                original_seq_lengths=[15],
+                jailbreak_seq_lengths=[20],
+                tail_tokens=16,
+                policy="error",
+            )
+
+    def test_prompt_axis_count_must_match_manifest(self):
+        included, manifest = apply_short_sequence_policy(
+            self._pairs(2), [16, 16], [16, 16], 16, "exclude_pair"
+        )
+        with self.assertRaisesRegex(ValueError, "counts differ"):
+            validate_prompt_axis(included, manifest, raw_prompt_count=1)
+
+    def test_enhanced_metadata_records_pairing_and_model_structure(self):
+        pairs = self._pairs(2)
+        included, manifest = apply_short_sequence_policy(
+            pairs, [16, 15], [20, 20], 16, "exclude_pair"
+        )
+        args = SimpleNamespace(
+            model="/models/Mistral-7B-Instruct-v0.2",
+            original_prompts="original.jsonl",
+            jailbreak_prompts="data/gcg/jailbreak.jsonl",
+            attack_name="GCG",
+            short_sequence_policy="exclude_pair",
+            system_prompt=None,
+        )
+        model = SimpleNamespace(
+            config=SimpleNamespace(num_key_value_heads=8, hidden_size=4096)
+        )
+        tokenizer = SimpleNamespace(chat_template="template")
+        metadata = build_common_metadata(
+            args=args,
+            model_config={"model_name": "Mistral"},
+            input_pair_count=2,
+            included_pairs=included,
+            manifest_rows=manifest,
+            tail_tokens=16,
+            elements_per_head=120,
+            num_layers=32,
+            num_attention_heads=32,
+            row_positions=np.asarray([1]),
+            col_positions=np.asarray([0]),
+            execution_datetime="2026-01-01T00:00:00+00:00",
+            tokenizer=tokenizer,
+            model=model,
+            source_commit="abc123",
+        )
+        self.assertEqual(metadata["input_pair_count"], 2)
+        self.assertEqual(metadata["included_pair_count"], 1)
+        self.assertEqual(metadata["excluded_pair_count"], 1)
+        self.assertEqual(metadata["excluded_source_indices"], [61])
+        self.assertEqual(metadata["num_key_value_heads"], 8)
+        self.assertEqual(metadata["head_dim"], 128)
+        self.assertTrue(metadata["gqa"])
+        self.assertEqual(metadata["prompt_manifest_path"], "prompt_manifest.csv")
+        self.assertEqual(metadata["attack_name"], "GCG")
+        self.assertEqual(metadata["source_commit"], "abc123")
+        self.assertIn("torch_version", metadata)
+        self.assertIn("transformers_version", metadata)
+
+    def test_attention_metrics_can_reuse_included_manifest_rows(self):
+        rows = [
+            {"prompt": "zero", "index": 60},
+            {"prompt": "one", "index": 61},
+            {"prompt": "two", "index": 62},
+        ]
+        columns = [
+            "raw_prompt_index",
+            "input_row_index",
+            "prompt_id",
+            "source_index",
+            "original_source_index",
+            "jailbreak_source_index",
+            "included",
+        ]
+        manifest = [
+            [0, 0, 0, 60, 60, 60, True],
+            ["", 1, 1, 61, 61, 61, False],
+            [1, 2, 2, 62, 62, 62, True],
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "prompt_manifest.csv"
+            with path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(columns)
+                writer.writerows(manifest)
+            selected = select_rows_from_prompt_manifest(rows, path, "original")
+        self.assertEqual([row["raw_prompt_index"] for row in selected], [0, 1])
+        self.assertEqual([row["source_index"] for row in selected], ["60", "62"])
 
     def test_strict_lower_positions_use_row_major_order(self):
         rows, columns = strict_lower_positions(4)
         np.testing.assert_array_equal(rows, [1, 2, 2, 3, 3, 3])
         np.testing.assert_array_equal(columns, [0, 0, 1, 0, 1, 2])
         self.assertEqual(len(rows), 4 * 3 // 2)
+        tail16_rows, _ = strict_lower_positions(16)
+        self.assertEqual(len(tail16_rows), 120)
 
     def test_raw_and_mean_delta_identities(self):
         original = np.arange(2 * 3 * 6, dtype=np.float32).reshape(2, 3, 6)

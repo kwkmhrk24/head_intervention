@@ -1,6 +1,7 @@
 import argparse
 import csv
 import json
+import subprocess
 import sys
 import tempfile
 from datetime import datetime, timezone
@@ -9,6 +10,7 @@ from typing import Any, Dict, List, Sequence, Tuple
 
 import numpy as np
 import torch
+import transformers
 from numpy.lib.format import open_memmap
 from tqdm import tqdm
 
@@ -43,9 +45,24 @@ MEAN_ARRAY_FILENAMES = {
 
 RAW_TARGET_FILENAMES = [
     *RAW_ARRAY_FILENAMES.values(),
+    "prompt_manifest.csv",
     "metadata.json",
     "raw_distribution_summary.csv",
     "per_head_summary.csv",
+]
+
+PROMPT_MANIFEST_COLUMNS = [
+    "raw_prompt_index",
+    "input_row_index",
+    "prompt_id",
+    "source_index",
+    "original_source_index",
+    "jailbreak_source_index",
+    "original_seq_len",
+    "jailbreak_seq_len",
+    "tail_tokens",
+    "included",
+    "exclusion_reason",
 ]
 
 MEAN_TARGET_FILENAMES = [
@@ -177,6 +194,31 @@ def get_args() -> argparse.Namespace:
         help="Optional number of prompt pairs to process.",
     )
     parser.add_argument(
+        "--short_sequence_policy",
+        choices=("error", "exclude_pair"),
+        default="error",
+        help=(
+            "How to handle a pair when either sequence is shorter than "
+            "--tail_tokens (default: error)."
+        ),
+    )
+    parser.add_argument(
+        "--expected_included_prompts",
+        type=int,
+        default=None,
+        help="Optional exact included-pair count required after length filtering.",
+    )
+    parser.add_argument(
+        "--attack_name",
+        default=None,
+        help="Attack label stored in metadata; inferred from the prompt path if omitted.",
+    )
+    parser.add_argument(
+        "--system_prompt",
+        default=None,
+        help="Optional system prompt passed to the existing chat-template helper.",
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Allow replacement of this script's existing target files.",
@@ -213,10 +255,26 @@ def prepare_line_indexed_prompt_pairs(
                 f"jailbreak prompt must be a string: prompt_id={prompt_id}, "
                 f"input_file={jailbreak_path}"
             )
+        original_source_index = original_row.get(
+            "source_index", original_row.get("index", prompt_id)
+        )
+        jailbreak_source_index = jailbreak_row.get(
+            "source_index", jailbreak_row.get("index", prompt_id)
+        )
+        if original_source_index != jailbreak_source_index:
+            raise ValueError(
+                "original/jailbreak source_index mismatch: "
+                f"prompt_id={prompt_id}, "
+                f"original_source_index={original_source_index}, "
+                f"jailbreak_source_index={jailbreak_source_index}"
+            )
         pairs.append(
             {
                 "prompt_id": prompt_id,
-                "source_index": prompt_id,
+                "input_row_index": prompt_id,
+                "source_index": original_source_index,
+                "original_source_index": original_source_index,
+                "jailbreak_source_index": jailbreak_source_index,
                 "original_prompt": original_row["prompt"],
                 "jailbreak_prompt": jailbreak_row["prompt"],
             }
@@ -226,7 +284,152 @@ def prepare_line_indexed_prompt_pairs(
         pairs = pairs[:max_prompts]
     if not pairs:
         raise ValueError("No prompt pairs selected")
+    source_indices = [pair["source_index"] for pair in pairs]
+    try:
+        duplicate_count = len(source_indices) - len(set(source_indices))
+    except TypeError as exc:
+        raise ValueError("source_index values must be scalar/hashable") from exc
+    if duplicate_count:
+        raise ValueError(f"Duplicate source_index values: count={duplicate_count}")
     return pairs
+
+
+def apply_short_sequence_policy(
+    pairs: Sequence[Dict[str, Any]],
+    original_seq_lengths: Sequence[int],
+    jailbreak_seq_lengths: Sequence[int],
+    tail_tokens: int,
+    policy: str,
+    expected_included_prompts: int | None = None,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    if policy not in {"error", "exclude_pair"}:
+        raise ValueError(f"Unsupported short sequence policy: {policy}")
+    if not (
+        len(pairs) == len(original_seq_lengths) == len(jailbreak_seq_lengths)
+    ):
+        raise ValueError("Prompt pairs and sequence-length arrays must have equal length")
+
+    included_pairs: List[Dict[str, Any]] = []
+    manifest_rows: List[Dict[str, Any]] = []
+    for pair, original_seq_len, jailbreak_seq_len in zip(
+        pairs, original_seq_lengths, jailbreak_seq_lengths
+    ):
+        original_seq_len = int(original_seq_len)
+        jailbreak_seq_len = int(jailbreak_seq_len)
+        original_short = original_seq_len < tail_tokens
+        jailbreak_short = jailbreak_seq_len < tail_tokens
+        if original_short or jailbreak_short:
+            if original_short and jailbreak_short:
+                reason = "original_and_jailbreak_shorter_than_tail_tokens"
+            elif original_short:
+                reason = "original_shorter_than_tail_tokens"
+            else:
+                reason = "jailbreak_shorter_than_tail_tokens"
+            if policy == "error":
+                condition = "original" if original_short else "jailbreak"
+                seq_len = original_seq_len if original_short else jailbreak_seq_len
+                require_tail_window(
+                    condition=condition,
+                    input_file="paired_prompt_inputs",
+                    prompt_id=int(pair["prompt_id"]),
+                    source_index=pair["source_index"],
+                    seq_len=seq_len,
+                    tail_tokens=tail_tokens,
+                )
+            raw_prompt_index: int | str = ""
+            included = False
+        else:
+            reason = ""
+            raw_prompt_index = len(included_pairs)
+            included = True
+            included_pair = dict(pair)
+            included_pair.update(
+                {
+                    "raw_prompt_index": raw_prompt_index,
+                    "original_seq_len": original_seq_len,
+                    "jailbreak_seq_len": jailbreak_seq_len,
+                }
+            )
+            included_pairs.append(included_pair)
+
+        manifest_rows.append(
+            {
+                "raw_prompt_index": raw_prompt_index,
+                "input_row_index": int(pair["input_row_index"]),
+                "prompt_id": int(pair["prompt_id"]),
+                "source_index": pair["source_index"],
+                "original_source_index": pair["original_source_index"],
+                "jailbreak_source_index": pair["jailbreak_source_index"],
+                "original_seq_len": original_seq_len,
+                "jailbreak_seq_len": jailbreak_seq_len,
+                "tail_tokens": tail_tokens,
+                "included": included,
+                "exclusion_reason": reason,
+            }
+        )
+
+    if not included_pairs:
+        raise ValueError("No prompt pairs remain after short-sequence filtering")
+    if (
+        expected_included_prompts is not None
+        and len(included_pairs) != expected_included_prompts
+    ):
+        raise ValueError(
+            "Included prompt-pair count differs from expectation: "
+            f"actual={len(included_pairs)}, expected={expected_included_prompts}"
+        )
+    return included_pairs, manifest_rows
+
+
+def measure_pair_sequence_lengths(
+    pairs: Sequence[Dict[str, Any]],
+    tokenizer: Any,
+    model_config: Dict[str, Any],
+    system_prompt: str | None,
+) -> Tuple[List[int], List[int]]:
+    lengths: Dict[str, List[int]] = {"original": [], "jailbreak": []}
+    for pair in tqdm(pairs, desc="tokenizing prompt pairs"):
+        for condition in ("original", "jailbreak"):
+            templated_prompt = apply_template(
+                prompts=[pair[f"{condition}_prompt"]],
+                system_prompt=system_prompt,
+                tokenizer=tokenizer,
+                model_config=model_config,
+            )[0]
+            encoded = tokenizer(
+                templated_prompt,
+                return_tensors="pt",
+                add_special_tokens=False,
+            )
+            lengths[condition].append(int(encoded.input_ids.shape[-1]))
+    return lengths["original"], lengths["jailbreak"]
+
+
+def write_prompt_manifest(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
+    write_dict_rows(path, PROMPT_MANIFEST_COLUMNS, rows)
+
+
+def validate_prompt_axis(
+    included_pairs: Sequence[Dict[str, Any]],
+    manifest_rows: Sequence[Dict[str, Any]],
+    raw_prompt_count: int,
+) -> None:
+    included_manifest = [row for row in manifest_rows if row["included"]]
+    if (
+        len(included_pairs) != len(included_manifest)
+        or len(included_pairs) != raw_prompt_count
+    ):
+        raise ValueError(
+            "Included pair/manifest/raw prompt counts differ: "
+            f"pairs={len(included_pairs)}, manifest={len(included_manifest)}, "
+            f"raw={raw_prompt_count}"
+        )
+    raw_indices = [int(row["raw_prompt_index"]) for row in included_manifest]
+    if raw_indices != list(range(raw_prompt_count)):
+        raise ValueError("Manifest raw_prompt_index must be contiguous from zero")
+    source_indices = [row["source_index"] for row in included_manifest]
+    if len(source_indices) != len(set(source_indices)):
+        raise ValueError("Included manifest source_index values are not unique")
 
 
 def strict_lower_positions(window_size: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -321,6 +524,7 @@ def extract_condition_into_memmap(
     model: Any,
     tokenizer: Any,
     model_config: Dict[str, Any],
+    system_prompt: str | None,
     tail_tokens: int,
     layers: Sequence[int],
     num_attention_heads: int,
@@ -333,7 +537,7 @@ def extract_condition_into_memmap(
         with torch.inference_mode():
             templated_prompt = apply_template(
                 prompts=[prompt],
-                system_prompt=None,
+                system_prompt=system_prompt,
                 tokenizer=tokenizer,
                 model_config=model_config,
             )[0]
@@ -526,6 +730,7 @@ def write_mean_element_csvs(
     col_positions: np.ndarray,
     layer_head_count: int,
     window_size: int,
+    included_pairs: Sequence[Dict[str, Any]] | None = None,
 ) -> None:
     element_path = mean_output_dir / "element_values_all_heads_mean.csv"
     delta_path = mean_output_dir / "delta_element_values_all_heads_mean.csv"
@@ -536,18 +741,26 @@ def write_mean_element_csvs(
             ("original", mean_original),
             ("jailbreak", mean_jailbreak),
         ):
-            for prompt_id in range(values.shape[0]):
+            for raw_prompt_index in range(values.shape[0]):
+                pair = (
+                    included_pairs[raw_prompt_index]
+                    if included_pairs is not None
+                    else {
+                        "prompt_id": raw_prompt_index,
+                        "source_index": raw_prompt_index,
+                    }
+                )
                 for position_index, (row_pos, col_pos) in enumerate(
                     zip(row_positions, col_positions)
                 ):
                     writer.writerow(
                         {
                             "condition": condition,
-                            "prompt_id": prompt_id,
-                            "source_index": prompt_id,
+                            "prompt_id": pair["prompt_id"],
+                            "source_index": pair["source_index"],
                             "row_pos": int(row_pos),
                             "col_pos": int(col_pos),
-                            "value": float(values[prompt_id, position_index]),
+                            "value": float(values[raw_prompt_index, position_index]),
                             "layer_head_count": layer_head_count,
                             "window_size": window_size,
                         }
@@ -556,19 +769,27 @@ def write_mean_element_csvs(
     with delta_path.open("w", newline="", encoding="utf-8") as delta_file:
         writer = csv.DictWriter(delta_file, fieldnames=MEAN_DELTA_COLUMNS)
         writer.writeheader()
-        for prompt_id in range(mean_delta.shape[0]):
+        for raw_prompt_index in range(mean_delta.shape[0]):
+            pair = (
+                included_pairs[raw_prompt_index]
+                if included_pairs is not None
+                else {
+                    "prompt_id": raw_prompt_index,
+                    "source_index": raw_prompt_index,
+                }
+            )
             for position_index, (row_pos, col_pos) in enumerate(
                 zip(row_positions, col_positions)
             ):
                 writer.writerow(
                     {
-                        "prompt_id": prompt_id,
-                        "source_index": prompt_id,
+                        "prompt_id": pair["prompt_id"],
+                        "source_index": pair["source_index"],
                         "row_pos": int(row_pos),
                         "col_pos": int(col_pos),
-                        "original_value": float(mean_original[prompt_id, position_index]),
-                        "jailbreak_value": float(mean_jailbreak[prompt_id, position_index]),
-                        "delta": float(mean_delta[prompt_id, position_index]),
+                        "original_value": float(mean_original[raw_prompt_index, position_index]),
+                        "jailbreak_value": float(mean_jailbreak[raw_prompt_index, position_index]),
+                        "delta": float(mean_delta[raw_prompt_index, position_index]),
                         "layer_head_count": layer_head_count,
                         "window_size": window_size,
                     }
@@ -585,18 +806,27 @@ def write_prompt_level_summary(
     mean_original: np.ndarray,
     mean_jailbreak: np.ndarray,
     mean_delta: np.ndarray,
+    included_pairs: Sequence[Dict[str, Any]] | None = None,
 ) -> None:
     with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=PROMPT_SUMMARY_COLUMNS)
         writer.writeheader()
-        for prompt_id in range(mean_original.shape[0]):
-            original = np.asarray(mean_original[prompt_id])
-            jailbreak = np.asarray(mean_jailbreak[prompt_id])
-            delta = np.asarray(mean_delta[prompt_id])
+        for raw_prompt_index in range(mean_original.shape[0]):
+            pair = (
+                included_pairs[raw_prompt_index]
+                if included_pairs is not None
+                else {
+                    "prompt_id": raw_prompt_index,
+                    "source_index": raw_prompt_index,
+                }
+            )
+            original = np.asarray(mean_original[raw_prompt_index])
+            jailbreak = np.asarray(mean_jailbreak[raw_prompt_index])
+            delta = np.asarray(mean_delta[raw_prompt_index])
             writer.writerow(
                 {
-                    "prompt_id": prompt_id,
-                    "source_index": prompt_id,
+                    "prompt_id": pair["prompt_id"],
+                    "source_index": pair["source_index"],
                     "original_mean": float(np.mean(original, dtype=np.float64)),
                     "jailbreak_mean": float(np.mean(jailbreak, dtype=np.float64)),
                     "delta_mean": float(np.mean(delta, dtype=np.float64)),
@@ -625,7 +855,9 @@ def build_common_metadata(
     *,
     args: argparse.Namespace,
     model_config: Dict[str, Any],
-    prompt_count: int,
+    input_pair_count: int,
+    included_pairs: Sequence[Dict[str, Any]],
+    manifest_rows: Sequence[Dict[str, Any]],
     tail_tokens: int,
     elements_per_head: int,
     num_layers: int,
@@ -633,18 +865,50 @@ def build_common_metadata(
     row_positions: np.ndarray,
     col_positions: np.ndarray,
     execution_datetime: str,
+    tokenizer: Any,
+    model: Any,
+    source_commit: str | None,
 ) -> Dict[str, Any]:
+    included_pair_count = len(included_pairs)
+    excluded_rows = [row for row in manifest_rows if not row["included"]]
+    model_config_object = getattr(model, "config", None)
+    num_key_value_heads = getattr(
+        model_config_object,
+        "num_key_value_heads",
+        num_attention_heads,
+    )
+    head_dim = getattr(model_config_object, "head_dim", None)
+    if head_dim is None:
+        hidden_size = getattr(model_config_object, "hidden_size", None)
+        if hidden_size is not None:
+            head_dim = int(hidden_size) // num_attention_heads
+    attack_name = args.attack_name
+    if attack_name is None:
+        attack_name = Path(args.jailbreak_prompts).parent.name or None
     return {
         "model": args.model,
+        "model_path": args.model,
         "model_name": model_config["model_name"],
         "original_prompts": args.original_prompts,
         "jailbreak_prompts": args.jailbreak_prompts,
-        "processed_prompt_count": prompt_count,
+        "original_prompts_path": args.original_prompts,
+        "jailbreak_prompts_path": args.jailbreak_prompts,
+        "attack_name": attack_name,
+        "input_pair_count": input_pair_count,
+        "included_pair_count": included_pair_count,
+        "excluded_pair_count": len(excluded_rows),
+        "excluded_source_indices": [row["source_index"] for row in excluded_rows],
+        "short_sequence_policy": args.short_sequence_policy,
+        "processed_prompt_count": included_pair_count,
         "tail_tokens": tail_tokens,
         "window_size": tail_tokens,
         "elements_per_head": elements_per_head,
         "num_layers": num_layers,
         "num_attention_heads": num_attention_heads,
+        "num_key_value_heads": int(num_key_value_heads),
+        "head_dim": int(head_dim) if head_dim is not None else None,
+        "gqa": int(num_key_value_heads) != num_attention_heads,
+        "repeat_kv": int(num_key_value_heads) != num_attention_heads,
         "layer_head_count": num_layers * num_attention_heads,
         "dtype": "float32",
         "score_definition": "S = QK^T / sqrt(d_head)",
@@ -655,12 +919,37 @@ def build_common_metadata(
         "strict_lower_position_order": "row-major order",
         "strict_lower_row_positions": row_positions.tolist(),
         "strict_lower_col_positions": col_positions.tolist(),
-        "prompt_id_definition": "zero-based JSONL row index",
-        "source_index_definition": "zero-based JSONL row index",
+        "prompt_id_definition": "zero-based JSONL input row index",
+        "source_index_definition": (
+            "source_index, then index from input JSONL; otherwise input row index"
+        ),
         "delta_definition": "jailbreak - original at paired prompt/layer/head/position",
+        "prompt_manifest_path": "prompt_manifest.csv",
+        "system_prompt": args.system_prompt,
+        "chat_template": {
+            "identifier": "tokenizer.chat_template",
+            "tokenizer_class": type(tokenizer).__name__,
+            "defined": getattr(tokenizer, "chat_template", None) is not None,
+        },
+        "torch_version": torch.__version__,
+        "transformers_version": transformers.__version__,
+        "source_commit": source_commit,
         "execution_datetime_utc": execution_datetime,
         "cli_arguments": vars(args),
     }
+
+
+def get_source_commit(repo_root: Path = REPO_ROOT) -> str | None:
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
 
 
 def main() -> None:
@@ -669,11 +958,16 @@ def main() -> None:
         raise ValueError("--max_prompts must be positive when specified")
     if args.tail_tokens < 2:
         raise ValueError("--tail_tokens must be at least 2")
+    if (
+        args.expected_included_prompts is not None
+        and args.expected_included_prompts <= 0
+    ):
+        raise ValueError("--expected_included_prompts must be positive when specified")
 
     raw_output_dir = Path(args.raw_output_dir)
     mean_output_dir = Path(args.mean_output_dir)
     validate_output_directories(raw_output_dir, mean_output_dir, args.overwrite)
-    pairs = prepare_line_indexed_prompt_pairs(
+    input_pairs = prepare_line_indexed_prompt_pairs(
         args.original_prompts,
         args.jailbreak_prompts,
         args.max_prompts,
@@ -688,6 +982,23 @@ def main() -> None:
     apply_rotary_pos_emb_fn, repeat_kv_fn = get_attention_helpers(
         model_config["model_name"]
     )
+
+    original_seq_lengths, jailbreak_seq_lengths = measure_pair_sequence_lengths(
+        input_pairs,
+        tokenizer,
+        model_config,
+        args.system_prompt,
+    )
+    pairs, manifest_rows = apply_short_sequence_policy(
+        input_pairs,
+        original_seq_lengths,
+        jailbreak_seq_lengths,
+        args.tail_tokens,
+        args.short_sequence_policy,
+        args.expected_included_prompts,
+    )
+    validate_prompt_axis(pairs, manifest_rows, len(pairs))
+    write_prompt_manifest(raw_output_dir / "prompt_manifest.csv", manifest_rows)
 
     row_positions, col_positions = strict_lower_positions(args.tail_tokens)
     elements_per_head = len(row_positions)
@@ -749,7 +1060,7 @@ def main() -> None:
     )
 
     for prompt_index, pair in enumerate(tqdm(pairs, desc="prompt pairs")):
-        _, accumulated_original_mean = extract_condition_into_memmap(
+        original_seq_len, accumulated_original_mean = extract_condition_into_memmap(
             condition="original",
             input_file=args.original_prompts,
             prompt_id=pair["prompt_id"],
@@ -758,6 +1069,7 @@ def main() -> None:
             model=model,
             tokenizer=tokenizer,
             model_config=model_config,
+            system_prompt=args.system_prompt,
             tail_tokens=args.tail_tokens,
             layers=layers,
             num_attention_heads=num_attention_heads,
@@ -766,7 +1078,7 @@ def main() -> None:
             apply_rotary_pos_emb_fn=apply_rotary_pos_emb_fn,
             repeat_kv_fn=repeat_kv_fn,
         )
-        _, accumulated_jailbreak_mean = extract_condition_into_memmap(
+        jailbreak_seq_len, accumulated_jailbreak_mean = extract_condition_into_memmap(
             condition="jailbreak",
             input_file=args.jailbreak_prompts,
             prompt_id=pair["prompt_id"],
@@ -775,6 +1087,7 @@ def main() -> None:
             model=model,
             tokenizer=tokenizer,
             model_config=model_config,
+            system_prompt=args.system_prompt,
             tail_tokens=args.tail_tokens,
             layers=layers,
             num_attention_heads=num_attention_heads,
@@ -783,6 +1096,16 @@ def main() -> None:
             apply_rotary_pos_emb_fn=apply_rotary_pos_emb_fn,
             repeat_kv_fn=repeat_kv_fn,
         )
+        if (
+            original_seq_len != pair["original_seq_len"]
+            or jailbreak_seq_len != pair["jailbreak_seq_len"]
+        ):
+            raise ValueError(
+                "Sequence length changed after prompt filtering: "
+                f"prompt_id={pair['prompt_id']}, source_index={pair['source_index']}, "
+                f"original={original_seq_len}/{pair['original_seq_len']}, "
+                f"jailbreak={jailbreak_seq_len}/{pair['jailbreak_seq_len']}"
+            )
         raw_delta[prompt_index] = (
             raw_jailbreak[prompt_index] - raw_original[prompt_index]
         )
@@ -876,12 +1199,14 @@ def main() -> None:
         col_positions,
         layer_head_count,
         args.tail_tokens,
+        pairs,
     )
     write_distribution_summary(
         mean_output_dir / "all_heads_mean_distribution_summary.csv",
         mean_original,
         mean_jailbreak,
         mean_delta,
+        pairs,
     )
     write_prompt_level_summary(
         mean_output_dir / "prompt_level_all_heads_mean_summary.csv",
@@ -894,7 +1219,9 @@ def main() -> None:
     common_metadata = build_common_metadata(
         args=args,
         model_config=model_config,
-        prompt_count=len(pairs),
+        input_pair_count=len(input_pairs),
+        included_pairs=pairs,
+        manifest_rows=manifest_rows,
         tail_tokens=args.tail_tokens,
         elements_per_head=elements_per_head,
         num_layers=num_layers,
@@ -902,6 +1229,9 @@ def main() -> None:
         row_positions=row_positions,
         col_positions=col_positions,
         execution_datetime=execution_datetime,
+        tokenizer=tokenizer,
+        model=model,
+        source_commit=get_source_commit(),
     )
     raw_metadata = {
         **common_metadata,
@@ -924,7 +1254,9 @@ def main() -> None:
     write_metadata(mean_output_dir / "metadata.json", mean_metadata)
 
     print(f"model name: {model_config['model_name']}")
+    print(f"input prompt pairs: {len(input_pairs)}")
     print(f"processed prompt pairs: {len(pairs)}")
+    print(f"excluded prompt pairs: {len(input_pairs) - len(pairs)}")
     print(f"tail_tokens: {args.tail_tokens}")
     print(f"elements per prompt/head: {elements_per_head}")
     print(f"layer-head count: {layer_head_count}")

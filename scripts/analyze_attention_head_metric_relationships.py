@@ -88,7 +88,11 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--per_head_summary", required=True)
     parser.add_argument("--original_metrics", required=True)
     parser.add_argument("--jailbreak_metrics", required=True)
-    parser.add_argument("--aie", required=True)
+    parser.add_argument(
+        "--aie",
+        default=None,
+        help="Optional AIE tensor. Omit for metric-only datasets such as GCG.",
+    )
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--top_k", type=int, default=20)
     parser.add_argument("--overwrite", action="store_true")
@@ -145,21 +149,30 @@ def validate_unique(frame: pd.DataFrame, keys: Sequence[str], label: str) -> Non
 
 def validate_head_grid(
     frame: pd.DataFrame,
-    expected_layers: int = 32,
-    expected_heads_per_layer: int = 32,
+    expected_layers: int | None = None,
+    expected_heads_per_layer: int | None = None,
 ) -> Tuple[List[int], List[int]]:
     validate_unique(frame, HEAD_KEYS, "head grid")
     layers = sorted(int(value) for value in frame["layer"].unique())
     heads = sorted(int(value) for value in frame["head"].unique())
-    if layers != list(range(expected_layers)):
-        raise ValueError(f"Expected layers 0..{expected_layers - 1}; received={layers}")
-    if heads != list(range(expected_heads_per_layer)):
+    inferred_layers = len(layers) if expected_layers is None else expected_layers
+    inferred_heads = (
+        len(heads) if expected_heads_per_layer is None else expected_heads_per_layer
+    )
+    if layers != list(range(inferred_layers)):
+        raise ValueError(f"Expected layers 0..{inferred_layers - 1}; received={layers}")
+    if heads != list(range(inferred_heads)):
         raise ValueError(
-            f"Expected heads 0..{expected_heads_per_layer - 1}; received={heads}"
+            f"Expected heads 0..{inferred_heads - 1}; received={heads}"
         )
     counts = frame.groupby("layer")["head"].nunique()
-    if not counts.eq(expected_heads_per_layer).all():
-        raise ValueError(f"Each layer must have {expected_heads_per_layer} heads")
+    if not counts.eq(inferred_heads).all():
+        raise ValueError(f"Each layer must have {inferred_heads} heads")
+    if len(frame) != inferred_layers * inferred_heads:
+        raise ValueError(
+            "Head grid is incomplete: "
+            f"rows={len(frame)}, expected={inferred_layers * inferred_heads}"
+        )
     return layers, heads
 
 
@@ -222,6 +235,22 @@ def aggregate_attention_metrics(
     jailbreak_window = int(jailbreak["window_size"].iloc[0])
     if original_window != jailbreak_window:
         raise ValueError("Original/jailbreak window_size values differ")
+
+    source_pairs = original[JOIN_KEYS + ["source_index"]].merge(
+        jailbreak[JOIN_KEYS + ["source_index"]],
+        on=JOIN_KEYS,
+        how="inner",
+        validate="one_to_one",
+        suffixes=("_original", "_jailbreak"),
+    )
+    both_present = (
+        source_pairs["source_index_original"].notna()
+        & source_pairs["source_index_jailbreak"].notna()
+    )
+    if not source_pairs.loc[both_present, "source_index_original"].astype(str).equals(
+        source_pairs.loc[both_present, "source_index_jailbreak"].astype(str)
+    ):
+        raise ValueError("Original/jailbreak source_index values do not match")
 
     original_columns = JOIN_KEYS + ATTENTION_METRICS
     jailbreak_columns = JOIN_KEYS + ATTENTION_METRICS
@@ -291,9 +320,13 @@ def attach_aie_and_flags(
     aie: np.ndarray,
     top_k: int,
 ) -> pd.DataFrame:
-    if aie.shape != (32, 32):
-        raise ValueError(f"Expected AIE shape (32, 32); received={aie.shape}")
     result = frame.copy().sort_values(HEAD_KEYS).reset_index(drop=True)
+    layers, heads = validate_head_grid(result)
+    expected_shape = (len(layers), len(heads))
+    if aie.shape != expected_shape:
+        raise ValueError(
+            f"Expected AIE shape {expected_shape}; received={aie.shape}"
+        )
     result["aie"] = [
         aie[int(layer), int(head)]
         for layer, head in result[HEAD_KEYS].itertuples(index=False, name=None)
@@ -309,6 +342,19 @@ def attach_aie_and_flags(
     result["aie_negative"] = result["aie"] < 0
     result["aie_top_k"] = result["aie_rank"] <= top_k
     result["abs_aie_top_k"] = result["abs_aie_rank"] <= top_k
+    result["paper_head"] = [
+        (int(layer), int(head)) in PAPER_HEADS
+        for layer, head in result[HEAD_KEYS].itertuples(index=False, name=None)
+    ]
+    result["head_label"] = [
+        f"L{int(layer)}H{int(head)}"
+        for layer, head in result[HEAD_KEYS].itertuples(index=False, name=None)
+    ]
+    return result
+
+
+def attach_head_labels_and_paper_flags(frame: pd.DataFrame) -> pd.DataFrame:
+    result = frame.copy().sort_values(HEAD_KEYS).reset_index(drop=True)
     result["paper_head"] = [
         (int(layer), int(head)) in PAPER_HEADS
         for layer, head in result[HEAD_KEYS].itertuples(index=False, name=None)
@@ -361,11 +407,39 @@ def validate_aggregation_consistency(frame: pd.DataFrame) -> None:
             )
 
 
+def build_merged_head_metrics(
+    per_head: pd.DataFrame,
+    original: pd.DataFrame,
+    jailbreak: pd.DataFrame,
+    aie: np.ndarray | None = None,
+    top_k: int = 20,
+) -> Tuple[pd.DataFrame, int, int]:
+    element_metrics = build_element_metrics(per_head)
+    attention_metrics, prompt_count, window_size = aggregate_attention_metrics(
+        original, jailbreak
+    )
+    merged = element_metrics.merge(
+        attention_metrics,
+        on=HEAD_KEYS,
+        how="inner",
+        validate="one_to_one",
+    )
+    if len(merged) != len(element_metrics) or len(merged) != len(attention_metrics):
+        raise ValueError("Element and attention head sets do not match")
+    validate_head_grid(merged)
+    if aie is None:
+        merged = attach_head_labels_and_paper_flags(merged)
+    else:
+        merged = attach_aie_and_flags(merged, aie, top_k)
+    merged = add_absolute_columns(merged)
+    validate_aggregation_consistency(merged)
+    return merged, prompt_count, window_size
+
+
 def build_layer_summary(frame: pd.DataFrame) -> pd.DataFrame:
     rows: List[Dict[str, Any]] = []
     for layer, group in frame.groupby("layer", sort=True):
-        rows.append(
-            {
+        row = {
                 "layer": int(layer),
                 "head_count": int(len(group)),
                 "element_delta_mean_mean": float(group["element_delta_mean"].mean()),
@@ -386,15 +460,23 @@ def build_layer_summary(frame: pd.DataFrame) -> pd.DataFrame:
                 "delta_asym_ratio_mean": float(group["delta_asym_ratio"].mean()),
                 "delta_asym_ratio_median": float(group["delta_asym_ratio"].median()),
                 "delta_asym_lower_mean_mean": float(group["delta_asym_lower_mean"].mean()),
-                "aie_mean": float(group["aie"].mean()),
-                "aie_median": float(group["aie"].median()),
-                "aie_positive_rate": float((group["aie"] > 0).mean()),
-                "abs_aie_mean": float(group["abs_aie"].mean()),
             }
-        )
+        if "aie" in group.columns:
+            row.update(
+                {
+                    "aie_mean": float(group["aie"].mean()),
+                    "aie_median": float(group["aie"].median()),
+                    "aie_positive_rate": float((group["aie"] > 0).mean()),
+                    "abs_aie_mean": float(group["abs_aie"].mean()),
+                }
+            )
+        rows.append(row)
     result = pd.DataFrame(rows)
-    if not result["head_count"].eq(32).all():
-        raise ValueError("Each layer_summary row must aggregate 32 heads")
+    expected_heads = int(frame.groupby("layer")["head"].nunique().iloc[0])
+    if not result["head_count"].eq(expected_heads).all():
+        raise ValueError(
+            f"Each layer_summary row must aggregate {expected_heads} heads"
+        )
     return result
 
 
@@ -436,6 +518,23 @@ def correlation_long(
     return pd.DataFrame(rows)
 
 
+def nonconstant_metrics(
+    frame: pd.DataFrame,
+    metrics: Sequence[str],
+) -> Tuple[List[str], List[str]]:
+    included: List[str] = []
+    excluded: List[str] = []
+    for metric in metrics:
+        values = frame[metric].to_numpy(np.float64)
+        if np.std(values) == 0:
+            excluded.append(metric)
+        else:
+            included.append(metric)
+    if not included:
+        raise ValueError("No non-constant metrics are available for correlation")
+    return included, excluded
+
+
 def layer_center(frame: pd.DataFrame, metrics: Sequence[str]) -> pd.DataFrame:
     result = frame[["layer", "head", "head_label"]].copy()
     for metric in metrics:
@@ -468,11 +567,16 @@ def write_rankings(frame: pd.DataFrame, output_dir: Path, top_k: int) -> None:
         "delta_asym_ratio",
     ]
     for filename, metric, ascending in specifications:
+        if metric not in frame.columns:
+            continue
         ranking = frame.sort_values(
             [metric, "layer", "head"], ascending=[ascending, True, True]
         ).head(top_k).copy()
         ranking.insert(0, "rank", np.arange(1, len(ranking) + 1))
-        columns = ["rank", *base_columns]
+        columns = [
+            "rank",
+            *[column for column in base_columns if column in frame.columns],
+        ]
         if metric not in columns:
             columns.insert(5, metric)
         ranking[columns].to_csv(output_dir / filename, index=False)
@@ -488,23 +592,11 @@ def main() -> None:
     per_head = read_csv(args.per_head_summary, "per_head_summary")
     original = read_csv(args.original_metrics, "original_metrics")
     jailbreak = read_csv(args.jailbreak_metrics, "jailbreak_metrics")
-    element_metrics = build_element_metrics(per_head)
-    attention_metrics, prompt_count, window_size = aggregate_attention_metrics(
-        original, jailbreak
+    aie = load_aie(args.aie) if args.aie else None
+    merged, prompt_count, window_size = build_merged_head_metrics(
+        per_head, original, jailbreak, aie=aie, top_k=args.top_k
     )
-    merged = element_metrics.merge(
-        attention_metrics,
-        on=HEAD_KEYS,
-        how="inner",
-        validate="one_to_one",
-    )
-    if len(merged) != len(element_metrics) or len(merged) != len(attention_metrics):
-        raise ValueError("Element and attention head sets do not match")
-    validate_head_grid(merged)
-    aie = load_aie(args.aie)
-    merged = attach_aie_and_flags(merged, aie, args.top_k)
-    merged = add_absolute_columns(merged)
-    validate_aggregation_consistency(merged)
+    layers, heads = validate_head_grid(merged)
 
     required_finite = [
         column
@@ -531,18 +623,27 @@ def main() -> None:
     layer_summary.to_csv(output_dir / "layer_summary.csv", index=False)
     write_rankings(merged, output_dir, min(args.top_k, len(merged)))
 
-    correlation_long(merged, CORRELATION_METRICS, "spearman").to_csv(
+    available_correlation_metrics = [
+        metric for metric in CORRELATION_METRICS if metric in merged.columns
+    ]
+    correlation_metrics, constant_full_metrics = nonconstant_metrics(
+        merged, available_correlation_metrics
+    )
+    correlation_long(merged, correlation_metrics, "spearman").to_csv(
         output_dir / "correlation_spearman_full.csv", index=False
     )
-    correlation_long(merged, CORRELATION_METRICS, "pearson").to_csv(
+    correlation_long(merged, correlation_metrics, "pearson").to_csv(
         output_dir / "correlation_pearson_full.csv", index=False
     )
-    centered = layer_center(merged, CORRELATION_METRICS)
+    centered = layer_center(merged, available_correlation_metrics)
     centered.to_csv(output_dir / "head_metrics_layer_centered.csv", index=False)
-    correlation_long(centered, CORRELATION_METRICS, "spearman").to_csv(
+    centered_correlation_metrics, constant_centered_metrics = nonconstant_metrics(
+        centered, available_correlation_metrics
+    )
+    correlation_long(centered, centered_correlation_metrics, "spearman").to_csv(
         output_dir / "correlation_spearman_layer_centered.csv", index=False
     )
-    correlation_long(centered, CORRELATION_METRICS, "pearson").to_csv(
+    correlation_long(centered, centered_correlation_metrics, "pearson").to_csv(
         output_dir / "correlation_pearson_layer_centered.csv", index=False
     )
 
@@ -556,10 +657,11 @@ def main() -> None:
         "output_dir": args.output_dir,
         "head_count": int(len(merged)),
         "layer_count": int(merged["layer"].nunique()),
-        "heads_per_layer": 32,
+        "heads_per_layer": len(heads),
         "prompt_count": prompt_count,
         "window_size": window_size,
-        "aie_shape": list(aie.shape),
+        "aie_shape": list(aie.shape) if aie is not None else None,
+        "aie_available": aie is not None,
         "paper_heads": [list(head) for head in sorted(PAPER_HEADS)],
         "top_k": args.top_k,
         "rank_tie_method": "first after stable layer/head ordering",
@@ -573,9 +675,16 @@ def main() -> None:
             "abs_columns": "absolute value of the corresponding signed metric",
         },
         "join_keys": JOIN_KEYS,
-        "source_index_join_policy": "source_index is not used because it is empty/NaN",
-        "correlation_statistical_unit": "one layer-head (n=1024)",
+        "source_index_join_policy": (
+            "source_index is not a join key; when present in both conditions, "
+            "paired values must match"
+        ),
+        "correlation_statistical_unit": f"one layer-head (n={len(merged)})",
         "correlation_p_values": "not computed; heads are not assumed independent",
+        "constant_metrics_excluded_from_full_correlation": constant_full_metrics,
+        "constant_metrics_excluded_from_layer_centered_correlation": (
+            constant_centered_metrics
+        ),
         "definitional_consistency_pairs": [
             ["element_delta_mean", "delta_asym_lower_mean"],
             ["element_positive_rate_shift", "delta_asym_lower_pos_rate"],
@@ -596,8 +705,11 @@ def main() -> None:
     print(f"prompt count: {prompt_count}")
     print(f"window_size: {window_size}")
     print(f"paper heads: {int(merged['paper_head'].sum())}")
-    rank_one = merged.loc[merged["aie_rank"] == 1].iloc[0]
-    print(f"AIE rank 1: {rank_one['head_label']}")
+    if aie is not None:
+        rank_one = merged.loc[merged["aie_rank"] == 1].iloc[0]
+        print(f"AIE rank 1: {rank_one['head_label']}")
+    else:
+        print("AIE: not provided")
     print("mean consistency: passed")
     print("positive-rate consistency: passed")
     print(f"output directory: {output_dir}")

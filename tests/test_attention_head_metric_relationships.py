@@ -11,6 +11,7 @@ from scripts.analyze_attention_head_metric_relationships import (
     attach_aie_and_flags,
     build_element_metrics,
     build_layer_summary,
+    build_merged_head_metrics,
     correlation_long,
     layer_center,
     pearson_correlation,
@@ -132,6 +133,30 @@ class AttentionHeadMetricRelationshipTests(unittest.TestCase):
         self.assertEqual(len(self.merged), 1024)
         self.assertEqual(layers, list(range(32)))
         self.assertEqual(heads, list(range(32)))
+
+    def test_aie_optional_and_head_grid_dimensions_are_inferred(self):
+        per_head = self.per_head.query("layer < 2 and head < 3").copy()
+        original = self.original.query("layer < 2 and head < 3").copy()
+        jailbreak = self.jailbreak.query("layer < 2 and head < 3").copy()
+        merged, prompt_count, window_size = build_merged_head_metrics(
+            per_head, original, jailbreak, aie=None
+        )
+        self.assertEqual(len(merged), 6)
+        self.assertEqual(prompt_count, 2)
+        self.assertEqual(window_size, 16)
+        self.assertNotIn("aie", merged.columns)
+        for column in (
+            "original_asym_ratio",
+            "jailbreak_asym_ratio",
+            "delta_asym_ratio",
+            "element_delta_mean",
+            "element_std_shift",
+            "element_positive_rate_shift",
+        ):
+            self.assertIn(column, merged.columns)
+        layers, heads = validate_head_grid(merged)
+        self.assertEqual(layers, [0, 1])
+        self.assertEqual(heads, [0, 1, 2])
 
     def test_element_std_shift_definition(self):
         element = build_element_metrics(self.per_head)
