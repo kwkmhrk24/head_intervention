@@ -1,4 +1,5 @@
 import csv
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -6,11 +7,13 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
+import torch
 
 from scripts.analyze_attention_score_all_heads_distributions import (
     apply_short_sequence_policy,
     build_common_metadata,
     compute_mean_distributions,
+    main as run_all_heads_main,
     mean_over_layer_heads,
     prepare_line_indexed_prompt_pairs,
     require_tail_window,
@@ -282,6 +285,129 @@ class AllHeadAttentionDistributionTests(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 validate_output_directories(raw_dir, mean_dir, overwrite=False)
             validate_output_directories(raw_dir, mean_dir, overwrite=True)
+
+    def test_main_output_stage_routes_pairs_and_writes_all_summaries(self):
+        class DummyModel:
+            device = torch.device("cpu")
+            config = SimpleNamespace(
+                num_key_value_heads=3,
+                hidden_size=12,
+                head_dim=4,
+            )
+
+            def eval(self):
+                return self
+
+        def fake_extract(**kwargs):
+            value = 1.0 if kwargs["condition"] == "original" else 2.0
+            destination = kwargs["destination"]
+            destination[...] = value
+            mean = np.mean(destination, axis=(0, 1), dtype=np.float64)
+            return 20, mean
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            raw_dir = base / "raw"
+            mean_dir = base / "mean"
+            args = SimpleNamespace(
+                model="synthetic-model",
+                original_prompts="original.jsonl",
+                jailbreak_prompts="jailbreak.jsonl",
+                tail_tokens=16,
+                raw_output_dir=str(raw_dir),
+                mean_output_dir=str(mean_dir),
+                max_prompts=None,
+                short_sequence_policy="exclude_pair",
+                expected_included_prompts=1,
+                attack_name="GCG",
+                system_prompt=None,
+                overwrite=False,
+            )
+            prompt_rows = [
+                {"prompt": "normal", "index": 60},
+                {"prompt": "short", "index": 166},
+            ]
+            model_config = {
+                "model_name": "Llama",
+                "n_layers": 2,
+                "n_heads": 3,
+            }
+            with (
+                patch(
+                    "scripts.analyze_attention_score_all_heads_distributions.get_args",
+                    return_value=args,
+                ),
+                patch(
+                    "scripts.analyze_attention_score_all_heads_distributions.read_prompt_rows",
+                    side_effect=[prompt_rows, prompt_rows],
+                ),
+                patch(
+                    "scripts.analyze_attention_score_all_heads_distributions.load_model_and_tokenizer",
+                    return_value=(
+                        DummyModel(),
+                        SimpleNamespace(chat_template="synthetic-template"),
+                        model_config,
+                    ),
+                ),
+                patch(
+                    "scripts.analyze_attention_score_all_heads_distributions.get_attention_helpers",
+                    return_value=(None, None),
+                ),
+                patch(
+                    "scripts.analyze_attention_score_all_heads_distributions.measure_pair_sequence_lengths",
+                    return_value=([20, 15], [20, 35]),
+                ),
+                patch(
+                    "scripts.analyze_attention_score_all_heads_distributions.extract_condition_into_memmap",
+                    side_effect=fake_extract,
+                ),
+                patch(
+                    "scripts.analyze_attention_score_all_heads_distributions.get_source_commit",
+                    return_value="synthetic-commit",
+                ),
+            ):
+                run_all_heads_main()
+
+            required_raw = {
+                "raw_distribution_summary.csv",
+                "per_head_summary.csv",
+                "prompt_manifest.csv",
+                "metadata.json",
+            }
+            required_mean = {
+                "all_heads_mean_distribution_summary.csv",
+                "prompt_level_all_heads_mean_summary.csv",
+                "metadata.json",
+            }
+            self.assertTrue(required_raw.issubset(path.name for path in raw_dir.iterdir()))
+            self.assertTrue(required_mean.issubset(path.name for path in mean_dir.iterdir()))
+
+            with (raw_dir / "metadata.json").open(encoding="utf-8") as handle:
+                metadata = json.load(handle)
+            self.assertEqual(metadata["input_pair_count"], 2)
+            self.assertEqual(metadata["included_pair_count"], 1)
+            self.assertEqual(metadata["excluded_pair_count"], 1)
+            self.assertEqual(metadata["array_shape"], [1, 2, 3, 120])
+
+            with (mean_dir / "prompt_level_all_heads_mean_summary.csv").open(
+                newline="", encoding="utf-8"
+            ) as handle:
+                prompt_summary = list(csv.DictReader(handle))
+            self.assertEqual(len(prompt_summary), 1)
+            self.assertEqual(prompt_summary[0]["prompt_id"], "0")
+            self.assertEqual(prompt_summary[0]["source_index"], "60")
+
+            for filename in (
+                raw_dir / "raw_distribution_summary.csv",
+                mean_dir / "all_heads_mean_distribution_summary.csv",
+            ):
+                with filename.open(newline="", encoding="utf-8") as handle:
+                    self.assertEqual(len(list(csv.DictReader(handle))), 3)
+
+            raw_original = np.load(raw_dir / "raw_original_values.npy")
+            raw_jailbreak = np.load(raw_dir / "raw_jailbreak_values.npy")
+            raw_delta = np.load(raw_dir / "raw_delta_values.npy")
+            np.testing.assert_allclose(raw_delta, raw_jailbreak - raw_original)
 
     def test_synthetic_plot_outputs_use_every_value(self):
         original = np.arange(2 * 2 * 3 * 6, dtype=np.float32).reshape(2, 2, 3, 6)

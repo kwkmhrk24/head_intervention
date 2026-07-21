@@ -1206,13 +1206,13 @@ def main() -> None:
         mean_original,
         mean_jailbreak,
         mean_delta,
-        pairs,
     )
     write_prompt_level_summary(
         mean_output_dir / "prompt_level_all_heads_mean_summary.csv",
         mean_original,
         mean_jailbreak,
         mean_delta,
+        pairs,
     )
 
     execution_datetime = datetime.now(timezone.utc).isoformat()
