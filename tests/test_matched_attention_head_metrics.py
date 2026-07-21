@@ -14,7 +14,10 @@ from scripts.analyze_matched_attention_head_metrics import (
     aggregate_raw_head_metrics,
     build_attack_metrics,
     build_autodan_mapping,
+    build_full_vs_matched_comparison,
     build_gcg_mapping,
+    build_layer_outputs,
+    build_manifest_mapping,
     build_joined_metrics,
     build_metadata,
     build_metric_comparisons,
@@ -22,6 +25,8 @@ from scripts.analyze_matched_attention_head_metrics import (
     compute_common_mapping,
     extract_head_subset,
     prepare_matched_attention_metrics,
+    read_fullset_head_metrics,
+    summarize_explicit_success_labels,
     validate_output_dir,
     validate_unique_mapping,
 )
@@ -189,6 +194,78 @@ class MatchedAttentionHeadMetricTests(unittest.TestCase):
         self.assertEqual(result["raw_prompt_index"].tolist(), [0, 1])
         self.assertEqual(details["excluded_source_indices"], [166])
 
+    def test_both_attack_manifests_compute_dynamic_common_set(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = []
+            for name, sources in (("a", [49, 50, 94, 95]), ("b", [50, 94, 95, 96])):
+                path = root / f"{name}.csv"
+                included = [source != 94 for source in sources]
+                raw_indices = []
+                next_raw = 0
+                for keep in included:
+                    raw_indices.append(next_raw if keep else np.nan)
+                    next_raw += int(keep)
+                pd.DataFrame(
+                    {
+                        "raw_prompt_index": raw_indices,
+                        "input_row_index": range(len(sources)),
+                        "source_index": sources,
+                        "original_source_index": sources,
+                        "jailbreak_source_index": sources,
+                        "included": included,
+                        "exclusion_reason": ["" if keep else "short" for keep in included],
+                    }
+                ).to_csv(path, index=False)
+                paths.append(path)
+            first, _ = build_manifest_mapping(paths[0], 3, "AutoDAN")
+            second, _ = build_manifest_mapping(paths[1], 3, "GCG")
+            common = compute_common_mapping(first, second, expected_count=2)
+        self.assertEqual(common.source_index.tolist(), [50, 95])
+        self.assertNotIn(94, common.source_index.tolist())
+
+    def test_fullset_reader_and_dynamic_layer_comparison(self):
+        frame = pd.DataFrame(
+            {
+                "layer": [0, 0, 1, 1],
+                "head": [0, 1, 0, 1],
+                **{
+                    metric: [1.0, -2.0, 3.0, 1.0]
+                    for metric in COMPARISON_METRICS
+                },
+            }
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "merged.csv"
+            frame.to_csv(path, index=False)
+            first = read_fullset_head_metrics(path, "A")
+        second = first.copy()
+        for metric in COMPARISON_METRICS:
+            second[metric] *= 0.5
+        summary, correlations = build_layer_outputs({"A": first, "B": second})
+        self.assertEqual(len(summary), 4)
+        self.assertTrue(summary.head_count.eq(2).all())
+        self.assertTrue(np.isfinite(correlations[["pearson", "spearman"]]).all().all())
+
+    def test_explicit_success_counts_do_not_infer_missing_definition(self):
+        unknown = summarize_explicit_success_labels(None, {1, 2}, {2})
+        self.assertEqual(unknown["status"], "unknown")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "labels.json"
+            path.write_text(
+                json.dumps(
+                    [
+                        {"index": 0, "success": None},
+                        {"index": 1, "success": True},
+                        {"index": 2, "success": False},
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            result = summarize_explicit_success_labels(path, {1, 2}, {2})
+        self.assertEqual(result["full"], {"success": 1, "failure": 1})
+        self.assertEqual(result["matched"], {"success": 0, "failure": 1})
+
     def test_memory_mapped_subset_aggregation_matches_numpy_ddof_zero(self):
         arrays = raw_arrays()
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -335,6 +412,64 @@ class MatchedAttentionHeadMetricTests(unittest.TestCase):
         self.assertEqual(len(signs), 4)
         self.assertTrue(np.isfinite(correlations[["pearson", "spearman"]]).all().all())
 
+    def test_full_vs_matched_comparison_reports_changes(self):
+        correlations = pd.DataFrame(
+            [
+                {
+                    "metric": metric,
+                    "pearson": 0.2,
+                    "spearman": 0.3,
+                    "autodan_mean": 0.1,
+                    "gcg_mean": 0.2,
+                }
+                for metric in COMPARISON_METRICS
+            ]
+        )
+        matched_correlations = correlations.copy()
+        matched_correlations["pearson"] += 0.1
+        matched_correlations["spearman"] += 0.2
+        signs = pd.DataFrame(
+            {"metric": COMPARISON_METRICS, "sign_agreement_rate": [0.5] * 4}
+        )
+        matched_signs = signs.copy()
+        matched_signs["sign_agreement_rate"] = 0.6
+        topk = pd.DataFrame(
+            [
+                {
+                    "metric": metric,
+                    "direction": direction,
+                    "k": k,
+                    "overlap_count": 1,
+                }
+                for metric in COMPARISON_METRICS
+                for direction in ("increase", "decrease")
+                for k in (3, 10)
+            ]
+        )
+        matched_topk = topk.copy()
+        matched_topk["overlap_count"] = 2
+        layers = pd.DataFrame(
+            [
+                {"metric": f"{metric}_mean", "pearson": 0.4, "spearman": 0.5}
+                for metric in COMPARISON_METRICS
+            ]
+        )
+        matched_layers = layers.copy()
+        matched_layers["pearson"] += 0.1
+        result = build_full_vs_matched_comparison(
+            correlations,
+            signs,
+            topk,
+            layers,
+            matched_correlations,
+            matched_signs,
+            matched_topk,
+            matched_layers,
+        )
+        self.assertEqual(len(result), 4)
+        self.assertTrue(np.allclose(result.pearson_change, 0.1))
+        self.assertTrue(result.increase_top3_overlap_change.eq(1).all())
+
     def test_existing_output_requires_overwrite(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             output = Path(temp_dir) / "output"
@@ -373,6 +508,13 @@ class MatchedAttentionHeadMetricTests(unittest.TestCase):
             dpi=50,
             overwrite=False,
             dry_run_mapping=False,
+            model_name="Mistral-7B-Instruct-v0.2",
+            attack_a_name="AutoDAN",
+            attack_b_name="GCG",
+            autodan_manifest="auto_manifest.csv",
+            autodan_merged_metrics="auto_merged.csv",
+            gcg_merged_metrics="gcg_merged.csv",
+            gcg_success_labels=None,
         )
         metadata = build_metadata(
             args,
@@ -385,6 +527,7 @@ class MatchedAttentionHeadMetricTests(unittest.TestCase):
             {"AutoDAN": 0.0, "GCG": 0.0},
         )
         self.assertEqual(metadata["analysis_type"], "matched")
+        self.assertEqual(metadata["model"], "Mistral-7B-Instruct-v0.2")
         self.assertEqual(metadata["std_ddof"], 0)
         self.assertIn("success_definition_limitation", metadata)
         self.assertIn("execution_datetime_utc", metadata)

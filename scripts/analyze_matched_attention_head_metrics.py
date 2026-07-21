@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare AutoDAN and GCG attention changes on matched source indices.
+"""Compare two attacks' attention changes on full and matched source sets.
 
 This is a CPU-only post-hoc analysis. It reads existing prompt-level metrics and
 memory-mapped raw arrays; it never loads a model or writes subset NPY arrays.
@@ -88,9 +88,18 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--gcg_jailbreak_metrics", required=True)
     parser.add_argument("--gcg_manifest", required=True)
     parser.add_argument(
+        "--autodan_manifest",
+        help=(
+            "Optional prompt manifest for AutoDAN. When supplied, explicit "
+            "source_index/raw_prompt_index mapping is used instead of the legacy "
+            "validated-row-index mapping."
+        ),
+    )
+    parser.add_argument(
         "--autodan_mapping_mode",
-        required=True,
+        required=False,
         choices=("validated_row_index",),
+        default="validated_row_index",
     )
     parser.add_argument(
         "--autodan_original_prompts",
@@ -110,6 +119,16 @@ def get_args() -> argparse.Namespace:
     )
     parser.add_argument("--advbench", default="data/raw/advbench.jsonl")
     parser.add_argument("--output_dir", required=True)
+    parser.add_argument("--model_name", default="Llama-2-7b-chat-hf")
+    parser.add_argument("--attack_a_name", default="AutoDAN")
+    parser.add_argument("--attack_b_name", default="GCG")
+    parser.add_argument("--autodan_merged_metrics")
+    parser.add_argument("--gcg_merged_metrics")
+    parser.add_argument("--fullset_output_dir")
+    parser.add_argument(
+        "--gcg_success_labels",
+        help="Optional JSON list with explicit integer index and boolean success.",
+    )
     parser.add_argument("--top_k", type=int, default=3)
     parser.add_argument("--expected_common_count", type=int, default=70)
     parser.add_argument("--bins", type=int, default=100)
@@ -281,15 +300,16 @@ def parse_included(values: pd.Series) -> pd.Series:
     return normalized.eq("true")
 
 
-def build_gcg_mapping(
+def build_manifest_mapping(
     manifest_path: Path,
     raw_prompt_count: int,
+    label: str,
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     try:
         manifest = pd.read_csv(manifest_path)
     except Exception as exc:
         raise ValueError(
-            f"Failed to read GCG manifest: path={manifest_path}, "
+            f"Failed to read {label} manifest: path={manifest_path}, "
             f"error_type={type(exc).__name__}"
         ) from exc
     required = {
@@ -303,13 +323,13 @@ def build_gcg_mapping(
     }
     missing = sorted(required - set(manifest.columns))
     if missing:
-        raise ValueError(f"GCG manifest missing columns: {missing}")
+        raise ValueError(f"{label} manifest missing columns: {missing}")
     included_mask = parse_included(manifest["included"])
     included = manifest.loc[included_mask].copy()
     excluded = manifest.loc[~included_mask].copy()
     if len(included) != raw_prompt_count:
         raise ValueError(
-            "GCG included manifest/raw count mismatch: "
+            f"{label} included manifest/raw count mismatch: "
             f"included={len(included)}, raw={raw_prompt_count}"
         )
     if not (
@@ -319,17 +339,19 @@ def build_gcg_mapping(
         included["source_index"].astype(str)
         == included["jailbreak_source_index"].astype(str)
     ).all():
-        raise ValueError("GCG original/jailbreak source indices differ")
+        raise ValueError(f"{label} original/jailbreak source indices differ")
     mapping = included[["raw_prompt_index", "input_row_index", "source_index"]].copy()
     for column in ("raw_prompt_index", "input_row_index", "source_index"):
         mapping[column] = pd.to_numeric(mapping[column], errors="raise").astype(int)
     if mapping["raw_prompt_index"].tolist() != list(range(raw_prompt_count)):
-        raise ValueError("GCG included raw_prompt_index must be contiguous 0..N-1")
+        raise ValueError(
+            f"{label} included raw_prompt_index must be contiguous 0..N-1"
+        )
     mapping["mapping_basis"] = "explicit included prompt_manifest.csv row"
     mapping["mapping_verified"] = True
-    validate_unique_mapping(mapping, "GCG")
+    validate_unique_mapping(mapping, label)
     details = {
-        "mapping_basis": "explicit included GCG prompt manifest",
+        "mapping_basis": f"explicit included {label} prompt manifest",
         "input_pair_count": int(len(manifest)),
         "included_pair_count": int(len(included)),
         "excluded_pair_count": int(len(excluded)),
@@ -338,6 +360,14 @@ def build_gcg_mapping(
         ],
     }
     return mapping[MAPPING_COLUMNS], details
+
+
+def build_gcg_mapping(
+    manifest_path: Path,
+    raw_prompt_count: int,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """Backward-compatible wrapper for the original public helper."""
+    return build_manifest_mapping(manifest_path, raw_prompt_count, "GCG")
 
 
 def compute_common_mapping(
@@ -396,10 +426,17 @@ def load_raw_bundle(raw_dir: Path, validate_values: bool) -> Tuple[Dict[str, np.
         "strict_lower_position",
     ]:
         raise ValueError(f"Unexpected raw array axes: raw_dir={raw_dir}")
-    if int(metadata.get("tail_tokens", -1)) != 16:
-        raise ValueError(f"Expected tail_tokens=16: raw_dir={raw_dir}")
-    if int(metadata.get("elements_per_head", -1)) != 120:
-        raise ValueError(f"Expected elements_per_head=120: raw_dir={raw_dir}")
+    tail_tokens = int(metadata.get("tail_tokens", -1))
+    elements_per_head = int(metadata.get("elements_per_head", -1))
+    if tail_tokens < 2:
+        raise ValueError(f"Invalid tail_tokens metadata: raw_dir={raw_dir}")
+    expected_elements = tail_tokens * (tail_tokens - 1) // 2
+    if elements_per_head != expected_elements or shape[-1] != expected_elements:
+        raise ValueError(
+            "Raw strict-lower element count does not match tail_tokens: "
+            f"raw_dir={raw_dir}, tail_tokens={tail_tokens}, "
+            f"elements={elements_per_head}, shape={shape}"
+        )
     if validate_values:
         validate_array_group(arrays, metadata, expected_ndim=4, label=str(raw_dir))
     return arrays, metadata
@@ -567,6 +604,7 @@ def prepare_matched_attention_metrics(
     common_sources: set[int],
     label: str,
     source_mode: str,
+    expected_window_size: int = 16,
 ) -> pd.DataFrame:
     required = {"prompt_id", "source_index", "layer", "head", "window_size", "asym_ratio"}
     missing = sorted(required - set(frame.columns))
@@ -601,8 +639,10 @@ def prepare_matched_attention_metrics(
         raise ValueError(f"{label} does not cover every common source index")
     if sorted(result["source_index"].unique()) != sorted(common_sources):
         raise ValueError(f"{label} common source index set differs")
-    if set(result["window_size"].unique()) != {16}:
-        raise ValueError(f"{label} must contain only window_size=16")
+    if set(result["window_size"].unique()) != {expected_window_size}:
+        raise ValueError(
+            f"{label} must contain only window_size={expected_window_size}"
+        )
     if result.duplicated(["prompt_id", "layer", "head"]).any():
         raise ValueError(f"{label} has duplicate matched prompt/layer/head keys")
     head_grid = result[["layer", "head"]].drop_duplicates()
@@ -619,10 +659,14 @@ def prepare_matched_attention_metrics(
 def aggregate_matched_attention(
     original: pd.DataFrame,
     jailbreak: pd.DataFrame,
+    expected_window_size: int = 16,
 ) -> pd.DataFrame:
     aggregated, _, window_size = aggregate_attention_metrics(original, jailbreak)
-    if window_size != 16:
-        raise ValueError("Matched attention metrics must use window_size=16")
+    if window_size != expected_window_size:
+        raise ValueError(
+            "Matched attention metrics use an unexpected window_size: "
+            f"expected={expected_window_size}, received={window_size}"
+        )
     return aggregated[
         [
             "layer",
@@ -699,6 +743,17 @@ def build_metric_comparisons(joined: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Dat
                 "pearson": pearson_correlation(auto, gcg_values),
                 "spearman": spearman_correlation(auto, gcg_values),
                 "n": len(joined),
+                "autodan_mean": float(np.mean(auto)),
+                "autodan_std": float(np.std(auto, ddof=0)),
+                "autodan_q25": float(np.quantile(auto, 0.25)),
+                "autodan_median": float(np.quantile(auto, 0.50)),
+                "autodan_q75": float(np.quantile(auto, 0.75)),
+                "gcg_mean": float(np.mean(gcg_values)),
+                "gcg_std": float(np.std(gcg_values, ddof=0)),
+                "gcg_q25": float(np.quantile(gcg_values, 0.25)),
+                "gcg_median": float(np.quantile(gcg_values, 0.50)),
+                "gcg_q75": float(np.quantile(gcg_values, 0.75)),
+                "gcg_minus_autodan_mean": float(np.mean(gcg_values - auto)),
             }
         )
         signs.append(
@@ -718,6 +773,31 @@ def build_metric_comparisons(joined: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Dat
             }
         )
     return pd.DataFrame(correlations), pd.DataFrame(signs)
+
+
+def read_fullset_head_metrics(path: Path, label: str) -> pd.DataFrame:
+    try:
+        frame = pd.read_csv(path)
+    except Exception as exc:
+        raise ValueError(
+            f"Failed to read full-set head metrics: path={path}, "
+            f"error_type={type(exc).__name__}"
+        ) from exc
+    required = {"layer", "head", *COMPARISON_METRICS}
+    missing = sorted(required - set(frame.columns))
+    if missing:
+        raise ValueError(f"{label} full-set metrics missing columns: {missing}")
+    result = frame[["layer", "head", *COMPARISON_METRICS]].copy()
+    result["head_label"] = [
+        f"L{int(layer)}H{int(head)}"
+        for layer, head in result[["layer", "head"]].itertuples(index=False)
+    ]
+    validate_head_grid(result)
+    if not np.isfinite(
+        result[["layer", "head", *COMPARISON_METRICS]].to_numpy(np.float64)
+    ).all():
+        raise ValueError(f"{label} full-set metrics contain NaN/inf")
+    return result.sort_values(["layer", "head"]).reset_index(drop=True)
 
 
 def _ranked_heads(frame: pd.DataFrame, metric: str, ascending: bool) -> pd.DataFrame:
@@ -773,6 +853,8 @@ def build_topk_overlap(
 def build_layer_outputs(
     attack_frames: Mapping[str, pd.DataFrame],
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if len(attack_frames) != 2:
+        raise ValueError("Layer comparison requires exactly two attacks")
     rows = []
     for attack, frame in attack_frames.items():
         for layer, group in frame.groupby("layer", sort=True):
@@ -789,10 +871,14 @@ def build_layer_outputs(
                 )
             rows.append(row)
     summary = pd.DataFrame(rows)
-    if len(summary) != 64 or not summary["head_count"].eq(32).all():
-        raise ValueError("Matched layer summary must contain 32 layers per attack")
-    auto = summary[summary["attack"] == "AutoDAN"].set_index("layer")
-    gcg = summary[summary["attack"] == "GCG"].set_index("layer")
+    attack_names = list(attack_frames)
+    first = summary[summary["attack"] == attack_names[0]].set_index("layer")
+    second = summary[summary["attack"] == attack_names[1]].set_index("layer")
+    if first.empty or not first.index.equals(second.index):
+        raise ValueError("Attack layer grids differ")
+    expected_heads = attack_frames[attack_names[0]].groupby("layer")["head"].nunique()
+    if not summary["head_count"].isin(expected_heads.unique()).all():
+        raise ValueError("Layer summary head counts differ from the input grid")
     correlations = []
     for column in summary.columns:
         if column in {"attack", "layer", "head_count"}:
@@ -800,9 +886,9 @@ def build_layer_outputs(
         correlations.append(
             {
                 "metric": column,
-                "pearson": pearson_correlation(auto[column], gcg[column]),
-                "spearman": spearman_correlation(auto[column], gcg[column]),
-                "n_layers": 32,
+                "pearson": pearson_correlation(first[column], second[column]),
+                "spearman": spearman_correlation(first[column], second[column]),
+                "n_layers": len(first),
             }
         )
     return summary, pd.DataFrame(correlations)
@@ -874,6 +960,8 @@ def write_histograms(
     top_k: int,
     bins: int,
     dpi: int,
+    model_name: str = "Llama-2-7B-chat",
+    tail_tokens: int = 16,
 ) -> Tuple[pd.DataFrame, list[Path]]:
     selected = select_signed_heads(
         head_metrics,
@@ -904,8 +992,12 @@ def write_histograms(
             delta_max_abs_error=delta_error,
             output_directory=str(head_dir.relative_to(output_dir)),
         )
-        if summary["total_values"] != len(raw_indices) * 120:
-            raise ValueError("Histogram element count is not matched_prompt_count * 120")
+        elements_per_head = arrays_for_head["original"].shape[1]
+        if summary["total_values"] != len(raw_indices) * elements_per_head:
+            raise ValueError(
+                "Histogram element count is not matched_prompt_count * "
+                "elements_per_head"
+            )
         expected = head_metrics[
             (head_metrics["layer"] == int(row.layer))
             & (head_metrics["head"] == int(row.head))
@@ -939,11 +1031,11 @@ def write_histograms(
                 arrays_for_head,
                 bins,
                 dpi,
-                "Llama-2-7B-chat",
-                f"{attack} matched70 exploratory",
+                model_name,
+                f"{attack} matched{len(raw_indices)} exploratory",
                 row,
                 "delta_asym_ratio",
-                16,
+                tail_tokens,
                 len(raw_indices),
             )
         )
@@ -958,6 +1050,12 @@ def save_comparison_plots(
     joined: pd.DataFrame,
     layer_summary: pd.DataFrame,
     dpi: int,
+    model_name: str = "Llama-2-7B-chat-hf",
+    analysis_label: str = "matched70 exploratory",
+    filename_scope: str = "matched",
+    attack_a_name: str = "AutoDAN",
+    attack_b_name: str = "GCG",
+    annotation_heads: Sequence[str] = (),
 ) -> list[Path]:
     paths = []
     for metric in COMPARISON_METRICS:
@@ -978,43 +1076,38 @@ def save_comparison_plots(
                 linestyle=":",
                 linewidth=1,
             )
-            target = joined[(joined["layer"] == 13) & (joined["head"] == 5)].iloc[0]
-            target_x = float(target[f"autodan_{metric}"])
-            target_y = float(target[f"gcg_{metric}"])
-            axis.scatter(
-                [target_x],
-                [target_y],
-                marker="*",
-                s=180,
-                color="red",
-                edgecolors="black",
-                linewidths=0.7,
-                zorder=4,
-            )
-            axis.annotate(
-                "L13H5",
-                (target_x, target_y),
-                xytext=(6, 6),
-                textcoords="offset points",
-            )
+            for label in annotation_heads:
+                target = joined[joined["head_label"] == label]
+                if len(target) != 1:
+                    continue
+                target_x = float(target.iloc[0][f"autodan_{metric}"])
+                target_y = float(target.iloc[0][f"gcg_{metric}"])
+                axis.scatter(
+                    [target_x], [target_y], marker="*", s=110, color="red",
+                    edgecolors="black", linewidths=0.6, zorder=4,
+                )
+                axis.annotate(
+                    label, (target_x, target_y), xytext=(4, 4),
+                    textcoords="offset points", fontsize=8,
+                )
             axis.set_xlim(low - padding, high + padding)
             axis.set_ylim(low - padding, high + padding)
-            axis.set_xlabel(f"AutoDAN {metric}")
-            axis.set_ylabel(f"GCG {metric}")
+            axis.set_xlabel(f"{attack_a_name} {metric}")
+            axis.set_ylabel(f"{attack_b_name} {metric}")
             axis.set_title(
-                f"Llama-2 matched70 exploratory: {metric}\n"
+                f"{model_name} {analysis_label}: {metric}\n"
                 f"Pearson r={pearson_correlation(x, y):.3f}, "
                 f"Spearman rho={spearman_correlation(x, y):.3f}, n=1024 heads"
             )
             axis.grid(alpha=0.2)
             fig.tight_layout()
-            path = output_dir / f"scatter_matched_{metric}.png"
+            path = output_dir / f"scatter_{filename_scope}_{metric}.png"
             fig.savefig(path, dpi=dpi)
             paths.append(path)
         finally:
             plt.close(fig)
-    auto = layer_summary[layer_summary["attack"] == "AutoDAN"].set_index("layer")
-    gcg = layer_summary[layer_summary["attack"] == "GCG"].set_index("layer")
+    auto = layer_summary[layer_summary["attack"] == attack_a_name].set_index("layer")
+    gcg = layer_summary[layer_summary["attack"] == attack_b_name].set_index("layer")
     fig, axis = plt.subplots(figsize=(9, 5))
     try:
         axis.plot(
@@ -1022,29 +1115,157 @@ def save_comparison_plots(
             auto["delta_asym_ratio_mean"],
             marker="o",
             markersize=4,
-            label="AutoDAN",
+            label=attack_a_name,
         )
         axis.plot(
             gcg.index,
             gcg["delta_asym_ratio_mean"],
             marker="o",
             markersize=4,
-            label="GCG",
+            label=attack_b_name,
         )
         axis.axhline(0, color="black", linestyle="--", linewidth=0.8)
         axis.set_xlabel("Layer")
-        axis.set_ylabel("Mean matched delta_asym_ratio across heads")
-        axis.set_title("Llama-2 matched70 exploratory layer profile")
-        axis.set_xticks(range(0, 32, 2))
+        axis.set_ylabel(f"Mean {filename_scope} delta_asym_ratio across heads")
+        axis.set_title(f"{model_name} {analysis_label} layer profile")
+        layers = list(auto.index)
+        tick_step = max(1, len(layers) // 16)
+        axis.set_xticks(layers[::tick_step])
         axis.legend()
         axis.grid(alpha=0.2)
         fig.tight_layout()
-        path = output_dir / "layer_profile_matched_delta_asym_ratio.png"
+        path = output_dir / f"layer_profile_{filename_scope}_delta_asym_ratio.png"
         fig.savefig(path, dpi=dpi)
         paths.append(path)
     finally:
         plt.close(fig)
     return paths
+
+
+def common_ranked_head_labels(
+    first: pd.DataFrame,
+    second: pd.DataFrame,
+    metric: str,
+    direction: str,
+    k: int,
+) -> list[str]:
+    if direction not in {"increase", "decrease"}:
+        raise ValueError(f"Unsupported ranking direction: {direction}")
+    ascending = direction == "decrease"
+    left = _ranked_heads(first, metric, ascending).head(k)
+    right = _ranked_heads(second, metric, ascending).head(k)
+    left_set = set(left[["layer", "head"]].itertuples(index=False, name=None))
+    right_set = set(right[["layer", "head"]].itertuples(index=False, name=None))
+    return [f"L{int(layer)}H{int(head)}" for layer, head in sorted(left_set & right_set)]
+
+
+def build_full_vs_matched_comparison(
+    full_correlations: pd.DataFrame,
+    full_signs: pd.DataFrame,
+    full_topk: pd.DataFrame,
+    full_layer_correlations: pd.DataFrame,
+    matched_correlations: pd.DataFrame,
+    matched_signs: pd.DataFrame,
+    matched_topk: pd.DataFrame,
+    matched_layer_correlations: pd.DataFrame,
+) -> pd.DataFrame:
+    rows = []
+    for metric in COMPARISON_METRICS:
+        full_c = full_correlations[full_correlations.metric == metric].iloc[0]
+        match_c = matched_correlations[matched_correlations.metric == metric].iloc[0]
+        full_s = full_signs[full_signs.metric == metric].iloc[0]
+        match_s = matched_signs[matched_signs.metric == metric].iloc[0]
+        row: Dict[str, Any] = {
+            "metric": metric,
+            "full_pearson": full_c.pearson,
+            "matched_pearson": match_c.pearson,
+            "pearson_change": match_c.pearson - full_c.pearson,
+            "full_spearman": full_c.spearman,
+            "matched_spearman": match_c.spearman,
+            "spearman_change": match_c.spearman - full_c.spearman,
+            "full_sign_agreement_rate": full_s.sign_agreement_rate,
+            "matched_sign_agreement_rate": match_s.sign_agreement_rate,
+            "sign_agreement_change": (
+                match_s.sign_agreement_rate - full_s.sign_agreement_rate
+            ),
+            "full_autodan_mean": full_c.autodan_mean,
+            "matched_autodan_mean": match_c.autodan_mean,
+            "full_gcg_mean": full_c.gcg_mean,
+            "matched_gcg_mean": match_c.gcg_mean,
+        }
+        for direction in ("increase", "decrease"):
+            for k in (3, 10):
+                full_t = full_topk[
+                    (full_topk.metric == metric)
+                    & (full_topk.direction == direction)
+                    & (full_topk.k == k)
+                ].iloc[0]
+                match_t = matched_topk[
+                    (matched_topk.metric == metric)
+                    & (matched_topk.direction == direction)
+                    & (matched_topk.k == k)
+                ].iloc[0]
+                stem = f"{direction}_top{k}"
+                row[f"full_{stem}_overlap"] = int(full_t.overlap_count)
+                row[f"matched_{stem}_overlap"] = int(match_t.overlap_count)
+                row[f"{stem}_overlap_change"] = int(
+                    match_t.overlap_count - full_t.overlap_count
+                )
+        layer_metric = f"{metric}_mean"
+        full_l = full_layer_correlations[
+            full_layer_correlations.metric == layer_metric
+        ].iloc[0]
+        match_l = matched_layer_correlations[
+            matched_layer_correlations.metric == layer_metric
+        ].iloc[0]
+        row.update(
+            {
+                "full_layer_mean_pearson": full_l.pearson,
+                "matched_layer_mean_pearson": match_l.pearson,
+                "full_layer_mean_spearman": full_l.spearman,
+                "matched_layer_mean_spearman": match_l.spearman,
+            }
+        )
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def summarize_explicit_success_labels(
+    path: Path | None,
+    full_sources: set[int],
+    matched_sources: set[int],
+) -> Dict[str, Any]:
+    if path is None:
+        return {
+            "status": "unknown",
+            "reason": "no explicit index/success label file supplied",
+        }
+    rows = read_json_list(path)
+    indices = [row.get("index") for row in rows]
+    if any(type(value) is not int for value in indices) or len(set(indices)) != len(indices):
+        raise ValueError(f"Success labels need unique integer index values: path={path}")
+    by_index = {
+        int(row["index"]): row["success"]
+        for row in rows
+        if type(row.get("success")) is bool
+    }
+    for label, sources in (("full", full_sources), ("matched", matched_sources)):
+        missing = sorted(sources - set(by_index))
+        if missing:
+            raise ValueError(
+                f"Success labels do not cover {label} source indices: "
+                f"path={path}, missing_count={len(missing)}"
+            )
+    def counts(sources: set[int]) -> Dict[str, int]:
+        positives = sum(by_index[index] for index in sources)
+        return {"success": int(positives), "failure": int(len(sources) - positives)}
+    return {
+        "status": "available",
+        "path": str(path),
+        "definition": "existing boolean success field; definition not re-derived",
+        "full": counts(full_sources),
+        "matched": counts(matched_sources),
+    }
 
 
 def current_commit() -> str | None:
@@ -1067,6 +1288,7 @@ def build_metadata(
     auto_details: Mapping[str, Any],
     gcg_details: Mapping[str, Any],
     raw_delta_errors: Mapping[str, float],
+    success_composition: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any]:
     source_paths = {
         "autodan_raw_dir": args.autodan_raw_dir,
@@ -1082,6 +1304,15 @@ def build_metadata(
         "autodan_labels": args.autodan_labels,
         "advbench": args.advbench,
     }
+    optional_paths = {
+        "autodan_manifest": getattr(args, "autodan_manifest", None),
+        "autodan_merged_metrics": getattr(args, "autodan_merged_metrics", None),
+        "gcg_merged_metrics": getattr(args, "gcg_merged_metrics", None),
+        "gcg_success_labels": getattr(args, "gcg_success_labels", None),
+    }
+    source_paths.update(
+        {key: value for key, value in optional_paths.items() if value is not None}
+    )
     hashes = {
         label: sha256_file(Path(path))
         for label, path in source_paths.items()
@@ -1091,17 +1322,22 @@ def build_metadata(
         "analysis_type": "matched",
         "exploratory": True,
         "held_out": False,
-        "model": "Llama-2-7b-chat-hf",
-        "attacks": ["AutoDAN", "GCG"],
+        "model": getattr(args, "model_name", "Llama-2-7b-chat-hf"),
+        "attacks": [
+            getattr(args, "attack_a_name", "AutoDAN"),
+            getattr(args, "attack_b_name", "GCG"),
+        ],
         "common_source_count": len(common),
         "common_source_min": int(common["source_index"].min()),
         "common_source_max": int(common["source_index"].max()),
         "common_source_indices_path": "common_source_indices.csv",
         "autodan_mapping_basis": auto_details["mapping_basis"],
         "gcg_mapping_basis": gcg_details["mapping_basis"],
-        "tail_tokens": 16,
-        "elements_per_head": 120,
-        "elements_per_matched_head": len(common) * 120,
+        "tail_tokens": int(auto_metadata.get("tail_tokens", 16)),
+        "elements_per_head": int(auto_metadata.get("elements_per_head", 120)),
+        "elements_per_matched_head": (
+            len(common) * int(auto_metadata.get("elements_per_head", 120))
+        ),
         "raw_shapes": {
             "AutoDAN": auto_metadata["array_shape"],
             "GCG": gcg_metadata["array_shape"],
@@ -1123,9 +1359,10 @@ def build_metadata(
             ),
         },
         "std_ddof": 0,
+        "success_composition": dict(success_composition or {}),
         "success_definition_limitation": (
-            "AutoDAN contains 84 source-success and 46 source-failure pairs with no "
-            "success filter; a comparable GCG success definition is unavailable."
+            "Attack-specific success definitions were not assumed equivalent; "
+            "the analysis does not balance success/failure composition."
         ),
         "analysis_positioning": (
             "exploratory post-hoc internal analysis; not an independent held-out evaluation"
@@ -1151,6 +1388,28 @@ def main() -> None:
         raise ValueError("--top_k must be positive")
     if args.expected_common_count <= 0:
         raise ValueError("--expected_common_count must be positive")
+    fullset_requested = any(
+        value
+        for value in (
+            args.autodan_merged_metrics,
+            args.gcg_merged_metrics,
+            args.fullset_output_dir,
+        )
+    )
+    if fullset_requested and not all(
+        (args.autodan_merged_metrics, args.gcg_merged_metrics, args.fullset_output_dir)
+    ):
+        raise ValueError(
+            "Full-set analysis requires --autodan_merged_metrics, "
+            "--gcg_merged_metrics, and --fullset_output_dir together"
+        )
+    candidate_outputs = [Path(args.output_dir)]
+    if args.fullset_output_dir:
+        candidate_outputs.append(Path(args.fullset_output_dir))
+    if not args.overwrite:
+        existing = [str(path) for path in candidate_outputs if path.exists()]
+        if existing:
+            raise FileExistsError(f"Output directory already exists: {existing}")
     auto_arrays, auto_metadata = load_raw_bundle(
         Path(args.autodan_raw_dir), validate_values=not args.dry_run_mapping
     )
@@ -1159,27 +1418,41 @@ def main() -> None:
     )
     if auto_arrays["original"].shape[1:] != gcg_arrays["original"].shape[1:]:
         raise ValueError("AutoDAN/GCG layer-head-position shapes differ")
-    autodan_mapping, auto_details = build_autodan_mapping(
-        auto_arrays["original"].shape[0],
-        auto_metadata,
-        Path(args.autodan_original_prompts),
-        Path(args.autodan_jailbreak_prompts),
-        Path(args.autodan_source_data),
-        Path(args.autodan_labels),
-        Path(args.advbench),
-        args.autodan_mapping_mode,
-    )
-    gcg_mapping, gcg_details = build_gcg_mapping(
-        Path(args.gcg_manifest), gcg_arrays["original"].shape[0]
+    if int(auto_metadata["tail_tokens"]) != int(gcg_metadata["tail_tokens"]):
+        raise ValueError("Attack raw tail_tokens differ")
+    tail_tokens = int(auto_metadata["tail_tokens"])
+    elements_per_head = int(auto_metadata["elements_per_head"])
+    if args.autodan_manifest:
+        autodan_mapping, auto_details = build_manifest_mapping(
+            Path(args.autodan_manifest),
+            auto_arrays["original"].shape[0],
+            args.attack_a_name,
+        )
+        auto_source_mode = "source_index"
+    else:
+        autodan_mapping, auto_details = build_autodan_mapping(
+            auto_arrays["original"].shape[0],
+            auto_metadata,
+            Path(args.autodan_original_prompts),
+            Path(args.autodan_jailbreak_prompts),
+            Path(args.autodan_source_data),
+            Path(args.autodan_labels),
+            Path(args.advbench),
+            args.autodan_mapping_mode,
+        )
+        auto_source_mode = "prompt_id_mapping"
+    gcg_mapping, gcg_details = build_manifest_mapping(
+        Path(args.gcg_manifest),
+        gcg_arrays["original"].shape[0],
+        args.attack_b_name,
     )
     common = compute_common_mapping(
         autodan_mapping,
         gcg_mapping,
         args.expected_common_count,
-        expected_indices=range(60, 130),
     )
-    print(f"AutoDAN mapping rows: {len(autodan_mapping)}")
-    print(f"GCG mapping rows: {len(gcg_mapping)}")
+    print(f"{args.attack_a_name} mapping rows: {len(autodan_mapping)}")
+    print(f"{args.attack_b_name} mapping rows: {len(gcg_mapping)}")
     print(
         "common source indices: "
         f"count={len(common)}, min={common.source_index.min()}, "
@@ -1190,6 +1463,11 @@ def main() -> None:
         return
     output_dir = Path(args.output_dir)
     validate_output_dir(output_dir, args.overwrite)
+    fullset_output_dir = (
+        Path(args.fullset_output_dir) if args.fullset_output_dir else None
+    )
+    if fullset_output_dir is not None:
+        validate_output_dir(fullset_output_dir, args.overwrite)
     autodan_mapping.to_csv(output_dir / "autodan_source_mapping.csv", index=False)
     gcg_mapping.to_csv(output_dir / "gcg_source_mapping.csv", index=False)
     common.to_csv(output_dir / "common_source_indices.csv", index=False)
@@ -1202,38 +1480,44 @@ def main() -> None:
     )
     common_sources = set(int(value) for value in common["source_index"])
     auto_original = prepare_matched_attention_metrics(
-        read_metrics(Path(args.autodan_original_metrics), "AutoDAN original"),
+        read_metrics(Path(args.autodan_original_metrics), f"{args.attack_a_name} original"),
         autodan_mapping,
         common_sources,
-        "AutoDAN original",
-        "prompt_id_mapping",
+        f"{args.attack_a_name} original",
+        auto_source_mode,
+        tail_tokens,
     )
     auto_jailbreak = prepare_matched_attention_metrics(
-        read_metrics(Path(args.autodan_jailbreak_metrics), "AutoDAN jailbreak"),
+        read_metrics(Path(args.autodan_jailbreak_metrics), f"{args.attack_a_name} jailbreak"),
         autodan_mapping,
         common_sources,
-        "AutoDAN jailbreak",
-        "prompt_id_mapping",
+        f"{args.attack_a_name} jailbreak",
+        auto_source_mode,
+        tail_tokens,
     )
     gcg_original = prepare_matched_attention_metrics(
-        read_metrics(Path(args.gcg_original_metrics), "GCG original"),
+        read_metrics(Path(args.gcg_original_metrics), f"{args.attack_b_name} original"),
         gcg_mapping,
         common_sources,
-        "GCG original",
+        f"{args.attack_b_name} original",
         "source_index",
+        tail_tokens,
     )
     gcg_jailbreak = prepare_matched_attention_metrics(
-        read_metrics(Path(args.gcg_jailbreak_metrics), "GCG jailbreak"),
+        read_metrics(Path(args.gcg_jailbreak_metrics), f"{args.attack_b_name} jailbreak"),
         gcg_mapping,
         common_sources,
-        "GCG jailbreak",
+        f"{args.attack_b_name} jailbreak",
         "source_index",
+        tail_tokens,
     )
     autodan_metrics = build_attack_metrics(
-        auto_raw, aggregate_matched_attention(auto_original, auto_jailbreak)
+        auto_raw,
+        aggregate_matched_attention(auto_original, auto_jailbreak, tail_tokens),
     )
     gcg_metrics = build_attack_metrics(
-        gcg_raw, aggregate_matched_attention(gcg_original, gcg_jailbreak)
+        gcg_raw,
+        aggregate_matched_attention(gcg_original, gcg_jailbreak, tail_tokens),
     )
     autodan_metrics.to_csv(output_dir / "autodan_matched_head_metrics.csv", index=False)
     gcg_metrics.to_csv(output_dir / "gcg_matched_head_metrics.csv", index=False)
@@ -1245,38 +1529,55 @@ def main() -> None:
     topk = build_topk_overlap(autodan_metrics, gcg_metrics)
     topk.to_csv(output_dir / "matched_topk_overlap.csv", index=False)
     layer_summary, layer_correlations = build_layer_outputs(
-        {"AutoDAN": autodan_metrics, "GCG": gcg_metrics}
+        {args.attack_a_name: autodan_metrics, args.attack_b_name: gcg_metrics}
     )
     layer_summary.to_csv(output_dir / "matched_layer_summary.csv", index=False)
     layer_correlations.to_csv(
         output_dir / "matched_layer_correlations.csv", index=False
     )
-    l13h5 = build_l13h5_summary(
-        {"AutoDAN": autodan_metrics, "GCG": gcg_metrics}
-    )
-    l13h5.to_csv(output_dir / "l13h5_matched_summary.csv", index=False)
+    if "llama" in args.model_name.lower():
+        l13h5 = build_l13h5_summary(
+            {args.attack_a_name: autodan_metrics, args.attack_b_name: gcg_metrics}
+        )
+        l13h5.to_csv(output_dir / "l13h5_matched_summary.csv", index=False)
     auto_selected, auto_pngs = write_histograms(
         output_dir,
-        "AutoDAN",
+        args.attack_a_name,
         autodan_metrics,
         auto_arrays,
         common["raw_prompt_index_autodan"].to_numpy(np.int64),
         args.top_k,
         args.bins,
         args.dpi,
+        args.model_name,
+        tail_tokens,
     )
     gcg_selected, gcg_pngs = write_histograms(
         output_dir,
-        "GCG",
+        args.attack_b_name,
         gcg_metrics,
         gcg_arrays,
         common["raw_prompt_index_gcg"].to_numpy(np.int64),
         args.top_k,
         args.bins,
         args.dpi,
+        args.model_name,
+        tail_tokens,
+    )
+    matched_annotation_heads = common_ranked_head_labels(
+        autodan_metrics, gcg_metrics, "delta_asym_ratio", "decrease", 10
     )
     comparison_pngs = save_comparison_plots(
-        output_dir, joined, layer_summary, args.dpi
+        output_dir,
+        joined,
+        layer_summary,
+        args.dpi,
+        args.model_name,
+        f"matched{len(common)} exploratory",
+        "matched",
+        args.attack_a_name,
+        args.attack_b_name,
+        matched_annotation_heads,
     )
     pngs = [*auto_pngs, *gcg_pngs, *comparison_pngs]
     expected_histogram_pngs = 4 * args.top_k
@@ -1288,6 +1589,118 @@ def main() -> None:
         raise ValueError("Unexpected PNG count")
     if any(not path.is_file() or path.stat().st_size == 0 for path in pngs):
         raise ValueError("A generated PNG is empty or missing")
+    full_outputs: Dict[str, Any] | None = None
+    if fullset_output_dir is not None:
+        full_auto = read_fullset_head_metrics(
+            Path(args.autodan_merged_metrics), args.attack_a_name
+        )
+        full_gcg = read_fullset_head_metrics(
+            Path(args.gcg_merged_metrics), args.attack_b_name
+        )
+        full_joined = build_joined_metrics(full_auto, full_gcg)
+        full_correlations, full_signs = build_metric_comparisons(full_joined)
+        full_topk = build_topk_overlap(full_auto, full_gcg)
+        full_layers, full_layer_correlations = build_layer_outputs(
+            {args.attack_a_name: full_auto, args.attack_b_name: full_gcg}
+        )
+        full_joined.to_csv(
+            fullset_output_dir / "full_set_head_metrics_joined.csv", index=False
+        )
+        full_correlations.to_csv(
+            fullset_output_dir / "full_set_metric_correlations.csv", index=False
+        )
+        full_signs.to_csv(
+            fullset_output_dir / "full_set_sign_agreement.csv", index=False
+        )
+        full_topk.to_csv(
+            fullset_output_dir / "full_set_topk_overlap.csv", index=False
+        )
+        full_layers.to_csv(
+            fullset_output_dir / "full_set_layer_summary.csv", index=False
+        )
+        full_layer_correlations.to_csv(
+            fullset_output_dir / "full_set_layer_correlations.csv", index=False
+        )
+        full_annotation_heads = common_ranked_head_labels(
+            full_auto, full_gcg, "delta_asym_ratio", "decrease", 10
+        )
+        full_pngs = save_comparison_plots(
+            fullset_output_dir,
+            full_joined,
+            full_layers,
+            args.dpi,
+            args.model_name,
+            "full-set exploratory",
+            "full_set",
+            args.attack_a_name,
+            args.attack_b_name,
+            full_annotation_heads,
+        )
+        if len(full_pngs) != 5 or any(
+            not path.is_file() or path.stat().st_size == 0 for path in full_pngs
+        ):
+            raise ValueError("Unexpected or empty full-set comparison PNG")
+        comparison = build_full_vs_matched_comparison(
+            full_correlations,
+            full_signs,
+            full_topk,
+            full_layer_correlations,
+            correlations,
+            signs,
+            topk,
+            layer_correlations,
+        )
+        comparison.to_csv(output_dir / "full_vs_matched_comparison.csv", index=False)
+        full_outputs = {
+            "head_rows": len(full_joined),
+            "comparison_png_count": len(full_pngs),
+            "annotation_heads": full_annotation_heads,
+        }
+    success_composition = {
+        args.attack_a_name: summarize_explicit_success_labels(
+            None, set(int(v) for v in autodan_mapping.source_index), common_sources
+        ),
+        args.attack_b_name: summarize_explicit_success_labels(
+            Path(args.gcg_success_labels) if args.gcg_success_labels else None,
+            set(int(v) for v in gcg_mapping.source_index),
+            common_sources,
+        ),
+        "definitions_comparable": "unknown",
+        "success_balanced_subset_applied": False,
+    }
+    if fullset_output_dir is not None:
+        fullset_metadata = {
+            "analysis_type": "full_set_attack_comparison",
+            "exploratory": True,
+            "held_out": False,
+            "model": args.model_name,
+            "attacks": [args.attack_a_name, args.attack_b_name],
+            "head_observation_count": int(full_outputs["head_rows"]),
+            "prompt_counts": {
+                args.attack_a_name: int(auto_metadata["included_pair_count"]),
+                args.attack_b_name: int(gcg_metadata["included_pair_count"]),
+            },
+            "tail_tokens": tail_tokens,
+            "elements_per_head": elements_per_head,
+            "comparison_metrics": COMPARISON_METRICS,
+            "ranking": "signed increase/decrease; no absolute-value ranking",
+            "success_composition": success_composition,
+            "success_definition_limitation": (
+                "Attack-specific success definitions were not assumed equivalent; "
+                "the full-set prompt sets also differ."
+            ),
+            "source_input_paths": {
+                args.attack_a_name: args.autodan_merged_metrics,
+                args.attack_b_name: args.gcg_merged_metrics,
+            },
+            "source_commit": current_commit(),
+            "execution_datetime_utc": datetime.now(timezone.utc).isoformat(),
+            "cli_args": vars(args),
+        }
+        (fullset_output_dir / "metadata.json").write_text(
+            json.dumps(fullset_metadata, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
     elapsed = time.perf_counter() - start
     metadata = build_metadata(
         args,
@@ -1298,7 +1711,10 @@ def main() -> None:
         auto_details,
         gcg_details,
         {"AutoDAN": auto_delta_error, "GCG": gcg_delta_error},
+        success_composition,
     )
+    metadata["fullset_outputs"] = full_outputs
+    metadata["matched_annotation_heads"] = matched_annotation_heads
     (output_dir / "metadata.json").write_text(
         json.dumps(metadata, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
@@ -1311,6 +1727,9 @@ def main() -> None:
     print(f"GCG selected heads: {len(gcg_selected)}")
     print(f"histogram PNGs: {len(auto_pngs) + len(gcg_pngs)}")
     print(f"comparison PNGs: {len(comparison_pngs)}")
+    if full_outputs is not None:
+        print(f"full-set head rows: {full_outputs['head_rows']}")
+        print(f"full-set comparison PNGs: {full_outputs['comparison_png_count']}")
     print(f"execution time seconds: {elapsed:.3f}")
     print(f"output directory: {output_dir}")
 
