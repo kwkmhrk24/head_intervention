@@ -49,7 +49,16 @@ SELECTED_HEAD_KEYS = {
     "negative": "negative_bottom5",
     "absolute": "absolute_top5",
 }
-ALL_CONDITIONS = ("paper", "positive", "negative", "absolute")
+LEGACY_CONDITIONS = ("paper", "positive", "negative", "absolute")
+CANDIDATE_CONDITIONS = (
+    "candidate_consensus_increase",
+    "candidate_consensus_decrease",
+)
+EXPECTED_CANDIDATE_DIRECTIONS = {
+    "candidate_consensus_increase": "increase",
+    "candidate_consensus_decrease": "decrease",
+}
+ALL_CONDITIONS = LEGACY_CONDITIONS + CANDIDATE_CONDITIONS
 
 EXPECTED_TOTAL_COUNT = 130
 EXPECTED_SELECTION_SIZE = 20
@@ -120,6 +129,15 @@ def parse_args(argv=None):
     parser.add_argument("--input-file", required=True)
     parser.add_argument("--split-manifest", required=True)
     parser.add_argument("--selected-heads", required=True)
+    parser.add_argument(
+        "--candidate-heads",
+        default=None,
+        help=(
+            "Optional candidate head configuration exported by "
+            "scripts/export_intervention_head_configs.py. Required when a "
+            "candidate_consensus_* condition is selected."
+        ),
+    )
     parser.add_argument("--baseline-results", required=True)
     parser.add_argument("--source-labels", required=True)
     parser.add_argument("--intervention-activation", required=True)
@@ -128,8 +146,11 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "--conditions",
-        default=",".join(ALL_CONDITIONS),
-        help="Comma-separated subset of paper,positive,negative,absolute.",
+        default=",".join(LEGACY_CONDITIONS),
+        help=(
+            "Comma-separated subset of paper,positive,negative,absolute,"
+            "candidate_consensus_increase,candidate_consensus_decrease."
+        ),
     )
     parser.add_argument("--output-dir", required=True)
     parser.add_argument(
@@ -195,7 +216,7 @@ def validate_head_set(name, heads, expected_count=5, n_layers=32, n_heads=32):
     return normalized
 
 
-def load_head_sets(selected_heads_path):
+def load_legacy_head_sets(selected_heads_path):
     payload = load_json_object(selected_heads_path)
     head_sets = {"paper": validate_head_set("paper", PAPER_HEADS)}
 
@@ -219,6 +240,156 @@ def load_head_sets(selected_heads_path):
             )
         head_sets[condition] = pairs
     return head_sets
+
+
+def load_head_sets(selected_heads_path):
+    """Load legacy head sets without changing the historical public helper."""
+
+    return load_legacy_head_sets(selected_heads_path)
+
+
+def _require_nonempty_string(payload, field, source_name):
+    value = payload.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{source_name}: {field} must be a non-empty string")
+    return value
+
+
+def load_candidate_head_sets(candidate_heads_path):
+    payload = load_json_object(candidate_heads_path)
+    source_name = str(candidate_heads_path)
+    if payload.get("schema_version") != 1:
+        raise ValueError(f"{source_name}: schema_version must be 1")
+
+    top_level_provenance = {
+        field: _require_nonempty_string(payload, field, source_name)
+        for field in (
+            "source_csv",
+            "source_csv_sha256",
+            "source_commit",
+            "generated_by",
+        )
+    }
+    sha256 = top_level_provenance["source_csv_sha256"]
+    if len(sha256) != 64 or any(character not in "0123456789abcdef" for character in sha256):
+        raise ValueError(f"{source_name}: source_csv_sha256 must be lowercase SHA-256")
+
+    candidate_sets = payload.get("candidate_sets")
+    if not isinstance(candidate_sets, dict):
+        raise ValueError(f"{source_name}: candidate_sets must be an object")
+
+    head_sets = {}
+    metadata = {}
+    for condition in CANDIDATE_CONDITIONS:
+        candidate_set = candidate_sets.get(condition)
+        if not isinstance(candidate_set, dict):
+            raise ValueError(f"{source_name}: missing candidate set {condition!r}")
+
+        direction = _require_nonempty_string(
+            candidate_set, "direction", f"{source_name}: {condition}"
+        )
+        expected_direction = EXPECTED_CANDIDATE_DIRECTIONS[condition]
+        if direction != expected_direction:
+            raise ValueError(
+                f"{source_name}: {condition} direction must be "
+                f"{expected_direction!r}, found {direction!r}"
+            )
+
+        candidate_metadata = {
+            field: _require_nonempty_string(
+                candidate_set, field, f"{source_name}: {condition}"
+            )
+            for field in (
+                "candidate_set_id",
+                "model",
+                "candidate_type",
+                "source_attack",
+                "selection_metric",
+            )
+        }
+        candidate_metadata["direction"] = direction
+
+        k = candidate_set.get("k")
+        if type(k) is not int or k != 5:
+            raise ValueError(f"{source_name}: {condition} k must be integer 5")
+        if candidate_set.get("attack_consistency") is not True:
+            raise ValueError(
+                f"{source_name}: {condition} attack_consistency must be true"
+            )
+
+        head_rows = candidate_set.get("heads")
+        if not isinstance(head_rows, list):
+            raise ValueError(f"{source_name}: {condition} heads must be a list")
+        ranks = []
+        pairs = []
+        for position, row in enumerate(head_rows):
+            if not isinstance(row, dict):
+                raise ValueError(
+                    f"{source_name}: {condition} heads[{position}] must be an object"
+                )
+            rank = row.get("rank")
+            if type(rank) is not int:
+                raise ValueError(
+                    f"{source_name}: {condition} heads[{position}].rank must be an integer"
+                )
+            selection_value = row.get("selection_value")
+            if (
+                isinstance(selection_value, bool)
+                or not isinstance(selection_value, (int, float))
+                or not math.isfinite(selection_value)
+            ):
+                raise ValueError(
+                    f"{source_name}: {condition} heads[{position}].selection_value "
+                    "must be finite numeric"
+                )
+            ranks.append(rank)
+            pairs.append((row.get("layer"), row.get("head")))
+
+        if ranks != list(range(1, k + 1)):
+            raise ValueError(
+                f"{source_name}: {condition} ranks must be ordered exactly 1 through {k}"
+            )
+        pairs = validate_head_set(condition, pairs, expected_count=k)
+        head_sets[condition] = pairs
+        metadata[condition] = {
+            **candidate_metadata,
+            "k": k,
+            "attack_consistency": True,
+            "heads": [dict(row) for row in head_rows],
+            **top_level_provenance,
+            "candidate_head_file": str(Path(candidate_heads_path).resolve()),
+        }
+
+    candidate_set_ids = payload.get("candidate_set_ids")
+    if candidate_set_ids is not None:
+        if not isinstance(candidate_set_ids, dict):
+            raise ValueError(f"{source_name}: candidate_set_ids must be an object")
+        for condition in CANDIDATE_CONDITIONS:
+            if candidate_set_ids.get(condition) != metadata[condition]["candidate_set_id"]:
+                raise ValueError(
+                    f"{source_name}: candidate_set_ids mismatch for {condition}"
+                )
+    return head_sets, metadata
+
+
+def resolve_head_sets(selected_heads_path, candidate_heads_path, conditions):
+    head_sets = load_legacy_head_sets(selected_heads_path)
+    requested_candidates = [
+        condition for condition in conditions if condition in CANDIDATE_CONDITIONS
+    ]
+    if requested_candidates and candidate_heads_path is None:
+        raise ValueError(
+            "--candidate-heads is required when selecting candidate condition(s): "
+            + ", ".join(requested_candidates)
+        )
+
+    candidate_metadata = {}
+    if candidate_heads_path is not None:
+        candidate_head_sets, candidate_metadata = load_candidate_head_sets(
+            candidate_heads_path
+        )
+        head_sets.update(candidate_head_sets)
+    return head_sets, candidate_metadata
 
 
 def _validate_index_list(manifest, field, expected_size):
@@ -745,6 +916,7 @@ def build_metadata(
     evaluated_prompt_count,
     command,
     git_metadata,
+    candidate_metadata=None,
 ):
     selection_methods = {
         "paper": "fixed Llama paper heads from evaluate.py",
@@ -752,12 +924,19 @@ def build_metadata(
         "negative": "selection-20 mean_delta_asym_ratio negative bottom-5",
         "absolute": "selection-20 abs(mean_delta_asym_ratio) top-5",
     }
+    if candidate_metadata is None:
+        selection_method = selection_methods[condition]
+    else:
+        selection_method = (
+            "attack_consistent_consensus_"
+            f"{candidate_metadata['direction']}_k{candidate_metadata['k']}"
+        )
     compact_model_config = {
         key: model_config.get(key)
         for key in ("model_name", "name_or_path", "n_layers", "n_heads", "resid_dim")
     }
     generation = getattr(model, "generation_config", None)
-    return {
+    metadata = {
         "model_path": str(Path(args.model).resolve()),
         "model_config": compact_model_config,
         "model_config_type": getattr(model.config, "model_type", None),
@@ -818,7 +997,7 @@ def build_metadata(
         "condition": condition,
         "selected_heads": _heads_for_json(heads),
         "selected_heads_file": str(Path(args.selected_heads).resolve()),
-        "selection_method": selection_methods[condition],
+        "selection_method": selection_method,
         "selection_size": manifest["selection_size"],
         "evaluation_size": manifest["evaluation_size"],
         "evaluated_prompt_count": evaluated_prompt_count,
@@ -835,6 +1014,30 @@ def build_metadata(
         ),
         **git_metadata,
     }
+    if candidate_metadata is not None:
+        direction = candidate_metadata["direction"]
+        k = candidate_metadata["k"]
+        metadata.update(
+            {
+                "selection_family": "delta_asym_ratio_cross_attack_consensus",
+                "selection_method": (
+                    f"attack_consistent_consensus_{direction}_k{k}"
+                ),
+                "candidate_set_id": candidate_metadata["candidate_set_id"],
+                "candidate_type": candidate_metadata["candidate_type"],
+                "source_attack": candidate_metadata["source_attack"],
+                "direction": direction,
+                "k": k,
+                "selection_metric": candidate_metadata["selection_metric"],
+                "attack_consistency": candidate_metadata["attack_consistency"],
+                "heads": _heads_for_json(heads),
+                "source_csv": candidate_metadata["source_csv"],
+                "source_csv_sha256": candidate_metadata["source_csv_sha256"],
+                "source_commit": candidate_metadata["source_commit"],
+                "candidate_head_file": candidate_metadata["candidate_head_file"],
+            }
+        )
+    return metadata
 
 
 def main(argv=None):
@@ -856,7 +1059,9 @@ def main(argv=None):
 
     manifest = load_json_object(args.split_manifest)
     validate_fixed_experiment_manifest(manifest)
-    head_sets = load_head_sets(args.selected_heads)
+    head_sets, candidate_metadata = resolve_head_sets(
+        args.selected_heads, args.candidate_heads, conditions
+    )
     input_rows = read_records(args.input_file)
     baseline_rows = read_records(args.baseline_results)
     source_rows = read_records(args.source_labels)
@@ -894,10 +1099,10 @@ def main(argv=None):
     model, tokenizer, model_config = load_model_and_tokenizer(args.model)
     model.eval()
     validate_model_and_activation(model_config, intervention_activation)
-    for condition in ALL_CONDITIONS:
+    for condition, heads in head_sets.items():
         validate_head_set(
             condition,
-            head_sets[condition],
+            heads,
             n_layers=model_config["n_layers"],
             n_heads=model_config["n_heads"],
         )
@@ -962,6 +1167,7 @@ def main(argv=None):
             evaluated_prompt_count=len(records),
             command=command,
             git_metadata=git_metadata,
+            candidate_metadata=candidate_metadata.get(condition),
         )
         condition_dir = Path(args.output_dir) / condition
         write_jsonl(condition_dir / "prompt_results.jsonl", results)
