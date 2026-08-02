@@ -199,6 +199,8 @@ class InterpolationTests(unittest.TestCase):
         summary = controller.summary()
         self.assertEqual(summary["short_sequence_skip_count"], 1)
         self.assertEqual(summary["intervention_call_count"], 0)
+        self.assertEqual(summary["per_head"][0]["short_sequence_skip_count"], 1)
+        self.assertEqual(controller.head_metric_records(), [])
 
 
 class AlphaValidationTests(unittest.TestCase):

@@ -340,7 +340,15 @@ class ReferenceAsymmetryController:
         self.short_sequence_skip_count = 0
         self._head_records: list[dict] = []
         self._layer_records: list[dict] = []
+        self._short_sequence_skip_by_head = {
+            (layer, head): 0 for layer, head in self.layer_head_pairs
+        }
         self._cache_transfer_count_at_clear = self._reference_cache_transfer_count
+
+    def head_metric_records(self) -> list[dict]:
+        """Return detached scalar-only call diagnostics for external aggregation."""
+
+        return [dict(record) for record in self._head_records]
 
     def _reference(self, layer: int, head: int, device: torch.device) -> torch.Tensor:
         key = (layer, head, str(device))
@@ -389,6 +397,8 @@ class ReferenceAsymmetryController:
             )
         if query_length < self.tail_tokens:
             self.short_sequence_skip_count += 1
+            for head in selected_heads:
+                self._short_sequence_skip_by_head[(layer, head)] += 1
             return attention_scores
         if not bool(torch.isfinite(attention_scores).all().item()):
             raise ReferenceInterventionRuntimeError(
@@ -567,6 +577,9 @@ class ReferenceAsymmetryController:
                     "layer": layer,
                     "head": head,
                     "call_count": len(records),
+                    "short_sequence_skip_count": self._short_sequence_skip_by_head[
+                        (layer, head)
+                    ],
                     "current_asym_frobenius_norm_min": min(
                         values("current_asym_frobenius_norm"), default=None
                     ),
