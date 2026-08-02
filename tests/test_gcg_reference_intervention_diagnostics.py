@@ -146,6 +146,15 @@ class LogitMetricTests(unittest.TestCase):
         self.assertEqual(result["intervention_top1_top2_margin"], 2.0)
         self.assertEqual(result["margin_change"], 0.0)
 
+    def test_tied_top_logits_follow_torch_argmax_not_topk_index(self):
+        baseline = torch.tensor([1.0, 3.0, 2.0])
+        intervention = torch.tensor([4.0, 4.0, 0.0])
+        result = compute_logit_step_metrics(baseline, intervention, step=0)
+        self.assertEqual(result["baseline_top1_token_id"], 1)
+        self.assertEqual(result["intervention_top1_token_id"], 0)
+        self.assertFalse(result["argmax_equal"])
+        self.assertEqual(result["intervention_top1_top2_margin"], 0.0)
+
     def test_step_aggregation(self):
         first = compute_logit_step_metrics(
             torch.tensor([3.0, 1.0]), torch.tensor([3.0, 1.0]), step=0

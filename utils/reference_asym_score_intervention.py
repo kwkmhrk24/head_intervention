@@ -45,6 +45,7 @@ EXPECTED_SCORE_CAPTURE_POSITION = (
     "post-RoPE, after repeat_kv, immediately after QK^T/sqrt(head_dim), "
     "pre-mask, pre-softmax"
 )
+INTERVENTION_TIMINGS = ("dynamic_all_steps", "first_token_only")
 
 
 class ReferenceInterventionRuntimeError(RuntimeError):
@@ -58,6 +59,15 @@ def validate_alpha(alpha: float) -> float:
     if not math.isfinite(alpha) or not 0.0 <= alpha <= 1.0:
         raise ValueError("alpha must satisfy 0.0 <= alpha <= 1.0")
     return alpha
+
+
+def validate_intervention_timing(intervention_timing: str) -> str:
+    if intervention_timing not in INTERVENTION_TIMINGS:
+        raise ValueError(
+            f"intervention_timing must be one of {INTERVENTION_TIMINGS}, "
+            f"found {intervention_timing!r}"
+        )
+    return intervention_timing
 
 
 def _max_abs(value: torch.Tensor) -> float:
@@ -295,8 +305,12 @@ class ReferenceAsymmetryController:
         alpha: float,
         tail_tokens: int = TAIL_TOKENS,
         expected_score_dtype: torch.dtype | None = None,
+        intervention_timing: str = "dynamic_all_steps",
     ):
         self.alpha = validate_alpha(alpha)
+        self.intervention_timing = validate_intervention_timing(
+            intervention_timing
+        )
         if not isinstance(reference_mean, torch.Tensor):
             raise TypeError("reference_mean must be a torch tensor")
         if reference_mean.ndim != 3:
@@ -338,12 +352,46 @@ class ReferenceAsymmetryController:
         self.intervention_call_count = 0
         self.alpha_zero_bypass_count = 0
         self.short_sequence_skip_count = 0
+        self.prompt_length: int | None = None
+        self.first_forward_detected = False
+        self.first_forward_intervened = False
+        self.later_forward_intervention_count = 0
+        self.later_forward_skip_count = 0
+        self._observed_sequence_lengths: set[int] = set()
+        self._per_head_intervention_count = {
+            (layer, head): 0 for layer, head in self.layer_head_pairs
+        }
         self._head_records: list[dict] = []
         self._layer_records: list[dict] = []
         self._short_sequence_skip_by_head = {
             (layer, head): 0 for layer, head in self.layer_head_pairs
         }
         self._cache_transfer_count_at_clear = self._reference_cache_transfer_count
+
+    def set_prompt_context(
+        self,
+        *,
+        prompt_length: int,
+        intervention_timing: str | None = None,
+    ) -> None:
+        """Set prompt-specific timing state before any selected-layer forward."""
+
+        if self.attention_forward_call_count != 0 or self.intervention_call_count != 0:
+            raise ReferenceInterventionRuntimeError(
+                "prompt context must be set before attention forwards"
+            )
+        if type(prompt_length) is not int:
+            raise TypeError("prompt_length must be an integer")
+        if prompt_length < self.tail_tokens:
+            raise ValueError(
+                f"prompt_length must be at least {self.tail_tokens}, "
+                f"found {prompt_length}"
+            )
+        if intervention_timing is not None:
+            self.intervention_timing = validate_intervention_timing(
+                intervention_timing
+            )
+        self.prompt_length = prompt_length
 
     def head_metric_records(self) -> list[dict]:
         """Return detached scalar-only call diagnostics for external aggregation."""
@@ -370,6 +418,19 @@ class ReferenceAsymmetryController:
 
         # Exact identity path: no shape checks, clone, dtype conversion, or arithmetic.
         if self.alpha == 0.0:
+            if (
+                isinstance(attention_scores, torch.Tensor)
+                and attention_scores.ndim >= 2
+            ):
+                current_length = int(attention_scores.shape[-1])
+                self._observed_sequence_lengths.add(current_length)
+                if self.prompt_length is not None:
+                    if current_length < self.prompt_length:
+                        raise ReferenceInterventionRuntimeError(
+                            "current sequence length is shorter than prompt length"
+                        )
+                    if current_length == self.prompt_length:
+                        self.first_forward_detected = True
             self.alpha_zero_bypass_count += 1
             return attention_scores
 
@@ -395,6 +456,37 @@ class ReferenceAsymmetryController:
             raise ReferenceInterventionRuntimeError(
                 f"attention score matrix is not square: {query_length}x{key_length}"
             )
+        self._observed_sequence_lengths.add(query_length)
+        if self.intervention_timing == "first_token_only":
+            if self.prompt_length is None:
+                raise ReferenceInterventionRuntimeError(
+                    "first_token_only requires prompt context"
+                )
+            if query_length < self.prompt_length:
+                raise ReferenceInterventionRuntimeError(
+                    "current sequence length is shorter than prompt length"
+                )
+            if query_length > self.prompt_length:
+                self.later_forward_skip_count += len(selected_heads)
+                return attention_scores
+            self.first_forward_detected = True
+            duplicate_heads = [
+                head
+                for head in selected_heads
+                if self._per_head_intervention_count[(layer, head)] != 0
+            ]
+            if duplicate_heads:
+                raise ReferenceInterventionRuntimeError(
+                    "first_token_only duplicate intervention for "
+                    f"layer={layer}, heads={duplicate_heads}"
+                )
+        elif self.prompt_length is not None:
+            if query_length < self.prompt_length:
+                raise ReferenceInterventionRuntimeError(
+                    "current sequence length is shorter than prompt length"
+                )
+            if query_length == self.prompt_length:
+                self.first_forward_detected = True
         if query_length < self.tail_tokens:
             self.short_sequence_skip_count += 1
             for head in selected_heads:
@@ -468,10 +560,19 @@ class ReferenceAsymmetryController:
             )
 
         self.intervention_call_count += 1
+        for head in selected:
+            self._per_head_intervention_count[(layer, head)] += 1
+        if self.prompt_length is not None:
+            if query_length == self.prompt_length:
+                self.first_forward_intervened = True
+            elif query_length > self.prompt_length:
+                self.later_forward_intervention_count += len(selected)
         self._layer_records.append(
             {
                 "layer": layer,
                 "sequence_length": query_length,
+                "block_start": query_length - self.tail_tokens,
+                "block_end": query_length,
                 "selected_heads": list(selected),
                 "max_unselected_head_change": unselected_change,
                 "max_outside_tail_change": outside_tail_change,
@@ -661,12 +762,32 @@ class ReferenceAsymmetryController:
             )
         return {
             "alpha": self.alpha,
+            "intervention_timing": self.intervention_timing,
+            "prompt_length": self.prompt_length,
+            "current_sequence_lengths": sorted(self._observed_sequence_lengths),
+            "first_forward_detected": self.first_forward_detected,
+            "first_forward_intervened": self.first_forward_intervened,
+            "later_forward_intervention_count": (
+                self.later_forward_intervention_count
+            ),
+            "later_forward_skip_count": self.later_forward_skip_count,
             "selected_heads": [
                 {"layer": layer, "head": head}
                 for layer, head in self.layer_head_pairs
             ],
             "attention_forward_call_count": self.attention_forward_call_count,
             "intervention_call_count": self.intervention_call_count,
+            "total_intervention_count": sum(
+                self._per_head_intervention_count.values()
+            ),
+            "per_head_intervention_count": [
+                {
+                    "layer": layer,
+                    "head": head,
+                    "count": self._per_head_intervention_count[(layer, head)],
+                }
+                for layer, head in self.layer_head_pairs
+            ],
             "alpha_zero_bypass_count": self.alpha_zero_bypass_count,
             "short_sequence_skip_count": self.short_sequence_skip_count,
             "reference_cache_entry_count": len(self._reference_cache),
@@ -675,6 +796,32 @@ class ReferenceAsymmetryController:
                 - self._cache_transfer_count_at_clear
             ),
             "reference_cache_transfer_count_total": self._reference_cache_transfer_count,
+            "block_start": (
+                self._layer_records[0]["block_start"]
+                if self._layer_records
+                else None
+            ),
+            "block_end": (
+                self._layer_records[0]["block_end"]
+                if self._layer_records
+                else None
+            ),
+            "intervention_blocks": [
+                {"start": start, "end": end}
+                for start, end in sorted(
+                    {
+                        (record["block_start"], record["block_end"])
+                        for record in self._layer_records
+                    }
+                )
+            ],
+            "block_changed_across_interventions": len(
+                {
+                    (record["block_start"], record["block_end"])
+                    for record in self._layer_records
+                }
+            )
+            > 1,
             "max_constructed_delta_antisymmetry_error_float32": maximum(
                 "max_constructed_delta_antisymmetry_error_float32"
             ),
@@ -870,6 +1017,7 @@ def patch_llama_reference_attention(
     *,
     artifacts: ValidatedReferenceArtifacts,
     alpha: float,
+    intervention_timing: str = "dynamic_all_steps",
 ):
     """Temporarily patch only artifact-selected eager Llama attention layers."""
 
@@ -885,6 +1033,7 @@ def patch_llama_reference_attention(
         alpha=alpha,
         tail_tokens=TAIL_TOKENS,
         expected_score_dtype=torch.float16,
+        intervention_timing=intervention_timing,
     )
     patched = []
     try:

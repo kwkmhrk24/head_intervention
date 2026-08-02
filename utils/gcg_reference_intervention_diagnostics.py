@@ -223,9 +223,11 @@ def compute_logit_step_metrics(
     kl_value = max(0.0, float(kl.detach().cpu().item()))
     baseline_top = torch.topk(baseline, k=2)
     intervention_top = torch.topk(intervention, k=2)
-    baseline_top1_id = int(baseline_top.indices[0].item())
-    intervention_top1_id = int(intervention_top.indices[0].item())
-    baseline_top1_logit = float(baseline_top.values[0].item())
+    # Greedy generation uses torch.argmax.  torch.topk can return a different
+    # index when several tokens have exactly tied maximum logits.
+    baseline_top1_id = int(torch.argmax(baseline).item())
+    intervention_top1_id = int(torch.argmax(intervention).item())
+    baseline_top1_logit = float(baseline[baseline_top1_id].item())
     intervention_at_baseline_top1 = float(
         intervention[baseline_top1_id].item()
     )
@@ -337,4 +339,3 @@ def validate_logit_diagnostic_record(
     if not isinstance(record["steps"], list):
         raise ValueError("logit diagnostic steps must be a list")
     aggregate_logit_steps(record["steps"])
-

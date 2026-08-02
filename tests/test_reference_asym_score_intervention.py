@@ -14,8 +14,10 @@ from utils.gcg_wasserstein_reference import (
 from utils.reference_asym_score_intervention import (
     EXPECTED_SCORE_CAPTURE_POSITION,
     ReferenceAsymmetryController,
+    ReferenceInterventionRuntimeError,
     build_antisymmetric_reference_matrix,
     validate_alpha,
+    validate_intervention_timing,
     validate_runtime_artifact_payloads,
 )
 
@@ -77,7 +79,7 @@ def make_verification():
     }
 
 
-def make_controller(alpha, lower_values=None):
+def make_controller(alpha, lower_values=None, *, intervention_timing="dynamic_all_steps"):
     reference = torch.zeros((2, 4, ELEMENTS_PER_HEAD), dtype=torch.float32)
     if lower_values is None:
         lower_values = torch.linspace(-1.0, 1.0, ELEMENTS_PER_HEAD)
@@ -86,6 +88,7 @@ def make_controller(alpha, lower_values=None):
         reference_mean=reference,
         layer_head_pairs=[(0, 1)],
         alpha=alpha,
+        intervention_timing=intervention_timing,
     )
 
 
@@ -218,6 +221,109 @@ class AlphaValidationTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 validate_alpha(value)
 
+
+class InterventionTimingTests(unittest.TestCase):
+    def test_first_token_only_applies_only_at_prompt_length(self):
+        controller = make_controller(0.5, intervention_timing="first_token_only")
+        controller.set_prompt_context(prompt_length=40)
+        first = torch.randn(1, 4, 40, 40)
+        later_one = torch.randn(1, 4, 41, 41)
+        later_many = torch.randn(1, 4, 50, 50)
+        self.assertIsNot(controller.apply(0, first), first)
+        self.assertIs(controller.apply(0, later_one), later_one)
+        self.assertIs(controller.apply(0, later_many), later_many)
+        summary = controller.summary()
+        self.assertTrue(summary["first_forward_detected"])
+        self.assertTrue(summary["first_forward_intervened"])
+        self.assertEqual(summary["total_intervention_count"], 1)
+        self.assertEqual(summary["later_forward_intervention_count"], 0)
+        self.assertEqual(summary["later_forward_skip_count"], 2)
+        self.assertEqual(summary["block_start"], 24)
+        self.assertEqual(summary["block_end"], 40)
+        self.assertFalse(summary["block_changed_across_interventions"])
+
+    def test_five_selected_heads_apply_once_on_first_forward(self):
+        reference = torch.zeros((5, 2, ELEMENTS_PER_HEAD), dtype=torch.float32)
+        heads = tuple((layer, 0) for layer in range(5))
+        controller = ReferenceAsymmetryController(
+            reference_mean=reference,
+            layer_head_pairs=heads,
+            alpha=0.5,
+            intervention_timing="first_token_only",
+        )
+        controller.set_prompt_context(prompt_length=40)
+        for layer, _ in heads:
+            controller.apply(layer, torch.randn(1, 2, 40, 40))
+        for layer, _ in heads:
+            scores = torch.randn(1, 2, 41, 41)
+            self.assertIs(controller.apply(layer, scores), scores)
+        summary = controller.summary()
+        self.assertEqual(summary["total_intervention_count"], 5)
+        self.assertEqual(
+            [item["count"] for item in summary["per_head_intervention_count"]],
+            [1, 1, 1, 1, 1],
+        )
+        self.assertEqual(summary["later_forward_intervention_count"], 0)
+        self.assertEqual(summary["later_forward_skip_count"], 5)
+
+    def test_dynamic_default_and_explicit_mode_apply_every_step(self):
+        for timing in (None, "dynamic_all_steps"):
+            with self.subTest(timing=timing):
+                kwargs = {} if timing is None else {"intervention_timing": timing}
+                controller = make_controller(0.5, **kwargs)
+                controller.set_prompt_context(prompt_length=40)
+                first = torch.randn(1, 4, 40, 40)
+                later = torch.randn(1, 4, 41, 41)
+                self.assertIsNot(controller.apply(0, first), first)
+                self.assertIsNot(controller.apply(0, later), later)
+                summary = controller.summary()
+                self.assertEqual(summary["intervention_timing"], "dynamic_all_steps")
+                self.assertEqual(summary["total_intervention_count"], 2)
+                self.assertEqual(summary["later_forward_intervention_count"], 1)
+                self.assertTrue(summary["block_changed_across_interventions"])
+
+    def test_alpha_zero_first_token_mode_is_exact_bypass(self):
+        controller = make_controller(0.0, intervention_timing="first_token_only")
+        controller.set_prompt_context(prompt_length=40)
+        for length in (40, 41, 50):
+            scores = torch.randn(1, 4, length, length)
+            before = scores.clone()
+            result = controller.apply(0, scores)
+            self.assertIs(result, scores)
+            self.assertTrue(torch.equal(result, before))
+        summary = controller.summary()
+        self.assertEqual(summary["total_intervention_count"], 0)
+        self.assertEqual(summary["reference_cache_transfer_count"], 0)
+
+    def test_first_token_mode_requires_prompt_context(self):
+        controller = make_controller(0.5, intervention_timing="first_token_only")
+        with self.assertRaisesRegex(
+            ReferenceInterventionRuntimeError, "requires prompt context"
+        ):
+            controller.apply(0, torch.randn(1, 4, 40, 40))
+
+    def test_prompt_context_validation(self):
+        controller = make_controller(0.5, intervention_timing="first_token_only")
+        with self.assertRaisesRegex(ValueError, "at least 16"):
+            controller.set_prompt_context(prompt_length=15)
+        controller.set_prompt_context(prompt_length=40)
+        with self.assertRaisesRegex(
+            ReferenceInterventionRuntimeError, "shorter than prompt"
+        ):
+            controller.apply(0, torch.randn(1, 4, 39, 39))
+
+    def test_unknown_timing_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "intervention_timing"):
+            validate_intervention_timing("unknown")
+
+    def test_duplicate_first_token_head_intervention_is_rejected(self):
+        controller = make_controller(0.5, intervention_timing="first_token_only")
+        controller.set_prompt_context(prompt_length=40)
+        controller.apply(0, torch.randn(1, 4, 40, 40))
+        with self.assertRaisesRegex(
+            ReferenceInterventionRuntimeError, "duplicate intervention"
+        ):
+            controller.apply(0, torch.randn(1, 4, 40, 40))
 
 class RuntimeArtifactValidationTests(unittest.TestCase):
     def validate(self, verification=None, top5=None, reference=None):
