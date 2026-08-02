@@ -164,6 +164,21 @@ class InterpolationTests(unittest.TestCase):
         self.assertEqual(summary["max_unselected_head_change"], 0.0)
         self.assertEqual(summary["max_outside_tail_change"], 0.0)
         selected = summary["per_head"][0]
+        record = controller.head_metric_records()[0]
+        original = self.scores[0, 1, -16:, -16:]
+        current = (original - original.T) / 2
+        reference = controller._reference_cpu[(0, 1)]
+        distance = reference - current
+        self.assertAlmostEqual(
+            record["current_to_reference_frobenius_distance"],
+            float(torch.linalg.vector_norm(distance)),
+            places=5,
+        )
+        self.assertAlmostEqual(
+            record["current_to_reference_mean_absolute_distance"],
+            float(distance.abs().mean()),
+            places=5,
+        )
         self.assertIn("max_delta_antisymmetry_error", selected)
         self.assertIn("max_symmetric_component_error", selected)
         self.assertEqual(selected["max_unselected_head_change"], 0.0)

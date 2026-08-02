@@ -582,6 +582,7 @@ class ReferenceAsymmetryController:
             index = (slice(None), local_index)
             current = current_asym[index]
             ref = reference[index]
+            current_to_reference = ref - current
             intervened_float32 = (
                 block_float32[index] - block_float32[index].transpose(-1, -2)
             ) / 2
@@ -600,6 +601,12 @@ class ReferenceAsymmetryController:
                     "score_dtype": str(attention_scores.dtype),
                     "current_asym_frobenius_norm": current_norm,
                     "reference_asym_frobenius_norm": reference_norm,
+                    "current_to_reference_frobenius_distance": float(
+                        torch.linalg.vector_norm(current_to_reference).item()
+                    ),
+                    "current_to_reference_mean_absolute_distance": float(
+                        current_to_reference.abs().mean().item()
+                    ),
                     "intervened_asym_frobenius_norm": intervened_norm,
                     "intervened_to_current_norm_ratio": (
                         intervened_norm / current_norm if current_norm > 0 else None
@@ -695,6 +702,22 @@ class ReferenceAsymmetryController:
                                 self._reference_cpu[(layer, head)]
                             ).item()
                         )
+                    ),
+                    "current_to_reference_frobenius_distance_min": min(
+                        values("current_to_reference_frobenius_distance"),
+                        default=None,
+                    ),
+                    "current_to_reference_frobenius_distance_max": max(
+                        values("current_to_reference_frobenius_distance"),
+                        default=None,
+                    ),
+                    "current_to_reference_mean_absolute_distance_min": min(
+                        values("current_to_reference_mean_absolute_distance"),
+                        default=None,
+                    ),
+                    "current_to_reference_mean_absolute_distance_max": max(
+                        values("current_to_reference_mean_absolute_distance"),
+                        default=None,
                     ),
                     "intervened_asym_frobenius_norm_min": min(
                         values("intervened_asym_frobenius_norm"), default=None
