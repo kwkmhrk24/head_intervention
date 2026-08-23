@@ -32,17 +32,21 @@ from utils.gcg_first_token_reference_ablation import (  # noqa: E402
     validate_first_token_response_invariant,
 )
 from utils.gcg_reference_factorization_diagnostics import (  # noqa: E402
-    ALPHA,
+    DEFAULT_ALPHA,
     EXPECTED_TOP5,
     GROUP_COUNTS,
     build_paired_original_records,
     classify_factorization_causes,
+    compare_with_reference_alpha,
     factorization_conditions,
     reference_for_condition,
+    should_validate_alpha05_exact_match,
+    summarize_combined_conditions,
     summarize_condition_logits,
     summarize_condition_results,
     summarize_reference_distances,
     validate_condition_definitions,
+    validate_factorization_alpha,
     validate_paired_original_values,
 )
 from utils.gcg_reference_intervention_diagnostics import (  # noqa: E402
@@ -99,6 +103,10 @@ DEFAULT_BASELINE_RESULTS = (
 )
 DEFAULT_RAW_ARCHIVE = "data/raw/llama2/llama2_GCG.json"
 DEFAULT_ADVBENCH = "data/raw/advbench.jsonl"
+DEFAULT_ALPHA05_FACTORIZATION_RUN = (
+    "data/outputs/gcg_wasserstein_reference_intervention/llama2/"
+    "reference_factorization_diagnosis_20260802T153940Z"
+)
 EXPECTED_SELECTION_MANIFEST_SHA256 = (
     "13578541411456bd689f8e771694ca97b047f2828bc35663536a5bc65badfa1e"
 )
@@ -135,6 +143,17 @@ def parse_args(argv=None):
     parser.add_argument("--baseline-results", default=DEFAULT_BASELINE_RESULTS)
     parser.add_argument("--raw-archive", default=DEFAULT_RAW_ARCHIVE)
     parser.add_argument("--advbench", default=DEFAULT_ADVBENCH)
+    parser.add_argument(
+        "--alpha",
+        type=validate_factorization_alpha,
+        default=DEFAULT_ALPHA,
+        help="Interpolation alpha in [0,1] (default: 0.5).",
+    )
+    parser.add_argument(
+        "--alpha05-factorization-run",
+        default=DEFAULT_ALPHA05_FACTORIZATION_RUN,
+        help="Saved alpha=0.5 factorization run used only for comparison.",
+    )
     parser.add_argument("--output-dir", required=True)
     return parser.parse_args(argv)
 
@@ -345,6 +364,8 @@ def run_condition_prompt(
     tokenizer,
     artifacts,
     saved_global: dict,
+    alpha: float,
+    validate_alpha05_exact_match: bool,
 ) -> tuple[dict, list[dict]]:
     reference = reference_for_condition(
         condition,
@@ -360,7 +381,7 @@ def run_condition_prompt(
     with patch_llama_reference_attention(
         model,
         artifacts=prompt_artifacts,
-        alpha=ALPHA,
+        alpha=alpha,
         intervention_timing="first_token_only",
     ) as controller:
         controller.set_prompt_context(
@@ -392,7 +413,7 @@ def run_condition_prompt(
         raise RuntimeError("response/first-token argmax invariance mismatch")
     transition = classify_transition(record["baseline_success"], generation["success"])
     prior_match = None
-    if condition["name"] == "top5_global_mean":
+    if condition["name"] == "top5_global_mean" and validate_alpha05_exact_match:
         prior = saved_global[record["dataset_index"]]
         prior_match = {
             "response_equal": generation["response"] == prior["response"],
@@ -414,7 +435,7 @@ def run_condition_prompt(
         "prompt": record["prompt"],
         "formatted_prompt": record["formatted_prompt"],
         "prompt_length": record["prompt_length"],
-        "alpha": ALPHA,
+        "alpha": alpha,
         "intervention_timing": "first_token_only",
         "selected_heads": [
             {"layer": layer, "head": head} for layer, head in heads
@@ -446,6 +467,7 @@ def run_condition_prompt(
             "condition": condition["name"],
             "dataset_index": record["dataset_index"],
             "reference_kind": condition["reference_kind"],
+            "alpha": alpha,
             **{
                 key: metric[key]
                 for key in (
@@ -469,11 +491,14 @@ def run_condition_prompt(
 
 def main(argv=None):
     args = parse_args(argv)
+    alpha = validate_factorization_alpha(args.alpha)
+    validate_alpha05_exact_match = should_validate_alpha05_exact_match(alpha)
     output_dir = ensure_output_absent(args.output_dir).resolve()
     model_path = Path(args.model).resolve()
     artifact_dir = Path(args.artifact_dir).resolve()
     selection_run = Path(args.selection_run).resolve()
     holdout_run = Path(args.holdout_run).resolve()
+    alpha05_factorization_run = Path(args.alpha05_factorization_run).resolve()
     conditions = factorization_conditions()
     validate_condition_definitions(conditions)
 
@@ -514,6 +539,10 @@ def main(argv=None):
         ),
         "holdout_run": str(holdout_run),
         "holdout_run_manifest_sha256": sha256_file(holdout_run / "run_manifest.json"),
+        "alpha05_factorization_run": str(alpha05_factorization_run),
+        "alpha05_factorization_run_manifest_sha256": sha256_file(
+            alpha05_factorization_run / "run_manifest.json"
+        ),
         "artifact_dir": str(artifact_dir),
         "reference_artifact_sha256": sha256_file(
             artifact_dir / "original_reference.pt"
@@ -528,7 +557,13 @@ def main(argv=None):
         "gpu": torch.cuda.get_device_name(0),
         "generation_settings": GENERATION_SETTINGS,
         "timing": "first_token_only",
-        "alpha": ALPHA,
+        "alpha": alpha,
+        "alpha_source": "CLI --alpha",
+        "alpha_default": DEFAULT_ALPHA,
+        "baseline_validation": "always applied against saved baseline tokens/logits",
+        "alpha_0.5_intervention_exact_match_required": (
+            validate_alpha05_exact_match
+        ),
         "tail_tokens": TAIL_TOKENS,
         "conditions": [
             {
@@ -578,6 +613,7 @@ def main(argv=None):
             "strict_lower_position_order": (
                 "torch.tril_indices(16, 16, offset=-1)"
             ),
+            "experiment_alpha": alpha,
         },
     }
     paired_path = output_dir / "paired_original_references.pt"
@@ -585,6 +621,7 @@ def main(argv=None):
     paired_manifest = {
         "schema_version": 1,
         "created_at": utc_now(),
+        "experiment_alpha": alpha,
         **paired_payload["metadata"],
         "model": str(model_path),
         "model_config": llama_model_config_summary(model),
@@ -627,6 +664,8 @@ def main(argv=None):
                     tokenizer=tokenizer,
                     artifacts=artifacts,
                     saved_global=saved_global[group],
+                    alpha=alpha,
+                    validate_alpha05_exact_match=validate_alpha05_exact_match,
                 )
                 condition_rows.append(row)
                 reference_rows.extend(metrics)
@@ -637,10 +676,18 @@ def main(argv=None):
                     flush=True,
                 )
 
-    condition_summary = summarize_condition_results(condition_rows)
-    logit_summary = summarize_condition_logits(condition_rows)
-    reference_summary = summarize_reference_distances(reference_rows)
+    condition_summary = summarize_condition_results(condition_rows, alpha=alpha)
+    combined_summary = summarize_combined_conditions(condition_summary)
+    logit_summary = summarize_condition_logits(condition_rows, alpha=alpha)
+    reference_summary = summarize_reference_distances(reference_rows, alpha=alpha)
     cause_classification = classify_factorization_causes(condition_summary)
+    alpha05_condition_summary = read_json(
+        alpha05_factorization_run / "condition_summary.json"
+    )
+    alpha05_comparison = compare_with_reference_alpha(
+        condition_summary,
+        alpha05_condition_summary,
+    )
 
     write_jsonl(output_dir / "condition_results.jsonl", condition_rows)
     write_json(output_dir / "condition_summary.json", condition_summary)
@@ -662,12 +709,26 @@ def main(argv=None):
                 for record in paired_manifest_records
             ),
         },
-        "global_condition_existing_artifact_mismatch_count": sum(
-            not all(row["matches_existing_global_artifact"].values())
-            for row in condition_rows
-            if row["condition"] == "top5_global_mean"
+        "alpha": alpha,
+        "baseline_validation_applied": True,
+        "alpha_0.5_intervention_exact_match_required": (
+            validate_alpha05_exact_match
+        ),
+        "alpha_0.5_intervention_exact_match_applied": (
+            validate_alpha05_exact_match
+        ),
+        "global_condition_existing_artifact_mismatch_count": (
+            sum(
+                not all(row["matches_existing_global_artifact"].values())
+                for row in condition_rows
+                if row["condition"] == "top5_global_mean"
+            )
+            if validate_alpha05_exact_match
+            else None
         ),
         "condition_summary": condition_summary,
+        "combined_condition_summary": combined_summary,
+        "alpha_0.5_comparison": alpha05_comparison,
         "cause_classification": cause_classification,
         "generation_failure_count": 0,
         "empty_response_count": sum(bool(row["empty_response"]) for row in condition_rows),
@@ -678,7 +739,9 @@ def main(argv=None):
     run_manifest["status"] = "complete"
     run_manifest["completed_at"] = diagnosis_summary["created_at"]
     run_manifest["paired_original_reference_sha256"] = sha256_file(paired_path)
-    run_manifest["global_condition_existing_artifact_mismatch_count"] = 0
+    run_manifest["global_condition_existing_artifact_mismatch_count"] = (
+        0 if validate_alpha05_exact_match else None
+    )
     # run_manifest is the one intentional in-run status transition.
     temporary_manifest = output_dir / ".run_manifest.json.tmp"
     with temporary_manifest.open("x", encoding="utf-8") as handle:

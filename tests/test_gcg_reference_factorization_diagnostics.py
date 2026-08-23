@@ -3,21 +3,27 @@ import unittest
 
 import torch
 
+from scripts.diagnose_gcg_reference_factorization import parse_args
 from utils.gcg_reference_factorization_diagnostics import (
     ALPHA,
     BASELINE_SUCCESS_COUNTS,
+    DEFAULT_ALPHA,
     EXPECTED_TOP5,
     GROUP_COUNTS,
     REFERENCE_FIELDS,
     SINGLE_HEAD,
     build_paired_original_records,
     classify_factorization_causes,
+    compare_with_reference_alpha,
     factorization_conditions,
     reference_for_condition,
+    should_validate_alpha05_exact_match,
+    summarize_combined_conditions,
     summarize_condition_logits,
     summarize_condition_results,
     summarize_reference_distances,
     validate_condition_definitions,
+    validate_factorization_alpha,
     validate_paired_original_values,
 )
 from utils.gcg_wasserstein_reference import sha256_text
@@ -107,6 +113,7 @@ def condition_rows():
                         "dataset_group": group,
                         "condition": condition["name"],
                         "dataset_index": position,
+                        "alpha": ALPHA,
                         "baseline_success": baseline_success,
                         "success": success,
                         "transition": (
@@ -144,6 +151,7 @@ def reference_rows():
                             "dataset_group": group,
                             "condition": condition["name"],
                             "dataset_index": position,
+                            "alpha": ALPHA,
                             "layer": layer,
                             "head": head,
                             **{field: value for field in REFERENCE_FIELDS},
@@ -197,6 +205,27 @@ class PairedOriginalTests(unittest.TestCase):
 
 
 class ConditionSwitchTests(unittest.TestCase):
+    def test_cli_alpha_default_and_override(self):
+        self.assertEqual(parse_args(["--output-dir", "out"]).alpha, 0.5)
+        self.assertEqual(
+            parse_args(["--output-dir", "out", "--alpha", "0.25"]).alpha,
+            0.25,
+        )
+
+    def test_alpha_default_and_validation(self):
+        self.assertEqual(DEFAULT_ALPHA, 0.5)
+        self.assertEqual(validate_factorization_alpha(0.25), 0.25)
+        self.assertEqual(validate_factorization_alpha("0.25"), 0.25)
+        for invalid in (-0.01, 1.01, math.nan, math.inf):
+            with self.assertRaises(ValueError):
+                validate_factorization_alpha(invalid)
+        with self.assertRaises(TypeError):
+            validate_factorization_alpha("not-a-number")
+
+    def test_alpha05_exact_match_policy_is_separate(self):
+        self.assertTrue(should_validate_alpha05_exact_match(0.5))
+        self.assertFalse(should_validate_alpha05_exact_match(0.25))
+
     def test_fixed_head_and_reference_switches(self):
         conditions = factorization_conditions()
         validate_condition_definitions(conditions)
@@ -229,6 +258,19 @@ class ConditionSwitchTests(unittest.TestCase):
 
 
 class SummaryTests(unittest.TestCase):
+    def test_alpha025_is_saved_in_summaries(self):
+        rows = condition_rows()
+        for row in rows:
+            row["alpha"] = 0.25
+        refs = reference_rows()
+        for row in refs:
+            row["alpha"] = 0.25
+        self.assertEqual(summarize_condition_results(rows, alpha=0.25)["alpha"], 0.25)
+        self.assertEqual(summarize_condition_logits(rows, alpha=0.25)["alpha"], 0.25)
+        self.assertEqual(
+            summarize_reference_distances(refs, alpha=0.25)["alpha"], 0.25
+        )
+
     def test_transition_and_first_token_aggregation(self):
         summary = summarize_condition_results(condition_rows())
         self.assertEqual(len(summary["conditions"]), 8)
@@ -289,6 +331,21 @@ class SummaryTests(unittest.TestCase):
         self.assertTrue(
             all("Layer 13 Head 4" in row["classification"] for row in result["groups"])
         )
+
+    def test_combined_summary_and_alpha05_comparison(self):
+        current_rows = condition_rows()
+        for row in current_rows:
+            row["alpha"] = 0.25
+        current = summarize_condition_results(current_rows, alpha=0.25)
+        prior = summarize_condition_results(condition_rows(), alpha=0.5)
+        combined = summarize_combined_conditions(current)
+        self.assertEqual(combined["alpha"], 0.25)
+        self.assertEqual(len(combined["conditions"]), 4)
+        self.assertTrue(all(row["prompt_count"] == 68 for row in combined["conditions"]))
+        comparison = compare_with_reference_alpha(current, prior)
+        self.assertEqual(comparison["current_alpha"], 0.25)
+        self.assertEqual(comparison["reference_alpha"], 0.5)
+        self.assertEqual(len(comparison["conditions"]), 8)
 
 
 if __name__ == "__main__":
