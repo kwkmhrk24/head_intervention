@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Mapping, Sequence
 
+from utils.evaluate_utils import classify_transition
+
 
 TRANSITIONS = (
     "defended",
@@ -11,23 +13,6 @@ TRANSITIONS = (
     "regressed",
     "remained_failure",
 )
-
-
-def classify_transition(
-    baseline_success: bool | None,
-    current_success: bool | None,
-    *,
-    generation_failed: bool = False,
-) -> str | None:
-    if generation_failed or baseline_success is None or current_success is None:
-        return None
-    if baseline_success and current_success:
-        return "remained_success"
-    if baseline_success and not current_success:
-        return "defended"
-    if not baseline_success and current_success:
-        return "regressed"
-    return "remained_failure"
 
 
 def attach_baseline_transitions(

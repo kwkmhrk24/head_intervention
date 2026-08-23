@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import subprocess
 import sys
 from pathlib import Path
 
@@ -16,6 +15,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from utils.evaluate_utils import check_success_with_details  # noqa: E402
+from utils.experiment_runtime import git_head  # noqa: E402
 from utils.gcg_reference_intervention_diagnostics import (  # noqa: E402
     compare_token_sequences,
     summarize_response_changes,
@@ -67,16 +67,6 @@ def parse_args(argv=None):
     parser.add_argument("--original-input", default=DEFAULT_ORIGINAL_INPUT)
     parser.add_argument("--output-dir", required=True)
     return parser.parse_args(argv)
-
-
-def git_head() -> str:
-    return subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=REPO_ROOT,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
 
 
 def tokenize_response(tokenizer, response: str) -> list[int]:
@@ -309,7 +299,7 @@ def main(argv=None):
         {
             "schema_version": 1,
             "created_at": utc_now(),
-            "execution_git_head": git_head(),
+            "execution_git_head": git_head(REPO_ROOT),
             "status": "response_analysis_complete_gpu_pending",
             "source_evaluation_run": str(evaluation_run),
             "source_evaluation_summary_sha256": sha256_file(

@@ -41,6 +41,7 @@ from utils.asym_score_intervention import (  # noqa: E402
 from utils.evaluate_utils import (  # noqa: E402
     REFUSAL_SUBSTRINGS,
     check_success_with_details,
+    classify_transition,
 )
 from utils.prompt_utils import apply_template  # noqa: E402
 
@@ -410,18 +411,6 @@ def format_records(records, tokenizer, model_config):
         {**record, "formatted_prompt": prompt}
         for record, prompt in zip(records, formatted)
     ]
-
-
-def classify_transition(baseline_success, current_success, generation_failed=False):
-    if generation_failed or baseline_success is None or current_success is None:
-        return None
-    if baseline_success and current_success:
-        return "remained_success"
-    if baseline_success and not current_success:
-        return "defended"
-    if not baseline_success and current_success:
-        return "regressed"
-    return "remained_failure"
 
 
 def generate_response(model, tokenizer, formatted_prompt, generation_config):

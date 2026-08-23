@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import csv
-import hashlib
 from pathlib import Path
 from typing import Sequence
+
+from utils.artifact_io import sha256_file
 
 
 PAPER_HEADS = {
@@ -17,14 +18,6 @@ MODEL_CSV_NAMES = {
     "mistral": "Mistral-7B-Instruct-v0.2",
 }
 CONSENSUS_CONDITIONS = ("consensus_increase", "consensus_decrease")
-
-
-def sha256_file(path: str | Path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def validate_head_pairs(

@@ -6,8 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import random
-import subprocess
 import sys
 from pathlib import Path
 
@@ -23,6 +21,7 @@ from utils.asym_score_intervention import (  # noqa: E402
     temporarily_disable_default_dynamic_cache,
 )
 from utils.evaluate_utils import check_success_with_details  # noqa: E402
+from utils.experiment_runtime import git_head, seed_everything as set_seed  # noqa: E402
 from utils.gcg_first_token_reference_ablation import (  # noqa: E402
     EXPECTED_SELECTION_DATASET_INDICES,
     load_selection_development_records,
@@ -112,24 +111,6 @@ def parse_args(argv=None):
     parser.add_argument("--prior-dynamic-smoke", default=DEFAULT_PRIOR_DYNAMIC_SMOKE)
     parser.add_argument("--output-dir", required=True)
     return parser.parse_args(argv)
-
-
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def git_head() -> str:
-    return subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=REPO_ROOT,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
 
 
 def load_model_and_tokenizer(model_path: Path):
@@ -563,7 +544,7 @@ def main(argv=None):
         "schema_version": 1,
         "status": "running",
         "created_at": utc_now(),
-        "execution_git_head": git_head(),
+        "execution_git_head": git_head(REPO_ROOT),
         "development_only": True,
         "selection_data_reused_for_head_selection": True,
         "selection_data_reused_for_reference": True,

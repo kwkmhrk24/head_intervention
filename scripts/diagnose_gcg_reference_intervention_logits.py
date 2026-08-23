@@ -6,8 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import random
-import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -24,6 +22,7 @@ from utils.asym_score_intervention import (  # noqa: E402
     temporarily_disable_default_dynamic_cache,
 )
 from utils.evaluate_utils import check_success_with_details  # noqa: E402
+from utils.experiment_runtime import git_head, seed_everything as set_seed  # noqa: E402
 from utils.gcg_reference_intervention_diagnostics import (  # noqa: E402
     aggregate_logit_steps,
     build_head_subset_conditions,
@@ -96,24 +95,6 @@ def parse_args(argv=None):
     parser.add_argument("--baseline-results", default=DEFAULT_BASELINE_RESULTS)
     parser.add_argument("--run-dir", required=True)
     return parser.parse_args(argv)
-
-
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def git_head() -> str:
-    return subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=REPO_ROOT,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
 
 
 def finalize_run_manifest(path: Path, *, diagnosis_summary: dict) -> None:
@@ -727,7 +708,7 @@ def main(argv=None):
     diagnosis_summary = {
         "status": "complete",
         "created_at": utc_now(),
-        "execution_git_head": git_head(),
+        "execution_git_head": git_head(REPO_ROOT),
         "run_directory": str(run_dir),
         "source_evaluation_run": str(evaluation_run),
         "source_evaluation_summary_sha256": sha256_file(

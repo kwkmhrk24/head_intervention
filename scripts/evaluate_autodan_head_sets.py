@@ -34,6 +34,7 @@ from scripts.evaluate_autodan_baseline import (  # noqa: E402
 from utils.evaluate_utils import (  # noqa: E402
     REFUSAL_SUBSTRINGS,
     check_success_with_details,
+    classify_transition,
 )
 from utils.prompt_utils import apply_template  # noqa: E402
 
@@ -670,18 +671,6 @@ def validate_model_and_activation(model_config, activation):
             f"intervention activation shape mismatch: expected {expected_shape}, "
             f"found {tuple(activation.shape)}"
         )
-
-
-def classify_transition(baseline_success, intervention_success, generation_failed=False):
-    if generation_failed or intervention_success is None:
-        return None
-    if baseline_success and intervention_success:
-        return "remained_success"
-    if baseline_success and not intervention_success:
-        return "defended"
-    if not baseline_success and intervention_success:
-        return "regressed"
-    return "remained_failure"
 
 
 def _heads_for_json(heads):

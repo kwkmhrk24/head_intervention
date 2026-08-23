@@ -5,8 +5,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import random
-import subprocess
 import sys
 from pathlib import Path
 
@@ -23,6 +21,7 @@ from utils.asym_score_intervention import (  # noqa: E402
     temporarily_disable_default_dynamic_cache,
 )
 from utils.evaluate_utils import check_success_with_details  # noqa: E402
+from utils.experiment_runtime import git_head, seed_everything as set_seed  # noqa: E402
 from utils.gcg_wasserstein_reference import (  # noqa: E402
     llama_model_config_summary,
     read_json,
@@ -81,24 +80,6 @@ def parse_args(argv=None):
     parser.add_argument("--baseline-results", default=DEFAULT_BASELINE_RESULTS)
     parser.add_argument("--output-dir", required=True)
     return parser.parse_args(argv)
-
-
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def git_head() -> str:
-    return subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=REPO_ROOT,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
 
 
 def formatted_inputs(tokenizer, prompt: str):
@@ -471,7 +452,7 @@ def main(argv=None):
         {
             "schema_version": 1,
             "created_at": utc_now(),
-            "execution_git_head": git_head(),
+            "execution_git_head": git_head(REPO_ROOT),
             "model": str(model_path),
             "model_config": llama_model_config_summary(model),
             "torch_version": torch.__version__,

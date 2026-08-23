@@ -5,8 +5,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import random
-import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -27,6 +25,7 @@ from scripts.evaluate_gcg_first_token_reference_ablation import (  # noqa: E402
 from utils.asym_score_intervention import (  # noqa: E402
     temporarily_disable_default_dynamic_cache,
 )
+from utils.experiment_runtime import git_value, seed_everything as set_seed  # noqa: E402
 from utils.gcg_first_token_generalization_diagnostics import (  # noqa: E402
     ALPHAS,
     EXPECTED_TOP5,
@@ -105,20 +104,6 @@ def parse_args(argv=None):
     parser.add_argument("--advbench", default=DEFAULT_ADVBENCH)
     parser.add_argument("--output-dir", required=True)
     return parser.parse_args(argv)
-
-
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def git_value(*arguments: str) -> str:
-    return subprocess.run(
-        ["git", *arguments], cwd=REPO_ROOT, check=True, capture_output=True, text=True
-    ).stdout.strip()
 
 
 def load_prompt_groups(args, tokenizer):
@@ -485,8 +470,8 @@ def main(argv=None):
         "schema_version": 1,
         "status": "complete",
         "created_at": utc_now(),
-        "execution_git_head": git_value("rev-parse", "HEAD"),
-        "execution_git_branch": git_value("branch", "--show-current"),
+        "execution_git_head": git_value(REPO_ROOT, "rev-parse", "HEAD"),
+        "execution_git_branch": git_value(REPO_ROOT, "branch", "--show-current"),
         "model": str(model_path),
         "model_config": llama_model_config_summary(model),
         "torch_version": torch.__version__,

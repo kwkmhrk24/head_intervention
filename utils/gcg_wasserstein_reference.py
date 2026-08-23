@@ -9,16 +9,25 @@ CPU-testable.
 from __future__ import annotations
 
 import csv
-import hashlib
-import json
 import math
 import random
-import subprocess
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
 import torch
+
+from utils.artifact_io import (
+    ensure_output_directory_absent,
+    read_json,
+    read_jsonl,
+    sha256_bytes,
+    sha256_file,
+    sha256_text,
+    utc_now,
+    write_json,
+    write_jsonl,
+)
+from utils.experiment_runtime import git_state
 
 
 TOTAL_COUNT = 160
@@ -120,78 +129,8 @@ REFERENCE_METADATA_FIELDS = {
 }
 
 
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def sha256_bytes(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
-def sha256_text(value: str) -> str:
-    return sha256_bytes(value.encode("utf-8"))
-
-
-def sha256_file(path: str | Path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def composite_score_sha256(original_sha256: str, jailbreak_sha256: str) -> str:
     return sha256_text(f"{original_sha256}:{jailbreak_sha256}")
-
-
-def read_jsonl(path: str | Path) -> list[dict]:
-    rows = []
-    with Path(path).open(encoding="utf-8") as handle:
-        for line_number, line in enumerate(handle, 1):
-            if not line.strip():
-                continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise ValueError(
-                    f"{path}: invalid JSON on line {line_number}: {exc}"
-                ) from exc
-            if not isinstance(row, dict):
-                raise ValueError(f"{path}: line {line_number} is not an object")
-            rows.append(row)
-    return rows
-
-
-def read_json(path: str | Path) -> dict:
-    with Path(path).open(encoding="utf-8") as handle:
-        payload = json.load(handle)
-    if not isinstance(payload, dict):
-        raise ValueError(f"{path}: expected a JSON object")
-    return payload
-
-
-def _git_value(repo_root: str | Path, *arguments: str) -> str:
-    return subprocess.run(
-        ["git", *arguments],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-
-
-def git_state(repo_root: str | Path) -> tuple[str, str]:
-    return (
-        _git_value(repo_root, "rev-parse", "HEAD"),
-        _git_value(repo_root, "branch", "--show-current"),
-    )
-
-
-def ensure_output_directory_absent(path: str | Path) -> Path:
-    path = Path(path)
-    if path.exists():
-        raise FileExistsError(f"refusing to overwrite existing output directory: {path}")
-    return path
 
 
 def _require_prompt_row(row: Mapping[str, object], *, source: str, row_position: int):
@@ -477,24 +416,6 @@ def selection_records(manifest: Mapping[str, object]) -> list[dict]:
     validate_split_manifest(manifest)
     records = manifest["records"]
     return [dict(records[row]) for row in manifest["selection_row_positions"]]
-
-
-def write_json(path: str | Path, payload) -> None:
-    path = Path(path)
-    if path.exists():
-        raise FileExistsError(f"refusing to overwrite existing file: {path}")
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2)
-        handle.write("\n")
-
-
-def write_jsonl(path: str | Path, rows: Sequence[Mapping[str, object]]) -> None:
-    path = Path(path)
-    if path.exists():
-        raise FileExistsError(f"refusing to overwrite existing file: {path}")
-    with path.open("w", encoding="utf-8") as handle:
-        for row in rows:
-            handle.write(json.dumps(dict(row), ensure_ascii=False) + "\n")
 
 
 def write_split_artifacts(manifest: Mapping[str, object], output_dir: str | Path):

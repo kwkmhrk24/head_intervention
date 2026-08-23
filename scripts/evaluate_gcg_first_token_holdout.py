@@ -7,7 +7,6 @@ import argparse
 import csv
 import json
 import os
-import subprocess
 import sys
 from pathlib import Path
 
@@ -26,6 +25,7 @@ from scripts.evaluate_gcg_first_token_reference_ablation import (  # noqa: E402
     run_intervention_condition,
     set_seed,
 )
+from utils.experiment_runtime import git_value  # noqa: E402
 from utils.gcg_first_token_holdout import (  # noqa: E402
     EVALUATION_ROLE,
     HOLDOUT_COUNT,
@@ -107,16 +107,6 @@ def parse_args(argv=None):
     return parser.parse_args(argv)
 
 
-def git_value(*arguments: str) -> str:
-    return subprocess.run(
-        ["git", *arguments],
-        cwd=REPO_ROOT,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-
-
 def atomic_replace_json(path: Path, payload: dict) -> None:
     temporary = path.with_name(f".{path.name}.tmp")
     if temporary.exists():
@@ -187,8 +177,8 @@ def prepare_stage(args) -> None:
             "schema_version": 1,
             "status": "manifest_prepared_before_baseline",
             "created_at": utc_now(),
-            "execution_git_head": git_value("rev-parse", "HEAD"),
-            "execution_git_branch": git_value("branch", "--show-current"),
+            "execution_git_head": git_value(REPO_ROOT, "rev-parse", "HEAD"),
+            "execution_git_branch": git_value(REPO_ROOT, "branch", "--show-current"),
             "evaluation_role": EVALUATION_ROLE,
             "evaluation_label": "exploratory Llama-GCG holdout",
             "alternative_evaluation_label": "Llama-GCG-specific holdout",
