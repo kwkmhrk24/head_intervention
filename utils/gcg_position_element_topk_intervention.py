@@ -37,6 +37,7 @@ from utils.reference_asym_score_intervention import (
 
 
 TOP_K_VALUES = (10, 50, 100, 500)
+WASSERSTEIN_TOP5_HEADS = ((31, 22), (13, 4), (5, 30), (9, 18), (27, 24))
 RANKING_METRIC = "abs(mean_p(jailbreak_asym-original_asym))"
 SIGN_CONSISTENCY_DEFINITION = (
     "fraction of paired prompt deltas whose sign agrees with the signed mean; "
@@ -104,6 +105,8 @@ def compute_position_element_ranking(
 
     _validate_paired_scores(original, jailbreak)
     delta = jailbreak - original
+    mean_original = original.mean(dim=0, dtype=torch.float32)
+    mean_gcg = jailbreak.mean(dim=0, dtype=torch.float32)
     mean_delta = delta.mean(dim=0, dtype=torch.float32)
     mean_absolute_delta = delta.abs().mean(dim=0, dtype=torch.float32)
     std_delta = delta.std(dim=0, correction=1).float()
@@ -137,6 +140,12 @@ def compute_position_element_ranking(
                         "row_pos": int(rows[position].item()),
                         "col_pos": int(cols[position].item()),
                         "lag": int((rows[position] - cols[position]).item()),
+                        "mean_original": float(
+                            mean_original[layer, head, position].item()
+                        ),
+                        "mean_gcg": float(
+                            mean_gcg[layer, head, position].item()
+                        ),
                         "mean_delta": signed,
                         "ranking_score": abs(signed),
                         "mean_absolute_delta": float(
@@ -275,6 +284,21 @@ def selection_diagnostics(selection: PositionElementSelection) -> dict:
     for k in selection.k_values:
         records = selection.topk_records(k)
         sign_values = [float(record["sign_consistency"]) for record in records]
+        layer_counts: dict[int, int] = {}
+        head_counts: dict[tuple[int, int], int] = {}
+        for record in records:
+            layer = int(record["layer"])
+            head = int(record["head"])
+            layer_counts[layer] = layer_counts.get(layer, 0) + 1
+            head_counts[(layer, head)] = head_counts.get((layer, head), 0) + 1
+        wasserstein_counts = [
+            {
+                "layer": layer,
+                "head": head,
+                "selected_element_count": head_counts.get((layer, head), 0),
+            }
+            for layer, head in WASSERSTEIN_TOP5_HEADS
+        ]
         conditions.append(
             {
                 "k": k,
@@ -299,6 +323,28 @@ def selection_diagnostics(selection: PositionElementSelection) -> dict:
                 "ranking_score_max": max(
                     float(row["ranking_score"]) for row in records
                 ),
+                "layer_selection_counts": [
+                    {
+                        "layer": layer,
+                        "selected_element_count": layer_counts.get(layer, 0),
+                    }
+                    for layer in range(NUM_LAYERS)
+                ],
+                "head_selection_counts": [
+                    {
+                        "layer": layer,
+                        "head": head,
+                        "selected_element_count": head_counts.get(
+                            (layer, head), 0
+                        ),
+                    }
+                    for layer in range(NUM_LAYERS)
+                    for head in range(NUM_HEADS)
+                ],
+                "wasserstein_top5_selected_element_count": sum(
+                    item["selected_element_count"] for item in wasserstein_counts
+                ),
+                "wasserstein_top5_head_counts": wasserstein_counts,
             }
         )
     return {

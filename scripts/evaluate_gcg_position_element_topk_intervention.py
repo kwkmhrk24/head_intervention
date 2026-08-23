@@ -67,7 +67,19 @@ from utils.reference_asym_score_intervention import (  # noqa: E402
 
 
 DATASET_GROUPS = ("selection20", "holdout48")
-DEFAULT_ALPHA = 0.5
+DEFAULT_ALPHA = 1.0
+
+REQUIRED_RUNTIME_INVARIANTS = {
+    "first_forward_detected": True,
+    "first_forward_intervened": True,
+    "later_forward_intervention_count": 0,
+    "short_sequence_skip_count": 0,
+    "all_scores_finite": True,
+    "max_unselected_element_change": 0.0,
+    "max_outside_tail_change": 0.0,
+    "max_diagonal_change_float32": 0.0,
+    "max_constructed_delta_antisymmetry_error_float32": 0.0,
+}
 
 
 def parse_args(argv=None):
@@ -190,6 +202,38 @@ def cpu_validation_payload(args) -> dict:
     }
 
 
+def validate_prompt_runtime_invariants(diagnostics: dict, *, k: int) -> None:
+    """Fail fast when a prompt violates the first-token runtime contract."""
+
+    if diagnostics.get("selected_element_intervention_count") != k:
+        raise RuntimeError(
+            "runtime invariant failed: selected_element_intervention_count "
+            f"!= k ({diagnostics.get('selected_element_intervention_count')} != {k})"
+        )
+    for field, expected in REQUIRED_RUNTIME_INVARIANTS.items():
+        observed = diagnostics.get(field)
+        matches = observed is expected if isinstance(expected, bool) else (
+            type(observed) in (int, float) and observed == expected
+        )
+        if not matches:
+            raise RuntimeError(
+                f"runtime invariant failed: {field}={observed!r}, "
+                f"expected={expected!r}"
+            )
+
+
+def validate_first_token_outcome_invariant(
+    *, response_equal: bool, first_token_argmax_equal: bool
+) -> None:
+    """A first-token-only edit can change output iff token-0 argmax changes."""
+
+    if response_equal is not first_token_argmax_equal:
+        raise RuntimeError(
+            "first-token-only invariant failed: "
+            "response_equal != first_token_argmax_equal"
+        )
+
+
 def run_baseline(records, *, model, tokenizer, label: str) -> list[dict]:
     rows = []
     for position, record in enumerate(records, 1):
@@ -247,16 +291,17 @@ def run_condition(
                     f"dataset_index={record['dataset_index']}"
                 )
             diagnostics = controller.summary()
-            if diagnostics["selected_element_intervention_count"] != k:
-                raise RuntimeError("per-prompt selected element count mismatch")
-            if diagnostics["later_forward_intervention_count"] != 0:
-                raise RuntimeError("first-token-only intervention occurred later")
+            validate_prompt_runtime_invariants(diagnostics, k=k)
             baseline = baseline_by_index[record["dataset_index"]]
             comparison = compare_token_sequences(
                 baseline["response_token_ids"], generation["response_token_ids"]
             )
             logit_metrics = compute_logit_step_metrics(
                 baseline["first_logits"], generation["first_logits"], step=0
+            )
+            validate_first_token_outcome_invariant(
+                response_equal=bool(comparison["response_equal"]),
+                first_token_argmax_equal=bool(logit_metrics["argmax_equal"]),
             )
             rows.append(
                 {

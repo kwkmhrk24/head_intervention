@@ -3,7 +3,12 @@ import unittest
 
 import torch
 
-from scripts.evaluate_gcg_position_element_topk_intervention import parse_args
+from scripts.evaluate_gcg_position_element_topk_intervention import (
+    REQUIRED_RUNTIME_INVARIANTS,
+    parse_args,
+    validate_first_token_outcome_invariant,
+    validate_prompt_runtime_invariants,
+)
 from utils.gcg_position_element_topk_intervention import (
     RANKING_METRIC,
     TOP_K_VALUES,
@@ -54,6 +59,8 @@ class PositionElementSelectionTests(unittest.TestCase):
         self.assertEqual([row["rank"] for row in self.ranking[:4]], [1, 2, 3, 4])
         self.assertEqual(self.ranking[0]["mean_delta"], -3.0)
         self.assertEqual(self.ranking[0]["ranking_score"], 3.0)
+        self.assertEqual(self.ranking[0]["mean_original"], 0.0)
+        self.assertEqual(self.ranking[0]["mean_gcg"], -3.0)
 
     def test_sign_consistency_follows_signed_mean_direction(self):
         always_negative = self.ranking[0]
@@ -112,6 +119,32 @@ class PositionElementSelectionTests(unittest.TestCase):
             [row["selected_element_count"] for row in diagnostics["conditions"]],
             [10, 50, 100, 500],
         )
+        for k, condition in zip(TOP_K_VALUES, diagnostics["conditions"]):
+            self.assertEqual(len(condition["layer_selection_counts"]), NUM_LAYERS)
+            self.assertEqual(
+                len(condition["head_selection_counts"]), NUM_LAYERS * NUM_HEADS
+            )
+            self.assertEqual(
+                sum(
+                    row["selected_element_count"]
+                    for row in condition["layer_selection_counts"]
+                ),
+                k,
+            )
+            self.assertEqual(
+                sum(
+                    row["selected_element_count"]
+                    for row in condition["head_selection_counts"]
+                ),
+                k,
+            )
+            self.assertEqual(
+                condition["wasserstein_top5_selected_element_count"],
+                sum(
+                    row["selected_element_count"]
+                    for row in condition["wasserstein_top5_head_counts"]
+                ),
+            )
 
     def test_invalid_inputs_are_rejected(self):
         self.assertEqual(validate_top_k_values(TOP_K_VALUES), TOP_K_VALUES)
@@ -129,6 +162,7 @@ class PositionElementSelectionTests(unittest.TestCase):
         self.assertIsNone(args.output_dir)
         self.assertEqual(tuple(args.k_values), TOP_K_VALUES)
         self.assertEqual(tuple(args.dataset_groups), ("selection20", "holdout48"))
+        self.assertEqual(args.alpha, 1.0)
 
 
 def make_controller(alpha=0.5, *, timing="first_token_only"):
@@ -243,6 +277,69 @@ class PositionElementInterventionTests(unittest.TestCase):
         short = torch.randn(1, 4, 15, 15)
         self.assertIs(controller.apply(0, short), short)
         self.assertEqual(controller.summary()["short_sequence_skip_count"], 1)
+
+
+class GPURuntimeInvariantTests(unittest.TestCase):
+    def valid_diagnostics(self):
+        return {
+            **REQUIRED_RUNTIME_INVARIANTS,
+            "selected_element_intervention_count": 10,
+        }
+
+    def test_required_prompt_runtime_invariants_pass(self):
+        validate_prompt_runtime_invariants(self.valid_diagnostics(), k=10)
+
+    def test_each_required_prompt_runtime_invariant_fails_fast(self):
+        invalid_values = {
+            "first_forward_detected": False,
+            "first_forward_intervened": False,
+            "later_forward_intervention_count": 1,
+            "short_sequence_skip_count": 1,
+            "all_scores_finite": False,
+            "max_unselected_element_change": 1e-7,
+            "max_outside_tail_change": 1e-7,
+            "max_diagonal_change_float32": 1e-7,
+            "max_constructed_delta_antisymmetry_error_float32": 1e-7,
+        }
+        for field, invalid in invalid_values.items():
+            with self.subTest(field=field):
+                diagnostics = self.valid_diagnostics()
+                diagnostics[field] = invalid
+                with self.assertRaisesRegex(RuntimeError, field):
+                    validate_prompt_runtime_invariants(diagnostics, k=10)
+        diagnostics = self.valid_diagnostics()
+        diagnostics["selected_element_intervention_count"] = 9
+        with self.assertRaisesRegex(
+            RuntimeError, "selected_element_intervention_count"
+        ):
+            validate_prompt_runtime_invariants(diagnostics, k=10)
+        diagnostics = self.valid_diagnostics()
+        diagnostics["first_forward_detected"] = 1
+        with self.assertRaisesRegex(RuntimeError, "first_forward_detected"):
+            validate_prompt_runtime_invariants(diagnostics, k=10)
+        diagnostics = self.valid_diagnostics()
+        diagnostics["later_forward_intervention_count"] = False
+        with self.assertRaisesRegex(
+            RuntimeError, "later_forward_intervention_count"
+        ):
+            validate_prompt_runtime_invariants(diagnostics, k=10)
+
+    def test_response_and_first_argmax_equality_must_match(self):
+        validate_first_token_outcome_invariant(
+            response_equal=True, first_token_argmax_equal=True
+        )
+        validate_first_token_outcome_invariant(
+            response_equal=False, first_token_argmax_equal=False
+        )
+        for response_equal, argmax_equal in ((True, False), (False, True)):
+            with self.subTest(
+                response_equal=response_equal, argmax_equal=argmax_equal
+            ):
+                with self.assertRaisesRegex(RuntimeError, "response_equal"):
+                    validate_first_token_outcome_invariant(
+                        response_equal=response_equal,
+                        first_token_argmax_equal=argmax_equal,
+                    )
 
 
 if __name__ == "__main__":
