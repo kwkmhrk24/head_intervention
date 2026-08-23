@@ -164,6 +164,15 @@ class PositionElementSelectionTests(unittest.TestCase):
         self.assertEqual(tuple(args.dataset_groups), ("selection20", "holdout48"))
         self.assertEqual(args.alpha, 1.0)
 
+    def test_entrypoint_parses_explicit_alpha_values(self):
+        self.assertEqual(parse_args(["--alpha", "1.0"]).alpha, 1.0)
+        self.assertEqual(parse_args(["--alpha", "0.5"]).alpha, 0.5)
+
+    def test_entrypoint_rejects_out_of_range_alpha_values(self):
+        for value in ("-0.1", "1.1"):
+            with self.subTest(value=value), self.assertRaises(SystemExit):
+                parse_args(["--alpha", value])
+
 
 def make_controller(alpha=0.5, *, timing="first_token_only"):
     reference = torch.zeros((2, 4, ELEMENTS_PER_HEAD), dtype=torch.float32)

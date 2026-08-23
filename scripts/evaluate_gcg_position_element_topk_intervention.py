@@ -82,6 +82,19 @@ REQUIRED_RUNTIME_INVARIANTS = {
 }
 
 
+def parse_cli_alpha(value: str) -> float:
+    """Convert argparse text to float before applying shared validation."""
+
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as error:
+        raise argparse.ArgumentTypeError("alpha must be a real number") from error
+    try:
+        return validate_alpha(numeric)
+    except (TypeError, ValueError) as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -105,7 +118,7 @@ def parse_args(argv=None):
         nargs="+",
         default=list(TOP_K_VALUES),
     )
-    parser.add_argument("--alpha", type=validate_alpha, default=DEFAULT_ALPHA)
+    parser.add_argument("--alpha", type=parse_cli_alpha, default=DEFAULT_ALPHA)
     parser.add_argument(
         "--dataset-groups",
         nargs="+",
