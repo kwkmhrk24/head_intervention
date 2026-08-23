@@ -3,6 +3,7 @@ __pycache__/
 
 .env
 *.log
+*.bundle
 
 # data / outputs
 outputs/

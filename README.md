@@ -92,3 +92,32 @@ The distinction between the stored AutoDAN source labels (84/130) and the
 current no-intervention evaluation (17/130), together with prompt-level
 diagnostic output, is documented in
 [`docs/autodan_baseline_alignment.md`](docs/autodan_baseline_alignment.md).
+
+## Current research workflow
+
+The canonical branch for ongoing work is `research/jailbreak-defense`. The
+original reproduction commands above remain available, but new analysis should
+start from these maintained entrypoints:
+
+- `scripts/analyze_attention_scores.py`: capture tail-window attention scores.
+- `scripts/analyze_matched_attention_head_metrics.py`: compare matched
+  AutoDAN/GCG attention metrics.
+- `scripts/evaluate_asym_score_intervention.py`: run the shared Llama/Mistral,
+  AutoDAN/GCG direct `S_asym` evaluation.
+- `scripts/prepare_gcg_wasserstein_reference.py`: build the fixed GCG split,
+  Wasserstein ranking, and reference artifacts.
+- `scripts/evaluate_gcg_wasserstein_reference_intervention.py`: run the fixed
+  GCG reference intervention.
+- `scripts/evaluate_gcg_first_token_reference_ablation.py` and
+  `scripts/evaluate_gcg_first_token_holdout.py`: run the selection and holdout
+  first-token-only evaluations.
+- `scripts/diagnose_gcg_first_token_generalization.py` and
+  `scripts/diagnose_gcg_reference_factorization.py`: run the current
+  generalization and reference/head factorization diagnostics.
+- `scripts/audit_gcg_reference.py`: audit artifacts and saved evaluation runs
+  with the `artifacts`, `summary`, `evaluation`, or `first-token` subcommand.
+- `scripts/analyze_cross_run_intervention_transitions.py`: compare prompt-level
+  transitions across saved multidataset runs without loading a model.
+
+Reusable logic and branch policy are mapped in
+[`docs/repository_structure.md`](docs/repository_structure.md).
