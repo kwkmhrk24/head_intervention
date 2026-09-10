@@ -35,6 +35,16 @@ from scripts.diagnose_gcg_reference_factorization import (  # noqa: E402
     load_model_and_tokenizer,
 )
 from utils.experiment_runtime import git_value, seed_everything  # noqa: E402
+from utils.harmbench_gcg_independent_test import (  # noqa: E402
+    load_fast_tokenizer as load_independent_fast_tokenizer,
+    load_independent_evaluation_records,
+    validate_fixed_config as validate_independent_config,
+    validate_formatted_evaluation_identity,
+    validate_harmbench_revision as validate_independent_harmbench_revision,
+    validate_input_manifest as validate_independent_input_manifest,
+    validate_model_revision as validate_independent_model_revision,
+    verify_all_configured_sources as verify_independent_sources,
+)
 from utils.gcg_position_element_topk_intervention import (  # noqa: E402
     TOP_K_VALUES,
     build_position_element_selection,
@@ -66,8 +76,18 @@ from utils.reference_asym_score_intervention import (  # noqa: E402
 )
 
 
-DATASET_GROUPS = ("selection20", "holdout48")
+DATASET_GROUPS = ("selection20", "holdout48", "independent100")
+DEFAULT_DATASET_GROUPS = ("selection20", "holdout48")
 DEFAULT_ALPHA = 1.0
+DEFAULT_INDEPENDENT_CONFIG = (
+    "configs/gcg_independent_test_v1/attack_config.json"
+)
+DEFAULT_INDEPENDENT_INPUT_MANIFEST = (
+    "configs/gcg_independent_test_v1/input_manifest.json"
+)
+DEFAULT_INDEPENDENT_ADAPTER = (
+    "scripts/generate_harmbench_gcg_independent_test.py"
+)
 
 REQUIRED_RUNTIME_INVARIANTS = {
     "first_forward_detected": True,
@@ -123,7 +143,16 @@ def parse_args(argv=None):
         "--dataset-groups",
         nargs="+",
         choices=DATASET_GROUPS,
-        default=list(DATASET_GROUPS),
+        default=list(DEFAULT_DATASET_GROUPS),
+    )
+    parser.add_argument("--independent-config", default=DEFAULT_INDEPENDENT_CONFIG)
+    parser.add_argument(
+        "--independent-input-manifest",
+        default=DEFAULT_INDEPENDENT_INPUT_MANIFEST,
+    )
+    parser.add_argument("--independent-attack-run-dir")
+    parser.add_argument(
+        "--independent-adapter", default=DEFAULT_INDEPENDENT_ADAPTER
     )
     parser.add_argument("--output-dir")
     return parser.parse_args(argv)
@@ -179,7 +208,7 @@ def cpu_validation_payload(args) -> dict:
         k_values=args.k_values,
         model_path=model_path,
     )
-    return {
+    result = {
         "status": "cpu_validation_passed",
         "model_loaded": False,
         "gpu_used": False,
@@ -213,6 +242,44 @@ def cpu_validation_payload(args) -> dict:
         "selection": selection_diagnostics(selection),
         "top_elements": [dict(row) for row in selection.ranking[:10]],
     }
+    if "independent100" in args.dataset_groups:
+        if tuple(args.k_values) != (500,) or args.alpha != 1.0:
+            raise ValueError(
+                "independent100 is frozen to k-values=500 and alpha=1.0"
+            )
+        independent_config = read_json(Path(args.independent_config).resolve())
+        validate_independent_config(independent_config)
+        if Path(independent_config["model"]["local_path"]).resolve() != model_path:
+            raise ValueError("independent100 model path differs from frozen config")
+        verify_independent_sources(independent_config)
+        validate_independent_harmbench_revision(independent_config)
+        validate_independent_model_revision(independent_config)
+        independent_records = validate_independent_input_manifest(
+            read_json(Path(args.independent_input_manifest).resolve()),
+            independent_config,
+        )
+        independent_validation = {
+            "input_manifest_verified": True,
+            "record_count": len(independent_records),
+            "attack_outputs_verified": False,
+        }
+        if args.independent_attack_run_dir:
+            tokenizer = load_independent_fast_tokenizer(independent_config)
+            completed = load_independent_evaluation_records(
+                config_path=Path(args.independent_config).resolve(),
+                input_manifest_path=Path(
+                    args.independent_input_manifest
+                ).resolve(),
+                attack_run_dir=Path(args.independent_attack_run_dir).resolve(),
+                adapter_path=Path(args.independent_adapter).resolve(),
+                tokenizer=tokenizer,
+            )
+            completed = format_records(completed, tokenizer)
+            validate_formatted_evaluation_identity(completed)
+            independent_validation["attack_outputs_verified"] = True
+            independent_validation["evaluation_input_ids_verified"] = True
+        result["independent100"] = independent_validation
+    return result
 
 
 def validate_prompt_runtime_invariants(diagnostics: dict, *, k: int) -> None:
@@ -247,7 +314,14 @@ def validate_first_token_outcome_invariant(
         )
 
 
-def run_baseline(records, *, model, tokenizer, label: str) -> list[dict]:
+def run_baseline(
+    records,
+    *,
+    model,
+    tokenizer,
+    label: str,
+    require_saved_reproduction: bool = True,
+) -> list[dict]:
     rows = []
     for position, record in enumerate(records, 1):
         generation = generate_with_first_logits(model, tokenizer, record["input_ids"])
@@ -255,7 +329,7 @@ def run_baseline(records, *, model, tokenizer, label: str) -> list[dict]:
             raise RuntimeError(
                 f"baseline generation failed: dataset_index={record['dataset_index']}"
             )
-        if (
+        if require_saved_reproduction and (
             generation["response"] != record["baseline_response"]
             or generation["success"] is not record["baseline_success"]
         ):
@@ -406,6 +480,14 @@ def run_gpu(args) -> dict:
         raise ValueError("--output-dir is required for --stage run")
     if len(args.dataset_groups) != len(set(args.dataset_groups)):
         raise ValueError("--dataset-groups must not contain duplicates")
+    if "independent100" in args.dataset_groups and (
+        tuple(args.k_values) != (500,) or args.alpha != 1.0
+    ):
+        raise ValueError("independent100 is frozen to k-values=500 and alpha=1.0")
+    if "independent100" in args.dataset_groups and not args.independent_attack_run_dir:
+        raise ValueError(
+            "--independent-attack-run-dir is required for independent100"
+        )
     output_dir = ensure_output_absent(args.output_dir).resolve()
     artifact_dir = Path(args.artifact_dir).resolve()
     model_path = Path(args.model).resolve()
@@ -414,10 +496,31 @@ def run_gpu(args) -> dict:
         k_values=args.k_values,
         model_path=model_path,
     )
-    # Reuse the existing strict group alignment/audit path.  Paired-original
-    # values returned by it are intentionally not used by this deployable defense.
-    groups, _, _, _, _ = _load_group_inputs(args)
-    groups = {name: groups[name] for name in args.dataset_groups}
+    groups = {}
+    legacy_groups = [
+        name for name in args.dataset_groups if name in DEFAULT_DATASET_GROUPS
+    ]
+    if legacy_groups:
+        # Reuse the existing strict group alignment/audit path. Paired-original
+        # values returned by it are not used by this deployable defense.
+        loaded, _, _, _, _ = _load_group_inputs(args)
+        groups.update({name: loaded[name] for name in legacy_groups})
+    if "independent100" in args.dataset_groups:
+        independent_config = read_json(Path(args.independent_config).resolve())
+        validate_independent_config(independent_config)
+        if Path(independent_config["model"]["local_path"]).resolve() != model_path:
+            raise ValueError("independent100 model path differs from frozen config")
+        verify_independent_sources(independent_config)
+        validate_independent_harmbench_revision(independent_config)
+        validate_independent_model_revision(independent_config)
+        groups["independent100"] = load_independent_evaluation_records(
+            config_path=Path(args.independent_config).resolve(),
+            input_manifest_path=Path(
+                args.independent_input_manifest
+            ).resolve(),
+            attack_run_dir=Path(args.independent_attack_run_dir).resolve(),
+            adapter_path=Path(args.independent_adapter).resolve(),
+        )
 
     audited_reference = load_validated_reference_artifacts(
         artifact_dir,
@@ -432,6 +535,8 @@ def run_gpu(args) -> dict:
     groups = {
         name: format_records(records, tokenizer) for name, records in groups.items()
     }
+    if "independent100" in groups:
+        validate_formatted_evaluation_identity(groups["independent100"])
 
     output_dir.mkdir(parents=True)
     manifest = {
@@ -478,6 +583,7 @@ def run_gpu(args) -> dict:
             model=model,
             tokenizer=tokenizer,
             label=f"{group_name} baseline",
+            require_saved_reproduction=group_name != "independent100",
         )
         baseline_by_index = {row["dataset_index"]: row for row in baseline}
         write_jsonl(

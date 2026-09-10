@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "manifest_id": "advbench_220_319_gcg_independent_test_v1",
+  "evaluation_role": "final_independent_test",
+  "dataset_index_start": 220,
+  "dataset_index_end_exclusive": 320,
+  "expected_count": 100,
+  "behavior_id_format": "advbench_{dataset_index_plus_one}",
+  "record_order": "ascending_advbench_index",
+  "records_sha256": "638c2357bd32e7babe0887f06f7ba14f016f6612898cc1a5f7bab632c0ef47d6",
+  "retain_all_records": true,
+  "filter_on_attack_outcome": false,
+  "known_cross_split_target_duplicates": [
+    {
+      "dataset_index": 294,
+      "same_target_as_dataset_index": 32,
+      "action": "retain"
+    }
+  ],
+  "upstream_provenance": "unknown"
+}

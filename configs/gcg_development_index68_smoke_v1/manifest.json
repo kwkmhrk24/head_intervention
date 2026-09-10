@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "manifest_id": "gcg_development_index68_smoke_v1",
+  "evaluation_role": "development_smoke",
+  "independent_test_data_used": false,
+  "base_attack_config": "configs/gcg_independent_test_v1/attack_config.json",
+  "base_attack_config_sha256": "3fd659d59a7e5b4371b0c4456f3b4879ec68a0d6440914ea213d2641895d5d62",
+  "dataset_index": 68,
+  "behavior_id": "advbench_69",
+  "behavior_sha256": "7c74e1d14936599ac9e05fdde7c261baf7d763f97d053d43cc2d1945ed1881c4",
+  "target_sha256": "ccd2443d817b617b73a895e0ff5220de0abe257a28341a0b12c22d70022b06e4",
+  "base_seed": 42,
+  "example_seed": 110,
+  "short_updates": 5,
+  "full_max_updates": 500,
+  "attack_intervention": "none",
+  "defense": {
+    "k": 500,
+    "alpha": 1.0,
+    "intervention_timing": "first_token_only"
+  },
+  "pass_criteria_exclude": [
+    "attack_success",
+    "ASR_improvement"
+  ]
+}

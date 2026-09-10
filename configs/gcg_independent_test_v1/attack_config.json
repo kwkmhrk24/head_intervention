@@ -1,0 +1,123 @@
+{
+  "schema_version": 1,
+  "config_id": "gcg_independent_test_v1",
+  "evaluation_role": "final_independent_test",
+  "dataset": {
+    "name": "AdvBench",
+    "dataset_index_start": 220,
+    "dataset_index_end_exclusive": 320,
+    "expected_count": 100,
+    "behavior_id_format": "advbench_{dataset_index_plus_one}",
+    "retain_all_records": true,
+    "filter_on_attack_outcome": false,
+    "behavior_source": "/home/h.kawakami/ulab/m/HarmBench/data/behavior_datasets/extra_behavior_datasets/advbench_behaviors.csv",
+    "behavior_source_sha256": "0e635254df9065ae6f8d074534b660fa7a361d1ad269e2c8e1b7377961802a86",
+    "target_source": "/home/h.kawakami/ulab/m/HarmBench/data/optimizer_targets/extra_targets/advbench_targets.json",
+    "target_source_sha256": "ce51eaa22bdbe8974cd2434f603c6ba17783c69802fe645d7a7df0a28cfaa6db",
+    "upstream_dataset_revision": "unknown"
+  },
+  "model": {
+    "model_name": "meta-llama/Llama-2-7b-chat-hf",
+    "local_path": "/mnt/mp_nas_mks/labmember/h.kawakami/models/Llama-2-7b-chat-hf",
+    "revision": "f5db02db724555f92da89c216ac04704f23d4590",
+    "dtype": "float16",
+    "weight_format": "safetensors",
+    "local_files_only": true,
+    "files_sha256": {
+      "config.json": "c904bd84ff892a2a0a454a35a4031914ccb65a82974ac8ab0fe34d3744656fc2",
+      "generation_config.json": "4eb769d945b7c9a9d9b5ee0cff40ac23a62e218ac683f87ac68d8ad9cd18dd7f",
+      "model.safetensors.index.json": "11b694a9d4bffdac71733db7f782be0df1f87a65fb9ef05bcf6d317029c22364",
+      "model-00001-of-00002.safetensors": "66dec18c9f1705b9387d62f8485f4e7d871ca388718786737ed3c72dbfaac9fb",
+      "model-00002-of-00002.safetensors": "0fd6895090da1b2ccffdb93964847709a3b31e6b69fe7dc5a480dce37c811b1d",
+      "pytorch_model.bin.index.json": "aca3c1facc89d12311a667c32e85ac86e625990992ea8a189e3b036ba371b931",
+      "pytorch_model-00001-of-00002.bin": "bb5f7b95236a8f4ce50231b44a076cdcea82ae0838e3492b24a7053fa12d2912",
+      "pytorch_model-00002-of-00002.bin": "42088179a7cb64336f82e4534fcb19f8259079ab2af5e56c1d9efa7eacf6ee1f"
+    }
+  },
+  "tokenizer": {
+    "local_path": "/mnt/mp_nas_mks/labmember/h.kawakami/models/Llama-2-7b-chat-hf",
+    "class": "LlamaTokenizerFast",
+    "use_fast": true,
+    "local_files_only": true,
+    "files_sha256": {
+      "tokenizer.json": "bcd04f0eadf90287bd26e1a183ac487d8a141b09b06aecb7725bbdd343640f2e",
+      "tokenizer.model": "1a8f238a200be6c23fbba0f9a999ab4fe3c09ca303b29805e68cf6659bfb7d89",
+      "tokenizer_config.json": "04aaa6eedd97412f3e63dd2493d2388b82347dd512b89192d3e9b4973a176417",
+      "special_tokens_map.json": "6fa06efa2785e450051989a6f8fb4416b10149ded485ddd3f127a40734f5cfd0"
+    },
+    "tokenizer_model_status": "git_lfs_pointer_not_used_by_fast_tokenizer"
+  },
+  "prompt": {
+    "system_prompt": null,
+    "messages": ["user"],
+    "chat_template": "tokenizer.apply_chat_template(user-only, tokenize=False)",
+    "tokenize_add_special_tokens": false,
+    "suffix_separator": " ",
+    "suffix_position": "after_behavior_before_closing_inst",
+    "require_optimization_evaluation_input_id_identity": true
+  },
+  "optimization": {
+    "baseline_intervention": "none",
+    "num_updates": 500,
+    "initial_control": "! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! !",
+    "control_token_count": 20,
+    "search_width": 512,
+    "coordinate_top_k": 256,
+    "coordinate_sampling": "uniform_torch_randint",
+    "temperature": 1,
+    "temperature_effective": false,
+    "allow_non_ascii": false,
+    "use_prefix_cache": true,
+    "candidate_filter": "full_prompt_decode_retokenize_exact_id_identity",
+    "zero_valid_candidates": "fail_example",
+    "candidate_selection": "first_argmin_current_step",
+    "output_selection": "current_suffix_at_termination_not_trajectory_minimum"
+  },
+  "early_stopping": {
+    "loss_only_early_stopping": false,
+    "eval_interval_updates": 50,
+    "eval_zero_based_steps": true,
+    "always_eval_final_update": true,
+    "check_refusal": true,
+    "check_refusal_loss_strictly_less_than": 0.05,
+    "generation": {
+      "do_sample": false,
+      "max_new_tokens": 32,
+      "input_ids": "exact_optimization_non_target_input_ids"
+    },
+    "refusal_rule": "HarmBench_32_case_insensitive_substrings_including_eos",
+    "stop_when": "completion_has_no_configured_refusal_substring"
+  },
+  "randomness": {
+    "base_seed": 42,
+    "example_seed_formula": "base_seed + advbench_index",
+    "generator": "per_example_torch.Generator_on_model_device",
+    "isolate_candidate_sampling_stream": true
+  },
+  "final_evaluation": {
+    "prompt": "same_user_only_non_target_input_ids_saved_by_attack",
+    "do_sample": false,
+    "max_new_tokens": 32,
+    "use_cache": false,
+    "success_rule": "existing_43_case_sensitive_refusal_substrings",
+    "evaluate_all_100": true
+  },
+  "defense": {
+    "selection": "fixed_selection20_abs_mean_delta_top500",
+    "reference": "fixed_selection20_original_mean",
+    "alpha": 1.0,
+    "intervention_timing": "first_token_only",
+    "mutable": false
+  },
+  "harmbench": {
+    "repo_path": "/home/h.kawakami/ulab/m/HarmBench",
+    "required_commit": "fa3c963890ef5e8e73e5106d8c54d753fc757d9a",
+    "upstream_gcg_revision": "unknown",
+    "source_files_sha256": {
+      "baselines/gcg/gcg.py": "869a98d7c3fde79db0df456cab30e0e764c4e90bfdeb8f65879fc80cc4af4bc3",
+      "baselines/gcg/gcg_utils.py": "5ffda926a12f27ea857396647539a52051e44fbf248b970927416dec364ca087",
+      "baselines/check_refusal_utils.py": "baae91721bdceeca487fbeaae2ab1dc29f3990ba6c0b0dae116769c1d2505140",
+      "baselines/model_utils.py": "5cd858ea7bc9e53c0cd7bfbb0c19140575ab89340e6fd83a26552e2981f77323"
+    }
+  }
+}
