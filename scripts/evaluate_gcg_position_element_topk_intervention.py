@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -100,6 +101,31 @@ REQUIRED_RUNTIME_INVARIANTS = {
     "max_diagonal_change_float32": 0.0,
     "max_constructed_delta_antisymmetry_error_float32": 0.0,
 }
+
+
+def serialized_input_ids(input_ids: torch.Tensor) -> list[int]:
+    """Return one prompt's exact token IDs in a JSON-safe representation."""
+
+    if not isinstance(input_ids, torch.Tensor) or input_ids.ndim != 2:
+        raise TypeError("input_ids must be a rank-2 torch.Tensor")
+    if input_ids.shape[0] != 1 or input_ids.shape[1] == 0:
+        raise ValueError("input_ids must contain exactly one non-empty prompt")
+    return [int(value) for value in input_ids[0].detach().cpu().tolist()]
+
+
+def start_cuda_measurement() -> float:
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    return time.perf_counter()
+
+
+def finish_cuda_measurement(started_at: float) -> dict:
+    torch.cuda.synchronize()
+    return {
+        "elapsed_seconds": time.perf_counter() - started_at,
+        "peak_allocated_vram_mib": torch.cuda.max_memory_allocated() / (1024**2),
+        "peak_reserved_vram_mib": torch.cuda.max_memory_reserved() / (1024**2),
+    }
 
 
 def parse_cli_alpha(value: str) -> float:
@@ -369,6 +395,12 @@ def run_condition(
         for position, record in enumerate(records, 1):
             controller.clear()
             controller.set_prompt_context(prompt_length=record["prompt_length"])
+            baseline = baseline_by_index[record["dataset_index"]]
+            if not torch.equal(record["input_ids"], baseline["input_ids"]):
+                raise RuntimeError(
+                    "baseline/defense input ID mismatch: "
+                    f"dataset_index={record['dataset_index']}"
+                )
             generation = generate_with_first_logits(
                 model, tokenizer, record["input_ids"]
             )
@@ -379,7 +411,6 @@ def run_condition(
                 )
             diagnostics = controller.summary()
             validate_prompt_runtime_invariants(diagnostics, k=k)
-            baseline = baseline_by_index[record["dataset_index"]]
             comparison = compare_token_sequences(
                 baseline["response_token_ids"], generation["response_token_ids"]
             )
@@ -398,6 +429,8 @@ def run_condition(
                     "dataset_index": record["dataset_index"],
                     "prompt": record["prompt"],
                     "prompt_length": record["prompt_length"],
+                    "input_ids": serialized_input_ids(record["input_ids"]),
+                    "input_ids_match_baseline": True,
                     "k": k,
                     "alpha": alpha,
                     "intervention_timing": "first_token_only",
@@ -446,6 +479,9 @@ def run_condition(
         "response_changed_count": sum(not row["response_equal"] for row in rows),
         "first_token_argmax_changed_count": sum(
             not row["first_token_argmax_equal"] for row in rows
+        ),
+        "input_ids_match_count": sum(
+            bool(row["input_ids_match_baseline"]) for row in rows
         ),
         "selected_element_intervention_count": sum(
             item["selected_element_intervention_count"]
@@ -538,6 +574,40 @@ def run_gpu(args) -> dict:
     if "independent100" in groups:
         validate_formatted_evaluation_identity(groups["independent100"])
 
+    independent_provenance = None
+    if "independent100" in groups:
+        attack_run_dir = Path(args.independent_attack_run_dir).resolve()
+        attack_final_manifest = attack_run_dir / "final_manifest.json"
+        attack_run_manifest = attack_run_dir / "run_manifest.json"
+        frozen = read_json(attack_final_manifest)
+        for key, expected in (
+            ("status", "complete_validated"),
+            ("complete_count", 100),
+            ("missing_count", 0),
+            ("duplicate_count", 0),
+            ("processing_failure_history_count", 0),
+        ):
+            if frozen.get(key) != expected:
+                raise ValueError(
+                    f"independent final manifest {key} mismatch: "
+                    f"{frozen.get(key)!r} != {expected!r}"
+                )
+        independent_provenance = {
+            "attack_run_dir": str(attack_run_dir),
+            "attack_run_manifest_sha256": sha256_file(attack_run_manifest),
+            "attack_final_manifest_sha256": sha256_file(attack_final_manifest),
+            "attack_config_sha256": sha256_file(
+                Path(args.independent_config).resolve()
+            ),
+            "attack_input_manifest_sha256": sha256_file(
+                Path(args.independent_input_manifest).resolve()
+            ),
+            "attack_adapter_sha256": sha256_file(
+                Path(args.independent_adapter).resolve()
+            ),
+            "frozen_prompt_count": len(groups["independent100"]),
+        }
+
     output_dir.mkdir(parents=True)
     manifest = {
         "schema_version": 1,
@@ -545,6 +615,10 @@ def run_gpu(args) -> dict:
         "created_at": utc_now(),
         "execution_git_head": git_value(REPO_ROOT, "rev-parse", "HEAD"),
         "execution_git_branch": git_value(REPO_ROOT, "branch", "--show-current"),
+        "execution_git_status_porcelain": git_value(
+            REPO_ROOT, "status", "--porcelain"
+        ).splitlines(),
+        "evaluator_source_sha256": sha256_file(Path(__file__).resolve()),
         "model": str(model_path),
         "model_config": llama_model_config_summary(model),
         "model_validation": model_validation,
@@ -573,11 +647,15 @@ def run_gpu(args) -> dict:
             "max_new_tokens": 32,
             "seed": 42,
         },
+        "independent_test_provenance": independent_provenance,
     }
     write_json(output_dir / "run_manifest.json", manifest)
 
     summaries = []
+    baseline_summaries = []
+    artifact_paths = []
     for group_name, records in groups.items():
+        baseline_started = start_cuda_measurement()
         baseline = run_baseline(
             records,
             model=model,
@@ -585,19 +663,40 @@ def run_gpu(args) -> dict:
             label=f"{group_name} baseline",
             require_saved_reproduction=group_name != "independent100",
         )
+        baseline_runtime = finish_cuda_measurement(baseline_started)
         baseline_by_index = {row["dataset_index"]: row for row in baseline}
+        baseline_path = output_dir / f"{group_name}_baseline.jsonl"
         write_jsonl(
-            output_dir / f"{group_name}_baseline.jsonl",
+            baseline_path,
             [
                 {
-                    key: value
+                    key: (
+                        serialized_input_ids(value)
+                        if key == "input_ids"
+                        else value
+                    )
                     for key, value in row.items()
-                    if key not in {"input_ids", "first_logits"}
+                    if key != "first_logits"
                 }
                 for row in baseline
             ],
         )
+        artifact_paths.append(baseline_path)
+        baseline_summary = {
+            "dataset_group": group_name,
+            "prompt_count": len(baseline),
+            "attack_success_count": sum(bool(row["success"]) for row in baseline),
+            "asr": sum(bool(row["success"]) for row in baseline) / len(baseline),
+            "generation_failure_count": 0,
+            "input_ids_saved_count": len(baseline),
+            **baseline_runtime,
+        }
+        baseline_summary_path = output_dir / f"{group_name}_baseline_summary.json"
+        write_json(baseline_summary_path, baseline_summary)
+        artifact_paths.append(baseline_summary_path)
+        baseline_summaries.append(baseline_summary)
         for k in selection.k_values:
+            condition_started = start_cuda_measurement()
             rows, summary = run_condition(
                 records,
                 baseline_by_index,
@@ -608,23 +707,48 @@ def run_gpu(args) -> dict:
                 alpha=args.alpha,
                 label=group_name,
             )
+            summary.update(finish_cuda_measurement(condition_started))
             condition_dir = output_dir / group_name / f"k_{k}"
             condition_dir.mkdir(parents=True)
-            write_jsonl(condition_dir / "prompt_results.jsonl", rows)
-            write_json(condition_dir / "summary.json", summary)
+            prompt_results_path = condition_dir / "prompt_results.jsonl"
+            condition_summary_path = condition_dir / "summary.json"
+            write_jsonl(prompt_results_path, rows)
+            write_json(condition_summary_path, summary)
+            artifact_paths.extend([prompt_results_path, condition_summary_path])
             summaries.append(summary)
     result = {
         "status": "complete",
         "completed_at": utc_now(),
+        "baselines": baseline_summaries,
         "conditions": summaries,
     }
-    write_json(output_dir / "evaluation_summary.json", result)
+    evaluation_summary_path = output_dir / "evaluation_summary.json"
+    write_json(evaluation_summary_path, result)
+    artifact_paths.append(evaluation_summary_path)
+    artifact_manifest_path = output_dir / "artifact_manifest.json"
+    write_json(
+        artifact_manifest_path,
+        {
+            "schema_version": 1,
+            "created_at": utc_now(),
+            "artifacts": [
+                {
+                    "relative_path": str(path.relative_to(output_dir)),
+                    "sha256": sha256_file(path),
+                }
+                for path in artifact_paths
+            ],
+        },
+    )
     manifest_path = output_dir / "run_manifest.json"
     saved_manifest = read_json(manifest_path)
     if saved_manifest.get("status") != "running":
         raise ValueError("run manifest is not in running state")
     saved_manifest["status"] = "complete"
     saved_manifest["completed_at"] = result["completed_at"]
+    saved_manifest["artifact_manifest_sha256"] = sha256_file(
+        artifact_manifest_path
+    )
     temporary = manifest_path.with_name(f".{manifest_path.name}.tmp")
     if temporary.exists():
         raise FileExistsError(f"temporary run manifest already exists: {temporary}")

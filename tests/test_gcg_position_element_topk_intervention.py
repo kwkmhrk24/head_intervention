@@ -6,6 +6,7 @@ import torch
 from scripts.evaluate_gcg_position_element_topk_intervention import (
     REQUIRED_RUNTIME_INVARIANTS,
     parse_args,
+    serialized_input_ids,
     validate_first_token_outcome_invariant,
     validate_prompt_runtime_invariants,
 )
@@ -172,6 +173,19 @@ class PositionElementSelectionTests(unittest.TestCase):
         for value in ("-0.1", "1.1"):
             with self.subTest(value=value), self.assertRaises(SystemExit):
                 parse_args(["--alpha", value])
+
+    def test_input_ids_are_serialized_exactly_and_invalid_shapes_fail(self):
+        ids = torch.tensor([[1, 17, 42]], dtype=torch.long)
+        self.assertEqual(serialized_input_ids(ids), [1, 17, 42])
+        for invalid in (
+            torch.tensor([1, 2]),
+            torch.empty((0, 2), dtype=torch.long),
+            torch.empty((1, 0), dtype=torch.long),
+        ):
+            with self.subTest(shape=tuple(invalid.shape)), self.assertRaises(
+                (TypeError, ValueError)
+            ):
+                serialized_input_ids(invalid)
 
 
 def make_controller(alpha=0.5, *, timing="first_token_only"):
