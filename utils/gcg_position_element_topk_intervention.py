@@ -375,6 +375,7 @@ class PositionElementTopKController:
         tail_tokens: int = TAIL_TOKENS,
         expected_score_dtype: torch.dtype | None = None,
         intervention_timing: str = "first_token_only",
+        capture_selected_values: bool = False,
     ):
         self.alpha = validate_alpha(alpha)
         self.intervention_timing = validate_intervention_timing(intervention_timing)
@@ -402,6 +403,9 @@ class PositionElementTopKController:
         self.layer_count, self.head_count, _ = reference_mean.shape
         self.tail_tokens = tail_tokens
         self.expected_score_dtype = expected_score_dtype
+        if type(capture_selected_values) is not bool:
+            raise TypeError("capture_selected_values must be bool")
+        self.capture_selected_values = capture_selected_values
         self.selected_layers = tuple(
             layer
             for layer in range(self.layer_count)
@@ -424,6 +428,7 @@ class PositionElementTopKController:
         self.later_forward_intervention_count = 0
         self.later_forward_skip_count = 0
         self._records: list[dict] = []
+        self._selected_value_records: list[dict] = []
 
     def set_prompt_context(self, *, prompt_length: int) -> None:
         if self.attention_forward_call_count or self.intervention_call_count:
@@ -509,6 +514,33 @@ class PositionElementTopKController:
         intervened_float32 = original_block + constructed_delta
         intervened_cast = intervened_float32.to(attention_scores.dtype)
 
+        if self.capture_selected_values:
+            constructed_lower = current_lower + lower_delta
+            realized_asym = (
+                intervened_cast.float() - intervened_cast.float().transpose(-1, -2)
+            ) / 2
+            realized_lower = realized_asym[:, :, rows, cols]
+            identities = mask.nonzero(as_tuple=False).detach().cpu().tolist()
+            values = zip(
+                identities,
+                current_lower[0].masked_select(mask).detach().cpu().tolist(),
+                reference.masked_select(mask).detach().cpu().tolist(),
+                constructed_lower[0].masked_select(mask).detach().cpu().tolist(),
+                realized_lower[0].masked_select(mask).detach().cpu().tolist(),
+            )
+            for (head, position), before, target, constructed_after, after in values:
+                self._selected_value_records.append(
+                    {
+                        "layer": layer,
+                        "head": int(head),
+                        "position": int(position),
+                        "score_before": float(before),
+                        "reference": float(target),
+                        "score_after_float32": float(constructed_after),
+                        "score_after": float(after),
+                    }
+                )
+
         modified = attention_scores.clone()
         modified[:, :, -self.tail_tokens :, -self.tail_tokens :] = intervened_cast
         if not bool(torch.isfinite(modified).all().item()):
@@ -572,6 +604,13 @@ class PositionElementTopKController:
         )
         return modified
 
+    def selected_value_trace(self) -> tuple[dict, ...]:
+        """Return opt-in selected-element values captured during this prompt."""
+
+        if not self.capture_selected_values:
+            raise RuntimeError("selected-value capture was not enabled")
+        return tuple(dict(record) for record in self._selected_value_records)
+
     def summary(self) -> dict:
         def maximum(key: str) -> float:
             return max((float(record[key]) for record in self._records), default=0.0)
@@ -617,6 +656,7 @@ def patch_llama_position_element_attention(
     k: int,
     alpha: float,
     intervention_timing: str = "first_token_only",
+    capture_selected_values: bool = False,
 ):
     """Temporarily install Position Element Top-k intervention hooks."""
 
@@ -632,6 +672,7 @@ def patch_llama_position_element_attention(
         alpha=alpha,
         expected_score_dtype=torch.float16,
         intervention_timing=intervention_timing,
+        capture_selected_values=capture_selected_values,
     )
     patched = []
     try:

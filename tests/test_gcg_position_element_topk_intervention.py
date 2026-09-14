@@ -296,7 +296,9 @@ class PositionElementSelectionTests(unittest.TestCase):
                 serialized_input_ids(invalid)
 
 
-def make_controller(alpha=0.5, *, timing="first_token_only"):
+def make_controller(
+    alpha=0.5, *, timing="first_token_only", capture_selected_values=False
+):
     reference = torch.zeros((2, 4, ELEMENTS_PER_HEAD), dtype=torch.float32)
     mask = torch.zeros_like(reference, dtype=torch.bool)
     reference[0, 1, 5] = 2.0
@@ -308,6 +310,7 @@ def make_controller(alpha=0.5, *, timing="first_token_only"):
         element_mask=mask,
         alpha=alpha,
         intervention_timing=timing,
+        capture_selected_values=capture_selected_values,
     )
 
 
@@ -354,6 +357,37 @@ class PositionElementInterventionTests(unittest.TestCase):
         self.assertEqual(summary["selected_element_intervention_count"], 2)
         self.assertEqual(summary["max_unselected_element_change"], 0.0)
         self.assertEqual(summary["max_outside_tail_change"], 0.0)
+
+    def test_opt_in_selected_value_trace_records_realized_scores(self):
+        controller = make_controller(
+            alpha=1.0, capture_selected_values=True
+        )
+        controller.set_prompt_context(prompt_length=20)
+        before = self.scores.clone()
+        result = controller.apply(0, self.scores)
+        trace = controller.selected_value_trace()
+        self.assertEqual(len(trace), 2)
+        by_identity = {
+            (row["head"], row["position"]): row for row in trace
+        }
+        self.assertEqual(set(by_identity), {(1, 5), (3, 119)})
+        rows, cols = strict_lower_indices(16)
+        for identity, target in (((1, 5), 2.0), ((3, 119), -1.0)):
+            head, position = identity
+            row = int(rows[position]) + 4
+            col = int(cols[position]) + 4
+            observed_before = float(
+                ((before[0, head, row, col] - before[0, head, col, row]) / 2)
+            )
+            observed_after = float(
+                ((result[0, head, row, col] - result[0, head, col, row]) / 2)
+            )
+            self.assertEqual(by_identity[identity]["score_before"], observed_before)
+            self.assertEqual(by_identity[identity]["reference"], target)
+            self.assertEqual(by_identity[identity]["score_after_float32"], target)
+            self.assertEqual(by_identity[identity]["score_after"], observed_after)
+        controller.clear()
+        self.assertEqual(controller.selected_value_trace(), ())
 
     def test_antisymmetry_preserves_symmetric_component_and_diagonal(self):
         controller = make_controller(alpha=0.5)
