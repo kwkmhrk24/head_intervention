@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -77,9 +78,22 @@ from utils.reference_asym_score_intervention import (  # noqa: E402
 )
 
 
-DATASET_GROUPS = ("selection20", "holdout48", "independent100")
+DATASET_GROUPS = ("selection20", "holdout48", "independent100", "autodan130")
 DEFAULT_DATASET_GROUPS = ("selection20", "holdout48")
 DEFAULT_ALPHA = 1.0
+DEFAULT_AUTODAN_INPUT = "data/raw/llama2/llama2_AutoDAN.json"
+EXPECTED_AUTODAN_SHA256 = (
+    "589add579b5110939c323f5c2de2984823f6d1afd684b9aa4fb112f7109198fb"
+)
+AUTODAN_RECORD_COUNT = 130
+AUTODAN_PROMPT_FORMATS = ("current", "official_fastchat_34062e9")
+DEFAULT_AUTODAN_PROMPT_FORMAT = "current"
+AUTODAN_OFFICIAL_REPOSITORY_COMMIT = (
+    "34062e964185693e81a6775b4f0d00bfd7507612"
+)
+AUTODAN_OFFICIAL_FASTCHAT_VERSION = "0.2.20"
+AUTODAN_OFFICIAL_PREFIX = "[INST] <<SYS>>\n\n<</SYS>>\n\n"
+AUTODAN_OFFICIAL_SUFFIX = "[/INST]"
 DEFAULT_INDEPENDENT_CONFIG = (
     "configs/gcg_independent_test_v1/attack_config.json"
 )
@@ -171,6 +185,24 @@ def parse_args(argv=None):
         choices=DATASET_GROUPS,
         default=list(DEFAULT_DATASET_GROUPS),
     )
+    parser.add_argument("--autodan-input", default=DEFAULT_AUTODAN_INPUT)
+    parser.add_argument(
+        "--autodan-prompt-format",
+        choices=AUTODAN_PROMPT_FORMATS,
+        default=DEFAULT_AUTODAN_PROMPT_FORMAT,
+        help=(
+            "AutoDAN input formatting. The official option reproduces the "
+            "pinned AutoDAN FastChat llama-2 prompt with an empty SYS block."
+        ),
+    )
+    parser.add_argument(
+        "--autodan-smoke-count",
+        type=int,
+        help=(
+            "Evaluate only the first N validated AutoDAN rows for a GPU smoke "
+            "test. Omit for the frozen full 130-row transfer test."
+        ),
+    )
     parser.add_argument("--independent-config", default=DEFAULT_INDEPENDENT_CONFIG)
     parser.add_argument(
         "--independent-input-manifest",
@@ -182,6 +214,166 @@ def parse_args(argv=None):
     )
     parser.add_argument("--output-dir")
     return parser.parse_args(argv)
+
+
+def load_autodan_transfer_records(
+    path: Path, *, smoke_count: int | None = None
+) -> tuple[list[dict], dict]:
+    """Load the immutable 130-row AutoDAN transfer set in source order."""
+
+    path = path.resolve()
+    if sha256_file(path) != EXPECTED_AUTODAN_SHA256:
+        raise ValueError("AutoDAN source artifact hash mismatch")
+    try:
+        rows = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise ValueError(f"invalid AutoDAN JSON: {path}") from error
+    if not isinstance(rows, list) or len(rows) != AUTODAN_RECORD_COUNT:
+        raise ValueError(
+            f"AutoDAN source must contain exactly {AUTODAN_RECORD_COUNT} rows"
+        )
+    expected_indices = list(range(AUTODAN_RECORD_COUNT))
+    actual_indices = [row.get("index") for row in rows if isinstance(row, dict)]
+    if actual_indices != expected_indices:
+        raise ValueError("AutoDAN indices must be the ordered integers 0..129")
+
+    prepared = []
+    prompt_hashes = set()
+    stored_success_count = 0
+    for row_position, row in enumerate(rows):
+        prompt = row.get("user prompt")
+        if not isinstance(prompt, str) or not prompt:
+            raise ValueError(f"invalid AutoDAN prompt at index={row_position}")
+        prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        if prompt_hash in prompt_hashes:
+            raise ValueError(f"duplicate AutoDAN prompt at index={row_position}")
+        prompt_hashes.add(prompt_hash)
+        if row.get("method") != "AutoDAN":
+            raise ValueError(f"AutoDAN method mismatch at index={row_position}")
+        if row.get("model") != "llama2-7B-chat-hf":
+            raise ValueError(f"AutoDAN model label mismatch at index={row_position}")
+        if row.get("system prompt") != "":
+            raise ValueError(f"AutoDAN system prompt mismatch at index={row_position}")
+        if type(row.get("success")) is not bool:
+            raise ValueError(
+                f"stored AutoDAN success must be bool at index={row_position}"
+            )
+        stored_success_count += int(row["success"])
+        prepared.append(
+            {
+                "prompt_id": f"autodan_{row_position}",
+                "row_position": row_position,
+                "dataset_index": row_position,
+                "split": "held_out_attack_transfer_test",
+                "prompt": prompt,
+                "prompt_sha256": prompt_hash,
+                "stored_source_success": row["success"],
+                "stored_source_loss": row.get("loss"),
+            }
+        )
+    if stored_success_count != 84:
+        raise ValueError("stored AutoDAN success count mismatch")
+    if smoke_count is not None:
+        if type(smoke_count) is not int or not 1 <= smoke_count <= len(prepared):
+            raise ValueError("--autodan-smoke-count must be in [1, 130]")
+        prepared = prepared[:smoke_count]
+    provenance = {
+        "role": "held_out_attack_transfer_test_not_newly_generated_independent_test",
+        "source_path": str(path),
+        "source_sha256": EXPECTED_AUTODAN_SHA256,
+        "source_record_count": AUTODAN_RECORD_COUNT,
+        "source_indices": expected_indices,
+        "source_index_unique_count": AUTODAN_RECORD_COUNT,
+        "stored_source_success_count_auxiliary_only": stored_success_count,
+        "evaluated_record_count": len(prepared),
+        "smoke_count": smoke_count,
+        "prompt_hashes_unique": True,
+        "selection_or_reference_from_autodan": False,
+    }
+    return prepared, provenance
+
+
+def autodan_prompt_format_provenance(prompt_format: str) -> dict:
+    """Describe the frozen AutoDAN formatting choice without loading a model."""
+
+    if prompt_format not in AUTODAN_PROMPT_FORMATS:
+        raise ValueError(f"unknown AutoDAN prompt format: {prompt_format!r}")
+    if prompt_format == "current":
+        return {
+            "name": prompt_format,
+            "implementation": "existing Llama tokenizer chat template",
+            "system_prompt": None,
+            "tokenize_add_special_tokens": False,
+        }
+    return {
+        "name": prompt_format,
+        "autodan_repository_commit": AUTODAN_OFFICIAL_REPOSITORY_COMMIT,
+        "fastchat_version_used_for_literal_verification": (
+            AUTODAN_OFFICIAL_FASTCHAT_VERSION
+        ),
+        "fastchat_template": "llama-2",
+        "formatted_text_formula": (
+            "[INST] <<SYS>>\\n\\n<</SYS>>\\n\\n{prompt}[/INST]"
+        ),
+        "prompt_text_preserved_without_strip": True,
+        "empty_system_block": True,
+        "assistant_boundary": AUTODAN_OFFICIAL_SUFFIX,
+        "tokenize_add_special_tokens": True,
+        "bos_added_by_tokenizer": True,
+    }
+
+
+def format_autodan_records(
+    records: list[dict], tokenizer, *, prompt_format: str
+) -> list[dict]:
+    """Format AutoDAN records with the current or pinned official template."""
+
+    autodan_prompt_format_provenance(prompt_format)
+    if prompt_format == "current":
+        return format_records(records, tokenizer)
+
+    output = []
+    bos_token_id = tokenizer.bos_token_id
+    if bos_token_id is None:
+        raise ValueError("official AutoDAN formatting requires a tokenizer BOS token")
+    for record in records:
+        formatted_prompt = (
+            AUTODAN_OFFICIAL_PREFIX
+            + record["prompt"]
+            + AUTODAN_OFFICIAL_SUFFIX
+        )
+        input_ids = tokenizer(
+            formatted_prompt,
+            return_tensors="pt",
+            add_special_tokens=True,
+        ).input_ids
+        prompt_length = int(input_ids.shape[-1])
+        if prompt_length < 16:
+            raise ValueError(
+                "AutoDAN prompt is shorter than 16 tokens: "
+                f"dataset_index={record['dataset_index']}"
+            )
+        if int(input_ids[0, 0].item()) != int(bos_token_id):
+            raise ValueError("official AutoDAN tokenization did not prepend BOS")
+        output.append(
+            {
+                **record,
+                "formatted_prompt": formatted_prompt,
+                "prompt_length": prompt_length,
+                "input_ids": input_ids,
+            }
+        )
+    return output
+
+
+def validate_autodan_format_request(args) -> None:
+    """Reject AutoDAN-only options when the AutoDAN group is absent."""
+
+    has_autodan = "autodan130" in args.dataset_groups
+    if args.autodan_smoke_count is not None and not has_autodan:
+        raise ValueError("--autodan-smoke-count requires --dataset-groups autodan130")
+    if args.autodan_prompt_format != DEFAULT_AUTODAN_PROMPT_FORMAT and not has_autodan:
+        raise ValueError("--autodan-prompt-format requires --dataset-groups autodan130")
 
 
 def load_selection(artifact_dir: Path, *, k_values, model_path: Path):
@@ -227,6 +419,7 @@ def load_selection(artifact_dir: Path, *, k_values, model_path: Path):
 
 
 def cpu_validation_payload(args) -> dict:
+    validate_autodan_format_request(args)
     artifact_dir = Path(args.artifact_dir).resolve()
     model_path = Path(args.model).resolve()
     selection, verification, metadata, paths = load_selection(
@@ -305,6 +498,16 @@ def cpu_validation_payload(args) -> dict:
             independent_validation["attack_outputs_verified"] = True
             independent_validation["evaluation_input_ids_verified"] = True
         result["independent100"] = independent_validation
+    if "autodan130" in args.dataset_groups:
+        if tuple(args.k_values) != (500,) or args.alpha != 1.0:
+            raise ValueError("autodan130 is frozen to k-values=500 and alpha=1.0")
+        _, autodan_provenance = load_autodan_transfer_records(
+            Path(args.autodan_input), smoke_count=args.autodan_smoke_count
+        )
+        autodan_provenance["prompt_format"] = autodan_prompt_format_provenance(
+            args.autodan_prompt_format
+        )
+        result["autodan130"] = autodan_provenance
     return result
 
 
@@ -483,12 +686,24 @@ def run_condition(
         "input_ids_match_count": sum(
             bool(row["input_ids_match_baseline"]) for row in rows
         ),
+        "first_forward_detected_count": sum(
+            item["first_forward_detected"] is True for item in prompt_diagnostics
+        ),
+        "first_forward_intervened_count": sum(
+            item["first_forward_intervened"] is True for item in prompt_diagnostics
+        ),
         "selected_element_intervention_count": sum(
             item["selected_element_intervention_count"]
             for item in prompt_diagnostics
         ),
         "later_forward_intervention_count": sum(
             item["later_forward_intervention_count"] for item in prompt_diagnostics
+        ),
+        "short_sequence_skip_count": sum(
+            item["short_sequence_skip_count"] for item in prompt_diagnostics
+        ),
+        "all_scores_finite": all(
+            item["all_scores_finite"] is True for item in prompt_diagnostics
         ),
         "max_unselected_element_change": max(
             item["max_unselected_element_change"] for item in prompt_diagnostics
@@ -500,10 +715,14 @@ def run_condition(
             item["max_constructed_delta_antisymmetry_error_float32"]
             for item in prompt_diagnostics
         ),
+        "max_diagonal_change_float32": max(
+            item["max_diagonal_change_float32"] for item in prompt_diagnostics
+        ),
         "max_symmetric_component_error_float32": max(
             item["max_symmetric_component_error_float32"]
             for item in prompt_diagnostics
         ),
+        "first_token_outcome_invariant_pass_count": len(rows),
         "generation_failure_count": 0,
     }
     return rows, summary
@@ -524,6 +743,11 @@ def run_gpu(args) -> dict:
         raise ValueError(
             "--independent-attack-run-dir is required for independent100"
         )
+    if "autodan130" in args.dataset_groups and (
+        tuple(args.k_values) != (500,) or args.alpha != 1.0
+    ):
+        raise ValueError("autodan130 is frozen to k-values=500 and alpha=1.0")
+    validate_autodan_format_request(args)
     output_dir = ensure_output_absent(args.output_dir).resolve()
     artifact_dir = Path(args.artifact_dir).resolve()
     model_path = Path(args.model).resolve()
@@ -557,6 +781,14 @@ def run_gpu(args) -> dict:
             attack_run_dir=Path(args.independent_attack_run_dir).resolve(),
             adapter_path=Path(args.independent_adapter).resolve(),
         )
+    autodan_provenance = None
+    if "autodan130" in args.dataset_groups:
+        groups["autodan130"], autodan_provenance = load_autodan_transfer_records(
+            Path(args.autodan_input), smoke_count=args.autodan_smoke_count
+        )
+        autodan_provenance["prompt_format"] = autodan_prompt_format_provenance(
+            args.autodan_prompt_format
+        )
 
     audited_reference = load_validated_reference_artifacts(
         artifact_dir,
@@ -569,7 +801,16 @@ def run_gpu(args) -> dict:
     model, tokenizer = load_model_and_tokenizer(model_path)
     model_validation = validate_loaded_llama_model(model, audited_reference)
     groups = {
-        name: format_records(records, tokenizer) for name, records in groups.items()
+        name: (
+            format_autodan_records(
+                records,
+                tokenizer,
+                prompt_format=args.autodan_prompt_format,
+            )
+            if name == "autodan130"
+            else format_records(records, tokenizer)
+        )
+        for name, records in groups.items()
     }
     if "independent100" in groups:
         validate_formatted_evaluation_identity(groups["independent100"])
@@ -648,6 +889,7 @@ def run_gpu(args) -> dict:
             "seed": 42,
         },
         "independent_test_provenance": independent_provenance,
+        "autodan_transfer_provenance": autodan_provenance,
     }
     write_json(output_dir / "run_manifest.json", manifest)
 
@@ -661,7 +903,10 @@ def run_gpu(args) -> dict:
             model=model,
             tokenizer=tokenizer,
             label=f"{group_name} baseline",
-            require_saved_reproduction=group_name != "independent100",
+            require_saved_reproduction=group_name not in (
+                "independent100",
+                "autodan130",
+            ),
         )
         baseline_runtime = finish_cuda_measurement(baseline_started)
         baseline_by_index = {row["dataset_index"]: row for row in baseline}

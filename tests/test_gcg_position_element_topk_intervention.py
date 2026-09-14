@@ -1,10 +1,22 @@
 import math
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
 from scripts.evaluate_gcg_position_element_topk_intervention import (
+    AUTODAN_RECORD_COUNT,
+    AUTODAN_OFFICIAL_PREFIX,
+    AUTODAN_OFFICIAL_REPOSITORY_COMMIT,
+    AUTODAN_OFFICIAL_SUFFIX,
+    DEFAULT_AUTODAN_PROMPT_FORMAT,
+    DEFAULT_AUTODAN_INPUT,
+    EXPECTED_AUTODAN_SHA256,
     REQUIRED_RUNTIME_INVARIANTS,
+    autodan_prompt_format_provenance,
+    format_autodan_records,
+    load_autodan_transfer_records,
     parse_args,
     serialized_input_ids,
     validate_first_token_outcome_invariant,
@@ -30,6 +42,7 @@ from utils.gcg_wasserstein_reference import (
 
 
 SCORE_SHAPE = (SELECTION_COUNT, NUM_LAYERS, NUM_HEADS, ELEMENTS_PER_HEAD)
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class PositionElementSelectionTests(unittest.TestCase):
@@ -173,6 +186,101 @@ class PositionElementSelectionTests(unittest.TestCase):
         for value in ("-0.1", "1.1"):
             with self.subTest(value=value), self.assertRaises(SystemExit):
                 parse_args(["--alpha", value])
+
+    def test_autodan_transfer_cli_is_explicitly_frozen(self):
+        args = parse_args(
+            [
+                "--dataset-groups",
+                "autodan130",
+                "--k-values",
+                "500",
+                "--alpha",
+                "1.0",
+                "--autodan-smoke-count",
+                "3",
+            ]
+        )
+        self.assertEqual(args.dataset_groups, ["autodan130"])
+        self.assertEqual(args.k_values, [500])
+        self.assertEqual(args.alpha, 1.0)
+        self.assertEqual(args.autodan_smoke_count, 3)
+        self.assertEqual(args.autodan_prompt_format, DEFAULT_AUTODAN_PROMPT_FORMAT)
+
+    def test_official_autodan_format_preserves_prompt_and_adds_bos(self):
+        class RecordingTokenizer:
+            bos_token_id = 1
+
+            def __init__(self):
+                self.calls = []
+
+            def __call__(self, text, **kwargs):
+                self.calls.append((text, kwargs))
+                return SimpleNamespace(
+                    input_ids=torch.tensor([[1] + list(range(2, 18))])
+                )
+
+        tokenizer = RecordingTokenizer()
+        prompt = "  keep [REPLACE] and trailing newline\n"
+        records = format_autodan_records(
+            [{"prompt": prompt, "dataset_index": 10}],
+            tokenizer,
+            prompt_format="official_fastchat_34062e9",
+        )
+        expected = AUTODAN_OFFICIAL_PREFIX + prompt + AUTODAN_OFFICIAL_SUFFIX
+        self.assertEqual(records[0]["formatted_prompt"], expected)
+        self.assertEqual(records[0]["prompt_length"], 17)
+        self.assertEqual(
+            tokenizer.calls,
+            [
+                (
+                    expected,
+                    {"return_tensors": "pt", "add_special_tokens": True},
+                )
+            ],
+        )
+        provenance = autodan_prompt_format_provenance(
+            "official_fastchat_34062e9"
+        )
+        self.assertEqual(
+            provenance["autodan_repository_commit"],
+            AUTODAN_OFFICIAL_REPOSITORY_COMMIT,
+        )
+        self.assertTrue(provenance["prompt_text_preserved_without_strip"])
+        self.assertTrue(provenance["bos_added_by_tokenizer"])
+
+    def test_official_autodan_format_cli_is_explicit(self):
+        args = parse_args(
+            [
+                "--dataset-groups",
+                "autodan130",
+                "--autodan-prompt-format",
+                "official_fastchat_34062e9",
+            ]
+        )
+        self.assertEqual(
+            args.autodan_prompt_format, "official_fastchat_34062e9"
+        )
+
+    def test_autodan_transfer_source_and_smoke_subset_are_validated(self):
+        source = REPO_ROOT / DEFAULT_AUTODAN_INPUT
+        records, provenance = load_autodan_transfer_records(source)
+        self.assertEqual(len(records), AUTODAN_RECORD_COUNT)
+        self.assertEqual(
+            [row["dataset_index"] for row in records],
+            list(range(AUTODAN_RECORD_COUNT)),
+        )
+        self.assertEqual(provenance["source_sha256"], EXPECTED_AUTODAN_SHA256)
+        self.assertEqual(
+            provenance["stored_source_success_count_auxiliary_only"], 84
+        )
+        self.assertFalse(provenance["selection_or_reference_from_autodan"])
+        smoke, smoke_provenance = load_autodan_transfer_records(
+            source, smoke_count=3
+        )
+        self.assertEqual([row["dataset_index"] for row in smoke], [0, 1, 2])
+        self.assertEqual(smoke_provenance["evaluated_record_count"], 3)
+        with self.assertRaisesRegex(ValueError, r"\[1, 130\]"):
+            load_autodan_transfer_records(source, smoke_count=0)
 
     def test_input_ids_are_serialized_exactly_and_invalid_shapes_fail(self):
         ids = torch.tensor([[1, 17, 42]], dtype=torch.long)
