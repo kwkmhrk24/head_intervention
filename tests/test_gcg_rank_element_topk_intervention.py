@@ -5,8 +5,13 @@ import torch
 
 from scripts.evaluate_gcg_rank_element_topk_intervention import (
     ALPHA,
+    DEFAULT_CONDITION,
     INTERVENTION_TIMING,
+    RANK_ALL_ELEMENT_COUNT,
     REQUIRED_RUNTIME_INVARIANTS,
+    _condition_for_name,
+    _runtime_selection_diagnostics,
+    _runtime_selection_for_condition,
     parse_args,
     validate_prompt_runtime_invariants,
 )
@@ -192,6 +197,7 @@ class RankElementSelectionTests(unittest.TestCase):
     def test_entrypoint_is_fixed_to_v1_and_excludes_independent100(self):
         args = parse_args(["--rank-artifact-dir", "/tmp/rank-artifact"])
         self.assertEqual(args.stage, "cpu-validate")
+        self.assertEqual(args.condition, DEFAULT_CONDITION)
         self.assertEqual(tuple(args.dataset_groups), ("selection20", "holdout48"))
         self.assertEqual(ALPHA, 1.0)
         self.assertEqual(INTERVENTION_TIMING, "first_token_only")
@@ -202,6 +208,62 @@ class RankElementSelectionTests(unittest.TestCase):
                     "/tmp/rank-artifact",
                     "--dataset-groups",
                     "independent100",
+                ]
+            )
+
+    def test_rank_all_alpha_half_selects_every_rank_without_ranking(self):
+        source = build_rank_element_selection(
+            self.original,
+            self.jailbreak,
+            k_values=(TOP_K,),
+        )
+        condition = _condition_for_name("rank_all_alpha0.5")
+        selection = _runtime_selection_for_condition(source, condition)
+        mask = selection.mask_for_k(RANK_ALL_ELEMENT_COUNT)
+        self.assertEqual(condition["alpha"], 0.5)
+        self.assertFalse(condition["ranking_used_for_selection"])
+        self.assertEqual(int(mask.sum().item()), 122880)
+        self.assertTrue(bool(mask.all().item()))
+
+        source_diagnostics = selection_diagnostics(source)
+        diagnostics = _runtime_selection_diagnostics(
+            source_diagnostics, condition
+        )
+        all_condition = diagnostics["conditions"][0]
+        self.assertEqual(all_condition["selected_head_count"], 1024)
+        self.assertEqual(all_condition["selected_rank_min"], 1)
+        self.assertEqual(all_condition["selected_rank_max"], 120)
+        self.assertEqual(
+            sum(
+                row["selected_rank_element_count"]
+                for row in all_condition["rank_band_counts"]
+            ),
+            122880,
+        )
+        self.assertTrue(
+            all(
+                row["selected_rank_element_count"] == 120
+                for row in all_condition["head_selection_counts"]
+            )
+        )
+
+    def test_cli_accepts_only_frozen_rank_all_condition(self):
+        args = parse_args(
+            [
+                "--rank-artifact-dir",
+                "/tmp/rank-artifact",
+                "--condition",
+                "rank_all_alpha0.5",
+            ]
+        )
+        self.assertEqual(args.condition, "rank_all_alpha0.5")
+        with self.assertRaises(SystemExit):
+            parse_args(
+                [
+                    "--rank-artifact-dir",
+                    "/tmp/rank-artifact",
+                    "--condition",
+                    "rank_all_alpha0.75",
                 ]
             )
 

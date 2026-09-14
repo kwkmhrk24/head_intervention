@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate or run GCG Rank Element Top-500 v1 intervention."""
+"""Validate or run frozen GCG Rank Element intervention conditions."""
 
 from __future__ import annotations
 
@@ -45,6 +45,7 @@ from scripts.evaluate_gcg_position_element_topk_intervention import (  # noqa: E
 from utils.experiment_runtime import git_value, seed_everything  # noqa: E402
 from utils.gcg_rank_element_topk_intervention import (  # noqa: E402
     TOP_K,
+    RankElementSelection,
     RankElementTopKController,
     load_rank_selection_artifact,
     patch_llama_rank_element_attention,
@@ -54,6 +55,9 @@ from utils.gcg_reference_intervention_diagnostics import (  # noqa: E402
     compute_logit_step_metrics,
 )
 from utils.gcg_wasserstein_reference import (  # noqa: E402
+    ELEMENTS_PER_HEAD,
+    NUM_HEADS,
+    NUM_LAYERS,
     llama_model_config_summary,
     read_json,
     read_jsonl,
@@ -76,6 +80,28 @@ from utils.reference_asym_score_intervention import (  # noqa: E402
 DATASET_GROUPS = ("selection20", "holdout48")
 DEFAULT_DATASET_GROUPS = DATASET_GROUPS
 ALPHA = 1.0
+RANK_ALL_ELEMENT_COUNT = NUM_LAYERS * NUM_HEADS * ELEMENTS_PER_HEAD
+DEFAULT_CONDITION = "rank_top500_alpha1.0"
+EVALUATION_CONDITIONS = {
+    DEFAULT_CONDITION: {
+        "name": DEFAULT_CONDITION,
+        "method": "rank_element_topk_v1",
+        "k": TOP_K,
+        "alpha": ALPHA,
+        "selection_rule": "top_k_by_abs_mean_gcg_minus_original",
+        "ranking_used_for_selection": True,
+        "output_name": "k_500",
+    },
+    "rank_all_alpha0.5": {
+        "name": "rank_all_alpha0.5",
+        "method": "rank_all_alpha0.5",
+        "k": RANK_ALL_ELEMENT_COUNT,
+        "alpha": 0.5,
+        "selection_rule": "all_rank_elements",
+        "ranking_used_for_selection": False,
+        "output_name": "rank_all_alpha0p5",
+    },
+}
 INTERVENTION_TIMING = "first_token_only"
 REQUIRED_RUNTIME_INVARIANTS = {
     "first_forward_detected": True,
@@ -97,6 +123,11 @@ def parse_args(argv=None):
         choices=("cpu-validate", "run"),
         default="cpu-validate",
         help="cpu-validate is read-only and never loads a model.",
+    )
+    parser.add_argument(
+        "--condition",
+        choices=tuple(EVALUATION_CONDITIONS),
+        default=DEFAULT_CONDITION,
     )
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument(
@@ -120,6 +151,114 @@ def parse_args(argv=None):
     )
     parser.add_argument("--output-dir")
     return parser.parse_args(argv)
+
+
+def _condition_for_name(name: str) -> dict:
+    """Return an isolated copy of one frozen evaluation condition."""
+
+    try:
+        return dict(EVALUATION_CONDITIONS[name])
+    except KeyError as error:
+        raise ValueError(f"unknown evaluation condition: {name!r}") from error
+
+
+def _runtime_selection_for_condition(
+    source_selection: RankElementSelection,
+    condition: dict,
+) -> RankElementSelection:
+    """Reuse the frozen reference while selecting the condition's rank mask."""
+
+    k = int(condition["k"])
+    if k == TOP_K:
+        return source_selection
+    if k != RANK_ALL_ELEMENT_COUNT:
+        raise ValueError(f"unsupported rank element count: {k}")
+    reference = source_selection.original_rank_reference
+    expected_shape = (NUM_LAYERS, NUM_HEADS, ELEMENTS_PER_HEAD)
+    if tuple(reference.shape) != expected_shape:
+        raise ValueError("rank reference shape mismatch for all-rank condition")
+    mask = torch.ones_like(reference, dtype=torch.bool, device="cpu")
+    if int(mask.sum().item()) != RANK_ALL_ELEMENT_COUNT:
+        raise AssertionError("all-rank mask cardinality mismatch")
+    return RankElementSelection(
+        ranking=source_selection.ranking,
+        masks={RANK_ALL_ELEMENT_COUNT: mask.contiguous()},
+        original_rank_reference=reference,
+        k_values=(RANK_ALL_ELEMENT_COUNT,),
+    )
+
+
+def _runtime_selection_diagnostics(
+    source_diagnostics: dict,
+    condition: dict,
+) -> dict:
+    """Describe the effective mask separately from the frozen Top-500 artifact."""
+
+    if int(condition["k"]) == TOP_K:
+        diagnostics = json.loads(json.dumps(source_diagnostics))
+        diagnostics["selection_rule"] = condition["selection_rule"]
+        diagnostics["ranking_used_for_selection"] = True
+        return diagnostics
+
+    per_rank_count = NUM_LAYERS * NUM_HEADS
+    per_layer_count = NUM_HEADS * ELEMENTS_PER_HEAD
+    rank_band_counts = [
+        {
+            "rank_start": start,
+            "rank_end": min(start + 11, ELEMENTS_PER_HEAD),
+            "selected_rank_element_count": (
+                min(start + 11, ELEMENTS_PER_HEAD) - start + 1
+            )
+            * per_rank_count,
+        }
+        for start in range(1, ELEMENTS_PER_HEAD + 1, 12)
+    ]
+    condition_diagnostics = {
+        "k": RANK_ALL_ELEMENT_COUNT,
+        "selected_rank_element_count": RANK_ALL_ELEMENT_COUNT,
+        "selected_head_count": NUM_LAYERS * NUM_HEADS,
+        "distinct_within_head_rank_count": ELEMENTS_PER_HEAD,
+        "selected_rank_min": 1,
+        "selected_rank_max": ELEMENTS_PER_HEAD,
+        "selected_rank_mean": (ELEMENTS_PER_HEAD + 1) / 2,
+        "selected_rank_median": (ELEMENTS_PER_HEAD + 1) / 2,
+        "rank_band_counts": rank_band_counts,
+        "within_head_rank_counts": [
+            {"rank": rank, "selected_rank_element_count": per_rank_count}
+            for rank in range(1, ELEMENTS_PER_HEAD + 1)
+        ],
+        "layer_selection_counts": [
+            {"layer": layer, "selected_rank_element_count": per_layer_count}
+            for layer in range(NUM_LAYERS)
+        ],
+        "head_selection_counts": [
+            {
+                "layer": layer,
+                "head": head,
+                "selected_rank_element_count": ELEMENTS_PER_HEAD,
+            }
+            for layer in range(NUM_LAYERS)
+            for head in range(NUM_HEADS)
+        ],
+    }
+    return {
+        "method": condition["method"],
+        "rank_sort": source_diagnostics["rank_sort"],
+        "rank_tie_break": source_diagnostics["rank_tie_break"],
+        "rank_numbering": source_diagnostics["rank_numbering"],
+        "ranking_metric": source_diagnostics["ranking_metric"],
+        "selection_prompt_count": source_diagnostics["selection_prompt_count"],
+        "candidate_rank_element_count": RANK_ALL_ELEMENT_COUNT,
+        "tail_tokens": source_diagnostics["tail_tokens"],
+        "strict_lower_elements_per_head": source_diagnostics[
+            "strict_lower_elements_per_head"
+        ],
+        "selection_rule": condition["selection_rule"],
+        "ranking_used_for_selection": False,
+        "reference_source": "Selection20 original rank mean from frozen rank artifact",
+        "k_values": [RANK_ALL_ELEMENT_COUNT],
+        "conditions": [condition_diagnostics],
+    }
 
 
 def _validate_source_provenance(config: dict, source_dir: Path) -> dict:
@@ -181,15 +320,15 @@ def validate_prompt_runtime_invariants(diagnostics: dict, *, k: int = TOP_K) -> 
         raise RuntimeError("runtime invariant failed: crossing diagnostics")
 
 
-def cpu_runtime_smoke(selection) -> dict:
+def cpu_runtime_smoke(selection, *, k: int = TOP_K, alpha: float = ALPHA) -> dict:
     """Exercise all selected rank mappings without loading a model or GPU."""
 
     generator = torch.Generator(device="cpu")
     generator.manual_seed(42)
     controller = RankElementTopKController(
         reference_mean=selection.original_rank_reference,
-        rank_mask=selection.mask_for_k(TOP_K),
-        alpha=ALPHA,
+        rank_mask=selection.mask_for_k(k),
+        alpha=alpha,
         intervention_timing=INTERVENTION_TIMING,
     )
     controller.set_prompt_context(prompt_length=20)
@@ -209,21 +348,28 @@ def cpu_runtime_smoke(selection) -> dict:
     if controller.apply(controller.selected_layers[0], later) is not later:
         raise RuntimeError("CPU smoke intervened after the first token")
     diagnostics = controller.summary()
-    validate_prompt_runtime_invariants(diagnostics)
+    validate_prompt_runtime_invariants(diagnostics, k=k)
     return diagnostics
 
 
 def cpu_validation_payload(args) -> dict:
     rank_artifact_dir = Path(args.rank_artifact_dir).resolve()
     source_dir = Path(args.artifact_dir).resolve()
-    selection, config, diagnostics, rank_verification = (
+    source_selection, config, source_diagnostics, rank_verification = (
         load_rank_selection_artifact(rank_artifact_dir)
     )
     source_verification = _validate_source_provenance(config, source_dir)
     model_path = Path(args.model).resolve()
     if Path(config.get("model", "")).resolve() != model_path:
         raise ValueError("rank artifact model mismatch")
-    smoke = cpu_runtime_smoke(selection)
+    condition = _condition_for_name(args.condition)
+    selection = _runtime_selection_for_condition(source_selection, condition)
+    diagnostics = _runtime_selection_diagnostics(source_diagnostics, condition)
+    smoke = cpu_runtime_smoke(
+        selection,
+        k=int(condition["k"]),
+        alpha=float(condition["alpha"]),
+    )
     top_rows = read_jsonl(
         rank_artifact_dir / "selected_rank_elements.jsonl"
     )[:10]
@@ -233,9 +379,11 @@ def cpu_validation_payload(args) -> dict:
         "gpu_used": False,
         "artifacts_written": False,
         "independent100_used": False,
+        "condition": condition,
         "rank_artifact_verification": rank_verification,
         "source_artifact_verified": source_verification["verified"],
         "selection": diagnostics,
+        "source_rank_artifact_selection": source_diagnostics,
         "top_rank_elements": top_rows,
         "cpu_runtime_smoke": smoke,
     }
@@ -248,15 +396,19 @@ def run_condition(
     model,
     tokenizer,
     selection,
+    condition: dict,
     label: str,
 ):
+    k = int(condition["k"])
+    alpha = float(condition["alpha"])
+    method = str(condition["method"])
     rows = []
     prompt_diagnostics = []
     with patch_llama_rank_element_attention(
         model,
         selection=selection,
-        k=TOP_K,
-        alpha=ALPHA,
+        k=k,
+        alpha=alpha,
         intervention_timing=INTERVENTION_TIMING,
     ) as controller:
         for position, record in enumerate(records, 1):
@@ -277,7 +429,7 @@ def run_condition(
                     f"dataset_index={record['dataset_index']}"
                 )
             runtime = controller.summary()
-            validate_prompt_runtime_invariants(runtime)
+            validate_prompt_runtime_invariants(runtime, k=k)
             comparison = compare_token_sequences(
                 baseline["response_token_ids"], generation["response_token_ids"]
             )
@@ -298,9 +450,10 @@ def run_condition(
                     "prompt_length": record["prompt_length"],
                     "input_ids": serialized_input_ids(record["input_ids"]),
                     "input_ids_match_baseline": True,
-                    "method": "rank_element_topk_v1",
-                    "k": TOP_K,
-                    "alpha": ALPHA,
+                    "condition": condition["name"],
+                    "method": method,
+                    "k": k,
+                    "alpha": alpha,
                     "intervention_timing": INTERVENTION_TIMING,
                     "baseline_response": baseline["response"],
                     "baseline_success": baseline["success"],
@@ -320,7 +473,7 @@ def run_condition(
             )
             prompt_diagnostics.append(runtime)
             print(
-                f"[{label} rank-top500 {position}/{len(records)}] "
+                f"[{label} {condition['name']} {position}/{len(records)}] "
                 f"dataset_index={record['dataset_index']} "
                 f"success={generation['success']}",
                 flush=True,
@@ -334,9 +487,10 @@ def run_condition(
     )
     summary = {
         "dataset_group": label,
-        "method": "rank_element_topk_v1",
-        "k": TOP_K,
-        "alpha": ALPHA,
+        "condition": condition["name"],
+        "method": method,
+        "k": k,
+        "alpha": alpha,
         "prompt_count": len(rows),
         "attack_success_count": sum(bool(row["success"]) for row in rows),
         "asr": sum(bool(row["success"]) for row in rows) / len(rows),
@@ -387,6 +541,21 @@ def run_condition(
             item["max_symmetric_component_error_float32"]
             for item in prompt_diagnostics
         ),
+        "max_diagonal_change_float32": max(
+            item["max_diagonal_change_float32"] for item in prompt_diagnostics
+        ),
+        "max_absolute_delta_float32": max(
+            item["max_absolute_delta_float32"] for item in prompt_diagnostics
+        ),
+        "first_forward_detected_count": sum(
+            bool(item["first_forward_detected"]) for item in prompt_diagnostics
+        ),
+        "first_forward_intervened_count": sum(
+            bool(item["first_forward_intervened"]) for item in prompt_diagnostics
+        ),
+        "all_scores_finite": all(
+            bool(item["all_scores_finite"]) for item in prompt_diagnostics
+        ),
         "generation_failure_count": 0,
     }
     return rows, summary
@@ -403,12 +572,15 @@ def run_gpu(args) -> dict:
     rank_artifact_dir = Path(args.rank_artifact_dir).resolve()
     source_dir = Path(args.artifact_dir).resolve()
     model_path = Path(args.model).resolve()
-    selection, config, diagnostics, rank_verification = (
+    source_selection, config, source_diagnostics, rank_verification = (
         load_rank_selection_artifact(rank_artifact_dir)
     )
     source_verification = _validate_source_provenance(config, source_dir)
     if Path(config.get("model", "")).resolve() != model_path:
         raise ValueError("rank artifact model mismatch")
+    condition = _condition_for_name(args.condition)
+    selection = _runtime_selection_for_condition(source_selection, condition)
+    diagnostics = _runtime_selection_diagnostics(source_diagnostics, condition)
 
     loaded, _, _, _, _ = _load_group_inputs(args)
     groups = {name: loaded[name] for name in args.dataset_groups}
@@ -448,14 +620,16 @@ def run_gpu(args) -> dict:
         "rank_artifact_verification": rank_verification,
         "source_artifact_dir": str(source_dir),
         "source_artifact_verification": source_verification,
+        "condition": condition,
         "selection": diagnostics,
+        "source_rank_artifact_selection": source_diagnostics,
         "top_rank_elements": read_jsonl(
             rank_artifact_dir / "selected_rank_elements.jsonl"
         )[:10],
         "dataset_groups": list(groups),
         "independent100_used": False,
-        "k": TOP_K,
-        "alpha": ALPHA,
+        "k": condition["k"],
+        "alpha": condition["alpha"],
         "intervention_timing": INTERVENTION_TIMING,
         "generation_settings": GENERATION_SETTINGS,
     }
@@ -512,10 +686,11 @@ def run_gpu(args) -> dict:
             model=model,
             tokenizer=tokenizer,
             selection=selection,
+            condition=condition,
             label=group_name,
         )
         summary.update(finish_cuda_measurement(condition_started))
-        condition_dir = output_dir / group_name / "k_500"
+        condition_dir = output_dir / group_name / str(condition["output_name"])
         condition_dir.mkdir(parents=True)
         prompt_results_path = condition_dir / "prompt_results.jsonl"
         condition_summary_path = condition_dir / "summary.json"
