@@ -17,11 +17,14 @@ from scripts.analyze_top500_attack_transfer_mechanism import (
 
 
 class AttackTransferMechanismAnalysisTests(unittest.TestCase):
-    def test_cli_defaults_to_cpu_validation(self):
-        args = parse_args([])
+    def test_cli_requires_explicit_autodan_run_and_defaults_to_cpu_validation(self):
+        with self.assertRaises(SystemExit):
+            parse_args([])
+        args = parse_args(["--autodan-run", "/tmp/historical-autodan-run"])
         self.assertEqual(args.stage, "cpu-validate")
         self.assertIsNone(args.output_dir)
         self.assertIsNone(args.limit_per_dataset)
+        self.assertEqual(args.autodan_run, "/tmp/historical-autodan-run")
 
     def test_distribution_reports_requested_quantiles_and_sample_std(self):
         summary = distribution([1.0, 2.0, 3.0, 4.0])

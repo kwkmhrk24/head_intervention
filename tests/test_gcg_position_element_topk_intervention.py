@@ -19,6 +19,7 @@ from scripts.evaluate_gcg_position_element_topk_intervention import (
     load_autodan_transfer_records,
     parse_args,
     serialized_input_ids,
+    validate_autodan_format_request,
     validate_first_token_outcome_invariant,
     validate_prompt_runtime_invariants,
 )
@@ -204,7 +205,27 @@ class PositionElementSelectionTests(unittest.TestCase):
         self.assertEqual(args.k_values, [500])
         self.assertEqual(args.alpha, 1.0)
         self.assertEqual(args.autodan_smoke_count, 3)
-        self.assertEqual(args.autodan_prompt_format, DEFAULT_AUTODAN_PROMPT_FORMAT)
+        self.assertIs(args.autodan_prompt_format, DEFAULT_AUTODAN_PROMPT_FORMAT)
+        with self.assertRaisesRegex(ValueError, "explicit"):
+            validate_autodan_format_request(args)
+
+    def test_autodan_prompt_format_must_be_explicit(self):
+        missing = parse_args(
+            ["--dataset-groups", "autodan130", "--k-values", "500"]
+        )
+        with self.assertRaisesRegex(ValueError, "explicit"):
+            validate_autodan_format_request(missing)
+        explicit = parse_args(
+            [
+                "--dataset-groups",
+                "autodan130",
+                "--k-values",
+                "500",
+                "--autodan-prompt-format",
+                "official_fastchat_34062e9",
+            ]
+        )
+        validate_autodan_format_request(explicit)
 
     def test_official_autodan_format_preserves_prompt_and_adds_bos(self):
         class RecordingTokenizer:

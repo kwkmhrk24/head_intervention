@@ -87,7 +87,7 @@ EXPECTED_AUTODAN_SHA256 = (
 )
 AUTODAN_RECORD_COUNT = 130
 AUTODAN_PROMPT_FORMATS = ("current", "official_fastchat_34062e9")
-DEFAULT_AUTODAN_PROMPT_FORMAT = "current"
+DEFAULT_AUTODAN_PROMPT_FORMAT = None
 AUTODAN_OFFICIAL_REPOSITORY_COMMIT = (
     "34062e964185693e81a6775b4f0d00bfd7507612"
 )
@@ -370,9 +370,13 @@ def validate_autodan_format_request(args) -> None:
     """Reject AutoDAN-only options when the AutoDAN group is absent."""
 
     has_autodan = "autodan130" in args.dataset_groups
+    if has_autodan and args.autodan_prompt_format is None:
+        raise ValueError(
+            "autodan130 requires an explicit --autodan-prompt-format"
+        )
     if args.autodan_smoke_count is not None and not has_autodan:
         raise ValueError("--autodan-smoke-count requires --dataset-groups autodan130")
-    if args.autodan_prompt_format != DEFAULT_AUTODAN_PROMPT_FORMAT and not has_autodan:
+    if args.autodan_prompt_format is not None and not has_autodan:
         raise ValueError("--autodan-prompt-format requires --dataset-groups autodan130")
 
 

@@ -63,10 +63,6 @@ DEFAULT_GCG_RUN = (
     "data/outputs/gcg_wasserstein_reference_intervention/llama2/"
     "independent100/evaluation_20260911T064911Z"
 )
-DEFAULT_AUTODAN_RUN = (
-    "data/outputs/gcg_position_element_topk/autodan130_transfer/"
-    "full130_20260914T085700Z"
-)
 DATASETS = {
     "GCG": {
         "group": "independent100",
@@ -145,7 +141,14 @@ def parse_args(argv=None):
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--artifact-dir", default=DEFAULT_ARTIFACT_DIR)
     parser.add_argument("--gcg-run", default=DEFAULT_GCG_RUN)
-    parser.add_argument("--autodan-run", default=DEFAULT_AUTODAN_RUN)
+    parser.add_argument(
+        "--autodan-run",
+        required=True,
+        help=(
+            "Explicit AutoDAN source run. Historical current-format runs remain "
+            "valid only when deliberately supplied."
+        ),
+    )
     parser.add_argument("--output-dir")
     parser.add_argument(
         "--limit-per-dataset",
