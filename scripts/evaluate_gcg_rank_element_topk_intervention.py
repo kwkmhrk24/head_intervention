@@ -398,13 +398,15 @@ def run_condition(
     selection,
     condition: dict,
     label: str,
+    patcher=patch_llama_rank_element_attention,
+    runtime_validator=validate_prompt_runtime_invariants,
 ):
     k = int(condition["k"])
     alpha = float(condition["alpha"])
     method = str(condition["method"])
     rows = []
     prompt_diagnostics = []
-    with patch_llama_rank_element_attention(
+    with patcher(
         model,
         selection=selection,
         k=k,
@@ -429,7 +431,7 @@ def run_condition(
                     f"dataset_index={record['dataset_index']}"
                 )
             runtime = controller.summary()
-            validate_prompt_runtime_invariants(runtime, k=k)
+            runtime_validator(runtime, k=k)
             comparison = compare_token_sequences(
                 baseline["response_token_ids"], generation["response_token_ids"]
             )
@@ -517,6 +519,7 @@ def run_condition(
         "selected_value_crossing_count": selected_crossings,
         "selected_value_crossing_fraction": (
             selected_crossings / selected_interventions
+            if selected_interventions else 0.0
         ),
         "adjacent_rank_pair_crossing_count": sum(
             item["adjacent_rank_pair_crossing_count"]

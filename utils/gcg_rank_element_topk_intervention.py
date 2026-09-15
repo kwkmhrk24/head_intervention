@@ -654,6 +654,7 @@ class RankElementTopKController:
         tail_tokens: int = TAIL_TOKENS,
         expected_score_dtype: torch.dtype | None = None,
         intervention_timing: str = "first_token_only",
+        shift_mode: bool = False,
     ):
         self.alpha = validate_alpha(alpha)
         self.intervention_timing = validate_intervention_timing(
@@ -676,11 +677,12 @@ class RankElementTopKController:
             raise ValueError("reference_mean rank dimension mismatch")
         if not bool(torch.isfinite(reference_mean).all().item()):
             raise ValueError("reference_mean contains NaN or infinity")
-        if bool((reference_mean[..., 1:] < reference_mean[..., :-1]).any().item()):
+        if not shift_mode and bool((reference_mean[..., 1:] < reference_mean[..., :-1]).any().item()):
             raise ValueError("reference_mean must be ascending across rank")
         if int(rank_mask.sum().item()) <= 0:
             raise ValueError("rank_mask must select at least one rank element")
         self.reference_mean = reference_mean.contiguous()
+        self.shift_mode = shift_mode
         self.rank_mask = rank_mask.contiguous()
         self.layer_count, self.head_count, _ = reference_mean.shape
         self.tail_tokens = tail_tokens
@@ -798,7 +800,11 @@ class RankElementTopKController:
         sorted_lower, rank_to_position = torch.sort(
             current_lower, dim=-1, stable=True
         )
-        sorted_delta = self.alpha * (reference.unsqueeze(0) - sorted_lower)
+        sorted_delta = (
+            -self.alpha * reference.unsqueeze(0)
+            if self.shift_mode
+            else self.alpha * (reference.unsqueeze(0) - sorted_lower)
+        )
         sorted_delta = torch.where(mask.unsqueeze(0), sorted_delta, 0.0)
         updated_rank_values = sorted_lower + sorted_delta
 
@@ -979,6 +985,19 @@ def patch_llama_rank_element_attention(
         expected_score_dtype=torch.float16,
         intervention_timing=intervention_timing,
     )
+    with patch_llama_rank_element_controller(model, controller) as active:
+        yield active
+
+
+@contextmanager
+def patch_llama_rank_element_controller(model, controller: RankElementTopKController):
+    """Install the same eager raw-score hook for either rank intervention."""
+
+    if transformers.__version__ != SUPPORTED_TRANSFORMERS_VERSION:
+        raise RuntimeError(
+            f"expected Transformers {SUPPORTED_TRANSFORMERS_VERSION}, "
+            f"found {transformers.__version__}"
+        )
     patched = []
     try:
         for layer_index in controller.selected_layers:
