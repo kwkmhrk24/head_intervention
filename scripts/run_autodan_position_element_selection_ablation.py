@@ -72,6 +72,26 @@ from utils.gcg_wasserstein_reference_evaluation import (  # noqa: E402
 
 
 OFFICIAL_FORMAT = "official_fastchat_34062e9"
+
+
+def source_code_provenance() -> dict:
+    """Hash the executed entrypoint and its main evaluation/score dependencies."""
+    entrypoint = Path(__file__).resolve()
+    dependencies = (
+        "scripts/evaluate_gcg_position_element_topk_intervention.py",
+        "utils/gcg_position_element_topk_intervention.py",
+        "utils/gcg_wasserstein_reference.py",
+    )
+    return {
+        "evaluator_source_path": str(entrypoint.relative_to(REPO_ROOT)),
+        "evaluator_source_sha256": sha256_file(entrypoint),
+        "dependency_source_sha256": {
+            relative_path: sha256_file(REPO_ROOT / relative_path)
+            for relative_path in dependencies
+        },
+    }
+
+
 OFFICIAL_BASELINE_DIR = (
     "data/outputs/llama2/autodan/formatting_ablation/"
     "official_fastchat_34062e9_full130_20260914T151610Z"
@@ -464,7 +484,11 @@ def structural_comparison(
         "top500_jaccard": overlaps["500"]["jaccard"],
         "top500_overlap_rate_each_set": overlaps["500"]["overlap_rate_each_set"],
         "all_element_ranking_score_pearson": score_correlation,
-        "all_element_rank_spearman": rank_correlation,
+        "all_element_tiebroken_rank_correlation": rank_correlation,
+        "rank_correlation_definition": (
+            "Pearson correlation of integer ranks after deterministic tie-breaking "
+            "by layer, head, and position for equal ranking scores."
+        ),
         "top500_layer_counts": {
             "GCG": count_by(gcg500, ("layer",)),
             "AutoDAN": count_by(autodan500, ("layer",)),
@@ -734,6 +758,7 @@ def build_selection(args) -> dict:
         "execution_git_status_porcelain": git_value(
             REPO_ROOT, "status", "--porcelain"
         ).splitlines(),
+        **source_code_provenance(),
         "model": str(model_path),
         "model_repository_head": MODEL_REPOSITORY_HEAD,
         "selection": selection_diagnostics(selection),
@@ -1151,6 +1176,7 @@ def evaluate(args) -> dict:
         "execution_git_status_porcelain": git_value(
             REPO_ROOT, "status", "--porcelain"
         ).splitlines(),
+        **source_code_provenance(),
         "model": str(model_path),
         "model_repository_head": MODEL_REPOSITORY_HEAD,
         "model_config": llama_model_config_summary(model),

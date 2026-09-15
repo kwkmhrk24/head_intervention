@@ -1,4 +1,6 @@
+import hashlib
 import unittest
+from pathlib import Path
 
 import torch
 
@@ -10,6 +12,8 @@ from scripts.run_autodan_position_element_selection_ablation import (
     logit_diagnostics,
     parse_args,
     pearson,
+    source_code_provenance,
+    structural_comparison,
     summarize_condition,
 )
 from utils.gcg_position_element_topk_intervention import (
@@ -101,6 +105,52 @@ class AutoDANPositionElementSelectionAblationTests(unittest.TestCase):
     def test_cpu_statistics_are_finite(self):
         self.assertAlmostEqual(pearson([1, 2, 3], [2, 4, 6]), 1.0)
         self.assertEqual(aggregate_scalar([1, 2, 3])["median"], 2.0)
+
+    def test_structural_comparison_labels_tiebroken_rank_correlation(self):
+        ranking = tuple(
+            {
+                "rank": index + 1,
+                "flat_index": index,
+                "ranking_score": float(122880 - index),
+                "mean_delta_sign": 1,
+                "layer": index // 3840,
+                "head": (index // 120) % 32,
+                "position": index % 120,
+                "lag": index % 15 + 1,
+            }
+            for index in range(122880)
+        )
+        masks = {k: torch.ones(1, dtype=torch.bool) for k in (100, 500, 1000)}
+        selection = PositionElementSelection(
+            ranking, masks, torch.zeros(1), (100, 500, 1000)
+        )
+        comparison = structural_comparison(selection, selection)
+        self.assertEqual(comparison["all_element_tiebroken_rank_correlation"], 1.0)
+        self.assertNotIn("all_element_rank_spearman", comparison)
+        self.assertIn("Pearson correlation", comparison["rank_correlation_definition"])
+        self.assertIn("layer, head, and position", comparison["rank_correlation_definition"])
+
+    def test_source_code_provenance_hashes_entrypoint_and_dependencies(self):
+        provenance = source_code_provenance()
+        repo_root = Path(__file__).resolve().parents[1]
+        self.assertEqual(
+            provenance["evaluator_source_path"],
+            "scripts/run_autodan_position_element_selection_ablation.py",
+        )
+        self.assertEqual(
+            provenance["evaluator_source_sha256"],
+            hashlib.sha256(
+                (repo_root / provenance["evaluator_source_path"]).read_bytes()
+            ).hexdigest(),
+        )
+        self.assertIn(
+            "scripts/evaluate_gcg_position_element_topk_intervention.py",
+            provenance["dependency_source_sha256"],
+        )
+        for relative_path, digest in provenance["dependency_source_sha256"].items():
+            self.assertEqual(
+                digest, hashlib.sha256((repo_root / relative_path).read_bytes()).hexdigest()
+            )
 
 
 if __name__ == "__main__":
