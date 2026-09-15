@@ -808,8 +808,6 @@ def extract_prompt_scores(
 ) -> tuple[torch.Tensor, int]:
     """Extract runtime-dtype eager pre-mask S_asym lower values for one prompt."""
 
-    from transformers.models.llama import modeling_llama
-
     from utils.prompt_utils import apply_template
 
     formatted_prompt = apply_template(
@@ -822,8 +820,33 @@ def extract_prompt_scores(
         formatted_prompt,
         return_tensors="pt",
         add_special_tokens=False,
-    ).to(model.device)
-    input_ids = inputs.input_ids
+    )
+    return extract_prompt_scores_from_input_ids(
+        model=model,
+        input_ids=inputs.input_ids,
+        row_position=row_position,
+        dataset_index=dataset_index,
+        tail_tokens=tail_tokens,
+    )
+
+
+def extract_prompt_scores_from_input_ids(
+    *,
+    model,
+    input_ids: torch.Tensor,
+    row_position: int,
+    dataset_index: int,
+    tail_tokens: int = TAIL_TOKENS,
+) -> tuple[torch.Tensor, int]:
+    """Run the established score extraction on preformatted exact input IDs."""
+
+    from transformers.models.llama import modeling_llama
+
+    if not isinstance(input_ids, torch.Tensor) or input_ids.ndim != 2:
+        raise TypeError("input_ids must be a rank-2 torch tensor")
+    if input_ids.shape[0] != 1 or input_ids.dtype != torch.long:
+        raise ValueError("score extraction requires one unpadded torch.long input")
+    input_ids = input_ids.to(model.device)
     sequence_length = int(input_ids.shape[-1])
     if sequence_length < tail_tokens:
         raise ValueError(
