@@ -98,15 +98,28 @@ Run GPU-intensive experiments only when explicitly requested.
 Prefer CPU-only audits and preflight validation before GPU execution.
 Do not proceed if preflight validation fails.
 
-Before GPU execution, verify:
+For explicitly requested GPU experiments, first check within the normal Codex sandbox:
 
 * `nvidia-smi` detects the expected GPU
-* CUDA is available from the current Codex execution environment
+* PyTorch reports `torch.cuda.is_available() == True` and at least one CUDA device
 * target GPU / VRAM / existing GPU processes
 * frozen scientific conditions
 
-If GPU or CUDA is unavailable from the Codex environment, stop and report it.
-Do not silently switch to CPU, another environment, or another execution method.
+If `nvidia-smi` cannot connect to the NVIDIA driver, PyTorch reports CUDA unavailable,
+or the CUDA device count is zero in the normal sandbox, do not yet conclude that GPU
+execution is unavailable. Obtain user approval if required, then recheck without
+`sudo` using Codex execution permissions outside the normal sandbox. Recheck
+`nvidia-smi`, `torch.cuda.is_available()`, `torch.cuda.device_count()`, and the GPU
+name; check VRAM and GPU processes when relevant. If the GPU is available there,
+continue the explicitly requested experiment in that same execution environment.
+Record the change in execution permissions as a runtime adjustment; it does
+not change the scientific conditions.
+
+Never use `sudo` to obtain GPU access. Do not reinstall or change the NVIDIA driver,
+CUDA, or PyTorch to make the GPU visible. Do not silently switch to CPU, another
+machine, another Python environment, or another execution method beyond the
+approved sandbox-exempt run. Do not change the scientific conditions.
+If GPU or CUDA remains unavailable outside the normal sandbox, stop and report it.
 
 Use fail-fast runtime invariants when applicable.
 Record generation failures, NaN/Inf, skipped inputs, unexpected intervention counts,
