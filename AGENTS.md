@@ -132,17 +132,20 @@ Record runtime adjustments even when they do not change the scientific experimen
 
 Treat existing research artifacts as immutable unless explicitly instructed otherwise.
 Do not overwrite prior experiment outputs.
-Do not commit generated outputs, logs, caches, or large artifacts unless requested.
+Do not commit experiment artifacts, generated outputs, logs, caches, or large artifacts.
 Versioned configs, manifests, schemas, and validators may be committed.
 Never commit model weights, secrets, caches, or unintended large files.
 
 ## Git
 
 Do not perform destructive Git operations without explicit instruction.
-Do not force-push, rebase shared history, merge, delete branches/tags,
-or reset published work unless explicitly requested.
-Do not commit or push automatically.
-Commit or push only when explicitly requested.
+Do not merge, delete branches/tags, or reset published work unless explicitly requested.
+Treat pushed history as immutable: never force-push (including force-with-lease),
+amend or rebase pushed commits. Add corrections as new commits.
+When a logical work unit is complete and its required tests and preflight checks pass,
+normally commit the code and tests and push them to the current feature branch.
+Do not mechanically push unverified or incomplete work.
+Do not push routine research implementation directly to `main`.
 After repository changes, report branch, HEAD, and worktree status.
 
 ## Reporting
