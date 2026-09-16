@@ -92,7 +92,8 @@ from scripts.run_autodan_position_element_selection_ablation import (  # noqa: E
 
 
 SEED = 42
-CONDITION_NAME = "proportional_0p1pct"
+DEFAULT_PROPORTIONAL_RATE = 0.001
+ALLOWED_PROPORTIONAL_RATES = (0.001, 0.005)
 ALPHA = 1.0
 LAYER0_INCLUDED = False
 EXPECTED_BASELINE_SUCCESS_COUNT = 53
@@ -113,21 +114,25 @@ SOURCE_PATHS = (
 )
 
 
-def fixed_selection() -> dict:
-    matches = [
-        row for row in stage2_selection_conditions() if row["name"] == CONDITION_NAME
-    ]
+def fixed_selection(rate: float = DEFAULT_PROPORTIONAL_RATE) -> dict:
+    if rate not in ALLOWED_PROPORTIONAL_RATES:
+        raise ValueError("proportional rate must be 0.001 or 0.005")
+    name = f"proportional_{rate * 100:.1f}pct".replace(".", "p")
     expected = {
-        "name": CONDITION_NAME,
+        "name": name,
         "family": "proportional_top_n",
         "top_n": None,
-        "rate": 0.001,
-        "rate_numerator": 1,
+        "rate": rate,
+        "rate_numerator": int(rate * 1000),
         "tau": None,
     }
-    if len(matches) != 1 or matches[0] != expected:
-        raise RuntimeError("frozen independent100 selection condition drifted")
-    return matches[0]
+    if rate == DEFAULT_PROPORTIONAL_RATE:
+        matches = [
+            row for row in stage2_selection_conditions() if row["name"] == name
+        ]
+        if len(matches) != 1 or matches[0] != expected:
+            raise RuntimeError("frozen independent100 selection condition drifted")
+    return expected
 
 
 def parse_args(argv=None):
@@ -136,6 +141,12 @@ def parse_args(argv=None):
     parser.add_argument("--dataset", choices=("independent100", "autodan130"), default="independent100")
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--reference", default=DEFAULT_REFERENCE)
+    parser.add_argument(
+        "--proportional-rate",
+        type=float,
+        choices=ALLOWED_PROPORTIONAL_RATES,
+        default=DEFAULT_PROPORTIONAL_RATE,
+    )
     parser.add_argument(
         "--component",
         choices=("antisymmetric", "symmetric"),
@@ -337,6 +348,7 @@ def validate_frozen_inputs(args) -> tuple[dict, list[dict]]:
 
 def summarize(rows: list[dict], baseline: list[dict]) -> dict:
     counts = [int(row["selected_count"]) for row in rows]
+    nominal_counts = [int(row["nominal_selected_count"]) for row in rows]
     fractions = [float(row["selected_fraction"]) for row in rows]
     return {
         "prompt_count": len(rows),
@@ -347,6 +359,7 @@ def summarize(rows: list[dict], baseline: list[dict]) -> dict:
         "improvement_count": sum(row["transition"] == "newly_defended" for row in rows),
         "worsening_count": sum(row["transition"] == "newly_worsened" for row in rows),
         "response_changed_count": sum(not row["response_equal"] for row in rows),
+        "nominal_selected_count_mean": statistics.fmean(nominal_counts),
         "selected_count_mean": statistics.fmean(counts),
         "selected_fraction_mean": statistics.fmean(fractions),
         "cap_activated_prompt_count": sum(bool(row["cap_activated"]) for row in rows),
@@ -388,7 +401,7 @@ def run(args, output_dir: Path, provenance: dict, baseline: list[dict]) -> dict:
         if len(records) != 110:
             raise ValueError("AutoDAN evaluation110 formatted record count mismatch")
     baseline_by_index = {int(row["dataset_index"]): row for row in baseline}
-    selection = fixed_selection()
+    selection = fixed_selection(args.proportional_rate)
     rows = []
     for position, record in enumerate(records, 1):
         base = baseline_by_index[int(record["dataset_index"])]
@@ -468,6 +481,7 @@ def run(args, output_dir: Path, provenance: dict, baseline: list[dict]) -> dict:
                 **{key: value for key, value in generated.items() if key != "first_logits"},
                 **comparison,
                 "transition": classify_transition(bool(base["success"]), bool(generated["success"])),
+                "nominal_selected_count": plan["requested_or_threshold_eligible_count"],
                 "selected_count": plan["selected_count"],
                 "selected_fraction": plan["selected_fraction"],
                 "cap_count": plan["cap_count"],
@@ -552,7 +566,7 @@ def main(argv=None):
     baseline = restrict_autodan_baseline(args, baseline)
     payload = {
         "status": "cpu_preflight_passed",
-        "selection": fixed_selection(),
+        "selection": fixed_selection(args.proportional_rate),
         "component": args.component,
         "alpha": ALPHA,
         "layer0_included": LAYER0_INCLUDED,

@@ -1,5 +1,7 @@
 import unittest
 
+import torch
+
 from scripts.diagnose_dynamic_asym_score_logit_propagation import (
     evenly_spaced_by_length,
 )
@@ -11,6 +13,7 @@ from scripts.evaluate_gcg_dynamic_asym_independent100 import (
     summarize,
     validate_request,
 )
+from utils.gcg_dynamic_asym_stage2 import build_stage2_selection_plan
 
 
 class Independent100DynamicAsymTest(unittest.TestCase):
@@ -23,6 +26,19 @@ class Independent100DynamicAsymTest(unittest.TestCase):
                 "top_n": None,
                 "rate": 0.001,
                 "rate_numerator": 1,
+                "tau": None,
+            },
+        )
+
+    def test_proportional_half_percent_condition(self):
+        self.assertEqual(
+            fixed_selection(0.005),
+            {
+                "name": "proportional_0p5pct",
+                "family": "proportional_top_n",
+                "top_n": None,
+                "rate": 0.005,
+                "rate_numerator": 5,
                 "tau": None,
             },
         )
@@ -40,6 +56,25 @@ class Independent100DynamicAsymTest(unittest.TestCase):
         args = parse_args(["--component", "symmetric"])
         self.assertEqual(args.component, "symmetric")
 
+    def test_half_percent_rate_cli(self):
+        args = parse_args(["--proportional-rate", "0.005"])
+        self.assertEqual(args.proportional_rate, 0.005)
+
+    def test_half_percent_uses_layer0_excluded_candidates_and_full_cap(self):
+        plan = build_stage2_selection_plan(
+            torch.arange(4000, dtype=torch.float32),
+            selection=fixed_selection(0.005),
+            layer_count=4,
+            head_count=2,
+            elements_per_head=500,
+            layer0_included=False,
+        )
+        self.assertEqual(plan["eligible_candidate_count"], 3000)
+        self.assertEqual(plan["requested_or_threshold_eligible_count"], 15)
+        self.assertEqual(plan["cap_count"], 20)
+        self.assertEqual(plan["selected_count"], 15)
+        self.assertFalse(plan["cap_activated"])
+
     def test_frozen_autodan_evaluation110_partition(self):
         indices = autodan_evaluation_indices()
         self.assertEqual(len(indices), 110)
@@ -54,6 +89,7 @@ class Independent100DynamicAsymTest(unittest.TestCase):
                 "success": False,
                 "transition": "newly_defended",
                 "response_equal": False,
+                "nominal_selected_count": 10,
                 "selected_count": 10,
                 "selected_fraction": 0.001,
                 "cap_count": 50,
@@ -64,6 +100,7 @@ class Independent100DynamicAsymTest(unittest.TestCase):
                 "success": True,
                 "transition": "newly_worsened",
                 "response_equal": True,
+                "nominal_selected_count": 20,
                 "selected_count": 20,
                 "selected_fraction": 0.001,
                 "cap_count": 100,
@@ -77,6 +114,7 @@ class Independent100DynamicAsymTest(unittest.TestCase):
         self.assertEqual(summary["improvement_count"], 1)
         self.assertEqual(summary["worsening_count"], 1)
         self.assertEqual(summary["response_changed_count"], 1)
+        self.assertEqual(summary["nominal_selected_count_mean"], 15.0)
         self.assertEqual(summary["selected_count_mean"], 15.0)
         self.assertEqual(summary["cap_violation_count"], 0)
         self.assertEqual(summary["decode_intervention_count"], 0)
