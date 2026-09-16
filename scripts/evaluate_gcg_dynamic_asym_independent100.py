@@ -28,10 +28,24 @@ from scripts.evaluate_gcg_first_token_reference_ablation import (  # noqa: E402
     load_model_and_tokenizer,
 )
 from scripts.evaluate_gcg_position_element_topk_intervention import (  # noqa: E402
+    AUTODAN_OFFICIAL_REPOSITORY_COMMIT,
+    DEFAULT_AUTODAN_INPUT,
     DEFAULT_INDEPENDENT_ADAPTER,
     DEFAULT_INDEPENDENT_CONFIG,
     DEFAULT_INDEPENDENT_INPUT_MANIFEST,
+    format_autodan_records,
+    load_autodan_transfer_records,
     serialized_input_ids,
+)
+from scripts.evaluate_gcg_pure_symmetric_autodan_transfer import (  # noqa: E402
+    BASELINE_SUCCESS_COUNT as AUTODAN_BASELINE_SUCCESS_COUNT,
+    DEFAULT_OFFICIAL_BASELINE_DIR,
+    EXPECTED_OFFICIAL_BASELINE_HASHES,
+    MODEL_REPOSITORY_HEAD,
+    OFFICIAL_FORMAT,
+    normalize_canonical_baseline_rows,
+    verify_artifact_manifest,
+    verify_fixed_hashes,
 )
 from scripts.evaluate_gcg_symmetric_position_element_topk_intervention import (  # noqa: E402
     DEFAULT_ATTACK_RUN,
@@ -80,6 +94,8 @@ LAYER0_INCLUDED = False
 EXPECTED_BASELINE_SUCCESS_COUNT = 53
 SOURCE_PATHS = (
     "scripts/evaluate_gcg_dynamic_asym_independent100.py",
+    "scripts/evaluate_gcg_pure_symmetric_autodan_transfer.py",
+    "scripts/evaluate_gcg_position_element_topk_intervention.py",
     "utils/gcg_dynamic_asym_stage2.py",
     "utils/gcg_dynamic_asym_stage1.py",
     "utils/gcg_dynamic_asym_intervention.py",
@@ -106,6 +122,7 @@ def fixed_selection() -> dict:
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stage", choices=("cpu-preflight", "run"), default="cpu-preflight")
+    parser.add_argument("--dataset", choices=("independent100", "autodan130"), default="independent100")
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--reference", default=DEFAULT_REFERENCE)
     parser.add_argument("--independent-config", default=DEFAULT_INDEPENDENT_CONFIG)
@@ -113,6 +130,8 @@ def parse_args(argv=None):
     parser.add_argument("--independent-attack-run-dir", default=DEFAULT_ATTACK_RUN)
     parser.add_argument("--independent-adapter", default=DEFAULT_INDEPENDENT_ADAPTER)
     parser.add_argument("--reused-baseline", default=DEFAULT_REUSED_BASELINE)
+    parser.add_argument("--autodan-input", default=DEFAULT_AUTODAN_INPUT)
+    parser.add_argument("--official-baseline-dir", default=DEFAULT_OFFICIAL_BASELINE_DIR)
     parser.add_argument("--output-dir")
     parser.add_argument("--sandbox-exempt-gpu", action="store_true")
     return parser.parse_args(argv)
@@ -132,6 +151,41 @@ def validate_frozen_inputs(args) -> tuple[dict, list[dict]]:
     reference_path, _ = validate_and_load_reference(args.reference)
     if sha256_file(reference_path) != EXPECTED_REFERENCE_SHA256:
         raise ValueError("reference SHA-256 mismatch")
+    if args.dataset == "autodan130":
+        raw_records, raw_provenance = load_autodan_transfer_records(
+            Path(args.autodan_input)
+        )
+        baseline_dir = Path(args.official_baseline_dir).resolve()
+        baseline_hashes = verify_fixed_hashes(
+            baseline_dir, EXPECTED_OFFICIAL_BASELINE_HASHES
+        )
+        verify_artifact_manifest(baseline_dir)
+        manifest = read_json(baseline_dir / "run_manifest.json")
+        summary = read_json(baseline_dir / "summary.json")
+        if (
+            manifest.get("status") != "complete"
+            or manifest.get("autodan_repository_commit")
+            != AUTODAN_OFFICIAL_REPOSITORY_COMMIT
+            or manifest.get("model_repository_head") != MODEL_REPOSITORY_HEAD
+            or manifest.get("index_10_unreplaced_placeholder_retained") is not True
+            or summary.get("condition_b_success_count")
+            != AUTODAN_BASELINE_SUCCESS_COUNT
+            or summary.get("generation_failure_count") != 0
+        ):
+            raise ValueError("official AutoDAN baseline conditions mismatch")
+        baseline = normalize_canonical_baseline_rows(
+            read_jsonl(baseline_dir / "paired_results.jsonl"), raw_records
+        )
+        return {
+            "reference": str(reference_path),
+            "reference_sha256": EXPECTED_REFERENCE_SHA256,
+            "dataset": "autodan130_official_format",
+            "raw_provenance": raw_provenance,
+            "official_format": OFFICIAL_FORMAT,
+            "official_baseline_dir": str(baseline_dir),
+            "official_baseline_hashes": baseline_hashes,
+        }, baseline
+
     config_path = Path(args.independent_config).resolve()
     manifest_path = Path(args.independent_input_manifest).resolve()
     attack_run = Path(args.independent_attack_run_dir).resolve()
@@ -212,21 +266,33 @@ def run(args, output_dir: Path, provenance: dict, baseline: list[dict]) -> dict:
     seed_everything(SEED)
     model, tokenizer = load_model_and_tokenizer(Path(args.model).resolve())
     _, reference = validate_and_load_reference(args.reference)
-    records = load_independent_evaluation_records(
-        config_path=args.independent_config,
-        input_manifest_path=args.independent_input_manifest,
-        attack_run_dir=args.independent_attack_run_dir,
-        adapter_path=args.independent_adapter,
-    )
-    records = format_records(records, tokenizer)
-    validate_formatted_evaluation_identity(records)
+    if args.dataset == "autodan130":
+        raw_records, _ = load_autodan_transfer_records(Path(args.autodan_input))
+        records = format_autodan_records(
+            raw_records, tokenizer, prompt_format=OFFICIAL_FORMAT
+        )
+    else:
+        records = load_independent_evaluation_records(
+            config_path=args.independent_config,
+            input_manifest_path=args.independent_input_manifest,
+            attack_run_dir=args.independent_attack_run_dir,
+            adapter_path=args.independent_adapter,
+        )
+        records = format_records(records, tokenizer)
+        validate_formatted_evaluation_identity(records)
     baseline_by_index = {int(row["dataset_index"]): row for row in baseline}
     selection = fixed_selection()
     rows = []
     for position, record in enumerate(records, 1):
         base = baseline_by_index[int(record["dataset_index"])]
-        if serialized_input_ids(record["input_ids"]) != base["input_ids"]:
-            raise RuntimeError("independent100 input IDs differ from reused baseline")
+        if (
+            serialized_input_ids(record["input_ids"]) != base["input_ids"]
+            or (
+                args.dataset == "autodan130"
+                and record["formatted_prompt"] != base["formatted_prompt"]
+            )
+        ):
+            raise RuntimeError(f"{args.dataset} input differs from reused baseline")
         with patch_llama_abs_z_collection(
             model, layer_count=NUM_LAYERS, head_count=NUM_HEADS
         ) as collector:
@@ -298,11 +364,11 @@ def run(args, output_dir: Path, provenance: dict, baseline: list[dict]) -> dict:
                 "diagnostics": diagnostics,
             }
         )
-        print(f"[independent100 {position}/100] index={record['dataset_index']} success={generated['success']} selected={plan['selected_count']}", flush=True)
+        print(f"[{args.dataset} {position}/{len(records)}] index={record['dataset_index']} success={generated['success']} selected={plan['selected_count']}", flush=True)
 
     summary = {
         "schema_version": 1,
-        "experiment_role": "final_independent100_evaluation",
+        "experiment_role": f"fixed_gcg_method_{args.dataset}_evaluation",
         "selection": selection,
         "alpha": ALPHA,
         "layer0_included": LAYER0_INCLUDED,
@@ -325,6 +391,7 @@ def run(args, output_dir: Path, provenance: dict, baseline: list[dict]) -> dict:
         "dirty_status": git_value(REPO_ROOT, "status", "--porcelain").splitlines(),
         "sandbox_exempt_gpu": args.sandbox_exempt_gpu,
         "scientific_conditions": {
+            "dataset": args.dataset,
             "selection": selection,
             "alpha": ALPHA,
             "layer0_included": LAYER0_INCLUDED,
@@ -333,7 +400,8 @@ def run(args, output_dir: Path, provenance: dict, baseline: list[dict]) -> dict:
             "timing": "first_prefill_only",
             "cap_rate": 0.005,
             "development68_used": False,
-            "autodan_used": False,
+            "independent100_used": args.dataset == "independent100",
+            "autodan_used": args.dataset == "autodan130",
         },
         "provenance": provenance,
         "source_code_sha256": {path: sha256_file(REPO_ROOT / path) for path in SOURCE_PATHS},
@@ -372,11 +440,13 @@ def main(argv=None):
         "alpha": ALPHA,
         "layer0_included": LAYER0_INCLUDED,
         "cap_rate": 0.005,
-        "independent100_count": len(baseline),
-        "baseline_successful_count": EXPECTED_BASELINE_SUCCESS_COUNT,
+        "dataset": args.dataset,
+        "prompt_count": len(baseline),
+        "baseline_successful_count": sum(bool(row["success"]) for row in baseline),
         "reference_sha256": provenance["reference_sha256"],
         "development68_used": False,
-        "autodan_used": False,
+        "independent100_used": args.dataset == "independent100",
+        "autodan_used": args.dataset == "autodan130",
     }
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     if args.stage == "cpu-preflight":

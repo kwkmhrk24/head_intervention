@@ -27,6 +27,10 @@ class Independent100DynamicAsymTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "output-dir"):
             validate_request(args)
 
+    def test_autodan_dataset_cli(self):
+        args = parse_args(["--dataset", "autodan130"])
+        self.assertEqual(args.dataset, "autodan130")
+
     def test_minimal_summary(self):
         baseline = [{"success": True}, {"success": False}]
         rows = [
