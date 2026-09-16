@@ -3,7 +3,15 @@ import unittest
 
 import torch
 
-from scripts.prepare_gcg_dynamic_asym_reference import parse_args, validate_request
+from scripts.prepare_gcg_dynamic_asym_reference import (
+    REPO_ROOT,
+    SOURCE_CODE_PATHS,
+    parse_args,
+    runtime_provenance,
+    validate_request,
+)
+from utils.artifact_io import sha256_file
+from utils.experiment_runtime import git_state, git_value
 from utils.gcg_dynamic_asym_intervention import (
     NUMERICAL_SIGMA_FLOOR,
     DynamicAsymmetryReference,
@@ -242,6 +250,24 @@ class ReferenceEntrypointTests(unittest.TestCase):
         args = parse_args(["--stage", "build-reference"])
         with self.assertRaisesRegex(ValueError, "output-dir"):
             validate_request(args)
+
+    def test_runtime_provenance_records_git_state_and_required_source_hashes(self):
+        provenance = runtime_provenance()
+        expected_head, expected_branch = git_state(REPO_ROOT)
+        self.assertEqual(provenance["git_head"], expected_head)
+        self.assertEqual(provenance["git_branch"], expected_branch)
+        self.assertEqual(
+            provenance["dirty_status"],
+            git_value(REPO_ROOT, "status", "--porcelain").splitlines(),
+        )
+        self.assertEqual(
+            tuple(provenance["source_code_sha256"]), SOURCE_CODE_PATHS
+        )
+        for relative_path in SOURCE_CODE_PATHS:
+            self.assertEqual(
+                provenance["source_code_sha256"][relative_path],
+                sha256_file(REPO_ROOT / relative_path),
+            )
 
 
 class TinyLlamaIntegrationTests(unittest.TestCase):

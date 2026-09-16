@@ -26,7 +26,7 @@ from utils.artifact_io import (  # noqa: E402
     utc_now,
     write_json,
 )
-from utils.experiment_runtime import git_state  # noqa: E402
+from utils.experiment_runtime import git_state, git_value  # noqa: E402
 from utils.gcg_dynamic_asym_intervention import (  # noqa: E402
     REFERENCE_SCHEMA_VERSION,
     compute_equal_prompt_reference_statistics,
@@ -55,6 +55,11 @@ MANIFEST_FILE = "reference_manifest.json"
 SCORE_CAPTURE_POSITION = (
     "post-RoPE, after repeat_kv, immediately after QK^T/sqrt(head_dim), "
     "pre-mask, pre-softmax"
+)
+SOURCE_CODE_PATHS = (
+    "scripts/prepare_gcg_dynamic_asym_reference.py",
+    "utils/gcg_dynamic_asym_intervention.py",
+    "utils/reference_asym_score_intervention.py",
 )
 
 
@@ -195,6 +200,22 @@ def preflight_summary(records, selection_manifest, args) -> dict:
     }
 
 
+def runtime_provenance(repo_root: str | Path = REPO_ROOT) -> dict:
+    """Capture Git state and exact source bytes used by a reference run."""
+
+    repo_root = Path(repo_root).resolve()
+    git_head, git_branch = git_state(repo_root)
+    return {
+        "git_head": git_head,
+        "git_branch": git_branch,
+        "dirty_status": git_value(repo_root, "status", "--porcelain").splitlines(),
+        "source_code_sha256": {
+            relative_path: sha256_file(repo_root / relative_path)
+            for relative_path in SOURCE_CODE_PATHS
+        },
+    }
+
+
 def main(argv=None):
     args = parse_args(argv)
     output_dir = validate_request(args)
@@ -208,6 +229,7 @@ def main(argv=None):
         print("CPU provenance preflight complete; no files created.")
         return
 
+    provenance = runtime_provenance()
     model, tokenizer = load_eager_model(args.model)
     model_summary = llama_model_config_summary(model)
     prompt_means, prompt_mean_squares, prompt_records = collect_reference_moments(
@@ -217,7 +239,6 @@ def main(argv=None):
         prompt_means,
         prompt_mean_squares,
     )
-    git_head, git_branch = git_state(REPO_ROOT)
     metadata = {
         "reference_condition": "selection20_original_only",
         "prompt_weighting": "equal_weight_per_prompt",
@@ -249,8 +270,8 @@ def main(argv=None):
         "selection_row_positions": selection_manifest["selection_row_positions"],
         "selection_dataset_indices": selection_manifest["selection_dataset_indices"],
         "jailbreak_reference_data_used": False,
-        "git_head": git_head,
-        "git_branch": git_branch,
+        "git_head": provenance["git_head"],
+        "git_branch": provenance["git_branch"],
         "created_at": utc_now(),
     }
     payload = {
@@ -275,8 +296,10 @@ def main(argv=None):
         **summary,
         "schema_version": REFERENCE_SCHEMA_VERSION,
         "created_at": metadata["created_at"],
-        "git_head": git_head,
-        "git_branch": git_branch,
+        "git_head": provenance["git_head"],
+        "git_branch": provenance["git_branch"],
+        "dirty_status": provenance["dirty_status"],
+        "source_code_sha256": provenance["source_code_sha256"],
         "model_path": metadata["model_path"],
         "model_config": model_summary,
         "reference_file": REFERENCE_FILE,
