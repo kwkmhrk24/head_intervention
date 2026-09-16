@@ -96,8 +96,10 @@ METRICS = (
 )
 RELATIONS = (
     ("baseline_margin", "max_absolute_logit_difference"),
+    ("baseline_margin", "logit_l2"),
     ("baseline_margin", "boundary_progress"),
     ("selected_score_change_l2", "logit_l2"),
+    ("selected_score_change_l2", "max_absolute_logit_difference"),
 )
 BOOTSTRAP_REPLICATES = 2000
 BOOTSTRAP_SEED = 42
@@ -233,6 +235,8 @@ def preflight(args) -> dict:
         raise ValueError("GCG saved ASR mismatch")
     if sum(row["success"] for row in ab) != 29 or sum(row["success"] for row in ad) != 29:
         raise ValueError("AutoDAN saved ASR mismatch")
+    if any(row["generation_failed"] for row in gb + gd + ab + ad):
+        raise ValueError("frozen source contains a generation failure")
     if sum(not row["first_token_argmax_equal"] for row in gd) != 23:
         raise ValueError("GCG argmax transition mismatch")
     if sum(not row["logit_diagnostics"]["argmax_equal"] for row in ad) != 0:

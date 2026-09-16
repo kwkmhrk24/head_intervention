@@ -3,6 +3,7 @@ import unittest
 import torch
 
 from scripts.diagnose_gcg_autodan_logit_propagation import (
+    RELATIONS,
     classify_direction,
     decision_metrics,
     distribution,
@@ -11,6 +12,18 @@ from scripts.diagnose_gcg_autodan_logit_propagation import (
 
 
 class LogitPropagationDiagnosticsTests(unittest.TestCase):
+    def test_all_requested_metric_relations_are_frozen(self):
+        self.assertEqual(
+            RELATIONS,
+            (
+                ("baseline_margin", "max_absolute_logit_difference"),
+                ("baseline_margin", "logit_l2"),
+                ("baseline_margin", "boundary_progress"),
+                ("selected_score_change_l2", "logit_l2"),
+                ("selected_score_change_l2", "max_absolute_logit_difference"),
+            ),
+        )
+
     def test_boundary_progress_uses_strongest_post_intervention_competitor(self):
         baseline = torch.tensor([3.0, 2.0, 0.0])
         intervention = torch.tensor([2.5, 2.6, 0.0])
