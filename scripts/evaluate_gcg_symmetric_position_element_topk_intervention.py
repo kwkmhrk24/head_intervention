@@ -38,7 +38,7 @@ from utils.experiment_runtime import git_value, seed_everything  # noqa: E402
 from utils.gcg_position_element_topk_intervention import (  # noqa: E402
     SYMMETRIC_RANKING_METRIC,
     build_position_element_selection,
-    patch_llama_symmetric_position_element_attention,
+    patch_llama_symmetric_lower_only_2delta_position_element_attention,
     selection_diagnostics,
 )
 from utils.gcg_reference_intervention_diagnostics import compare_token_sequences  # noqa: E402
@@ -83,6 +83,7 @@ K = 500
 ALPHA = 1.0
 INTERVENTION_TIMING = "first_token_only"
 COMPONENT = "symmetric"
+INTERVENTION_VARIANT = "sym_lower_only_2delta"
 DECOMPOSITION = "(S + S^T) / 2"
 RAW_SCORE_INTERVENTION = (
     "S_ij' = S_ij + 2*alpha*(reference_sym_ij-current_sym_ij), "
@@ -109,6 +110,7 @@ EXPECTED_ASYM_RESULTS_SHA256 = (
 
 REQUIRED_RUNTIME_INVARIANTS = {
     "component": COMPONENT,
+    "intervention_variant": INTERVENTION_VARIANT,
     "first_forward_detected": True,
     "first_forward_intervened": True,
     "later_forward_intervention_count": 0,
@@ -332,6 +334,7 @@ def cpu_validation_payload(args) -> dict:
         "gpu_used": False,
         "artifacts_written": False,
         "component": COMPONENT,
+        "intervention_variant": INTERVENTION_VARIANT,
         "decomposition": DECOMPOSITION,
         "candidate_definition": "32 layers x 32 heads x tail16 strict lower i>j (120/head)",
         "candidate_count": frozen["candidate_count"],
@@ -369,7 +372,7 @@ def finish_cuda_measurement(started_at: float) -> dict:
 def run_condition(records, baseline_by_index, *, model, tokenizer, selection):
     rows = []
     diagnostics_rows = []
-    with patch_llama_symmetric_position_element_attention(
+    with patch_llama_symmetric_lower_only_2delta_position_element_attention(
         model,
         selection=selection,
         k=K,
@@ -414,6 +417,7 @@ def run_condition(records, baseline_by_index, *, model, tokenizer, selection):
                     "input_ids": ids,
                     "input_ids_match_reused_baseline": True,
                     "component": COMPONENT,
+                    "intervention_variant": INTERVENTION_VARIANT,
                     "k": K,
                     "alpha": ALPHA,
                     "intervention_timing": INTERVENTION_TIMING,
@@ -439,6 +443,7 @@ def run_condition(records, baseline_by_index, *, model, tokenizer, selection):
     summary = {
         "dataset_group": "independent100",
         "component": COMPONENT,
+        "intervention_variant": INTERVENTION_VARIANT,
         "k": K,
         "alpha": ALPHA,
         "prompt_count": len(rows),
@@ -567,6 +572,7 @@ def run_gpu(args) -> dict:
     artifact_paths = []
     score_metadata = {
         "component": COMPONENT,
+        "intervention_variant": INTERVENTION_VARIANT,
         "decomposition": DECOMPOSITION,
         "score_capture_position": (
             "post-RoPE, after repeat_kv, immediately after QK^T/sqrt(head_dim), "
@@ -758,7 +764,7 @@ def run_gpu(args) -> dict:
             "first_token_argmax_changed_count": 23,
             "source_sha256": EXPECTED_ASYM_RESULTS_SHA256,
         },
-        "symmetric_top500": summary,
+        "sym_lower_only_2delta": summary,
         "structural_comparison": comparison,
     }
     write_json(evaluation_path, result)

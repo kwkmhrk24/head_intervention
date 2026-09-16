@@ -9,7 +9,7 @@ from scripts.evaluate_gcg_symmetric_position_element_topk_intervention import (
 )
 from utils.gcg_position_element_topk_intervention import (
     SYMMETRIC_RANKING_METRIC,
-    SymmetricPositionElementTopKController,
+    SymmetricLowerOnly2DeltaPositionElementTopKController,
     build_position_element_selection,
 )
 from utils.gcg_wasserstein_reference import (
@@ -80,7 +80,7 @@ class SymmetricInterventionTests(unittest.TestCase):
         reference[0, 3, 119] = -1.0
         mask[0, 1, 5] = True
         mask[0, 3, 119] = True
-        self.controller = SymmetricPositionElementTopKController(
+        self.controller = SymmetricLowerOnly2DeltaPositionElementTopKController(
             reference_mean=reference,
             element_mask=mask,
             alpha=1.0,
@@ -106,6 +106,7 @@ class SymmetricInterventionTests(unittest.TestCase):
             observed = (result[0, head, row, col] + result[0, head, col, row]) / 2
             torch.testing.assert_close(observed, torch.tensor(target), atol=3e-7, rtol=0)
         summary = self.controller.summary()
+        self.assertEqual(summary["intervention_variant"], "sym_lower_only_2delta")
         self.assertEqual(summary["max_upper_triangle_change"], 0.0)
         self.assertEqual(summary["max_diagonal_change_float32"], 0.0)
         self.assertEqual(summary["max_unselected_element_change"], 0.0)
@@ -138,6 +139,7 @@ class SymmetricInterventionTests(unittest.TestCase):
     def test_runtime_validation(self):
         diagnostics = {
             "component": "symmetric",
+            "intervention_variant": "sym_lower_only_2delta",
             "selected_element_intervention_count": 500,
             "selected_lower_changed_count": 500,
             "first_forward_detected": True,
