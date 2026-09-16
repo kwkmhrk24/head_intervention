@@ -425,6 +425,7 @@ class DynamicAsymmetryController:
         tau: float,
         alpha: float = 1.0,
         expected_score_dtype: torch.dtype | None = None,
+        capture_score_change_metrics: bool = False,
     ):
         if not isinstance(mu, torch.Tensor) or not isinstance(sigma, torch.Tensor):
             raise TypeError("mu and sigma must be torch tensors")
@@ -442,6 +443,9 @@ class DynamicAsymmetryController:
         self.tau = validate_tau(tau)
         self.alpha = validate_alpha(alpha)
         self.expected_score_dtype = expected_score_dtype
+        if type(capture_score_change_metrics) is not bool:
+            raise TypeError("capture_score_change_metrics must be bool")
+        self.capture_score_change_metrics = capture_score_change_metrics
         self.layer_count, self.head_count = mu.shape
         self._reference_cache: dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor]] = {}
         self._tril_cache: dict[tuple[int, str], torch.Tensor] = {}
@@ -462,6 +466,9 @@ class DynamicAsymmetryController:
         self.later_forward_skip_count = 0
         self._prefill_layers_seen: set[int] = set()
         self._records: list[dict] = []
+        self._selected_score_change_abs_sum = 0.0
+        self._selected_score_change_sq_sum = 0.0
+        self._selected_score_change_max_abs = 0.0
 
     def set_prompt_context(self, *, prompt_length: int) -> None:
         if self.attention_forward_call_count or self.intervention_call_count:
@@ -646,6 +653,15 @@ class DynamicAsymmetryController:
 
         realized = modified.float()
         realized64 = realized.to(torch.float64)
+        if self.capture_score_change_metrics and selected_count:
+            score_delta = (
+                realized[:, :, rows, cols] - original[:, :, rows, cols]
+            ).masked_select(selected).to(torch.float64)
+            self._selected_score_change_abs_sum += float(score_delta.abs().sum())
+            self._selected_score_change_sq_sum += float((score_delta * score_delta).sum())
+            self._selected_score_change_max_abs = max(
+                self._selected_score_change_max_abs, float(score_delta.abs().max())
+            )
         realized_sym64 = (realized64 + realized64.transpose(-1, -2)) / 2.0
         realized_asym = (realized - realized.transpose(-1, -2)) / 2.0
         realized_lower = realized_asym[:, :, rows, cols]
@@ -718,6 +734,20 @@ class DynamicAsymmetryController:
         def maximum(key: str) -> float:
             return max((float(row[key]) for row in self._records), default=0.0)
 
+        captured_count = self.selected_element_intervention_count
+        score_metrics = None
+        if self.capture_score_change_metrics:
+            if captured_count <= 0 or self._selected_score_change_sq_sum <= 0.0:
+                raise ReferenceInterventionRuntimeError(
+                    "captured selected score changes are empty"
+                )
+            score_metrics = {
+                "count": captured_count,
+                "mean_absolute": self._selected_score_change_abs_sum / captured_count,
+                "rms": math.sqrt(self._selected_score_change_sq_sum / captured_count),
+                "l2": math.sqrt(self._selected_score_change_sq_sum),
+                "max_absolute": self._selected_score_change_max_abs,
+            }
         return {
             "component": "antisymmetric",
             "intervention_variant": "dynamic_full_prompt_zscore_pure_asym",
@@ -788,6 +818,7 @@ class DynamicAsymmetryController:
                 "max_selected_distance_to_mu_after_cast"
             ),
             "all_scores_finite": True,
+            "selected_raw_score_change": score_metrics,
         }
 
 

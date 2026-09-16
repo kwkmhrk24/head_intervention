@@ -1,5 +1,9 @@
 import unittest
 
+from scripts.diagnose_dynamic_asym_score_logit_propagation import (
+    evenly_spaced_by_length,
+)
+
 from scripts.evaluate_gcg_dynamic_asym_independent100 import (
     fixed_selection,
     parse_args,
@@ -64,6 +68,14 @@ class Independent100DynamicAsymTest(unittest.TestCase):
         self.assertEqual(summary["selected_count_mean"], 15.0)
         self.assertEqual(summary["cap_violation_count"], 0)
         self.assertEqual(summary["decode_intervention_count"], 0)
+
+    def test_diagnostic_sample_spans_length_order(self):
+        rows = [
+            {"dataset_index": index, "prompt_length": length}
+            for index, length in enumerate((40, 10, 30, 20, 50))
+        ]
+        selected = evenly_spaced_by_length(rows, 3)
+        self.assertEqual([row["prompt_length"] for row in selected], [10, 30, 50])
 
 
 if __name__ == "__main__":

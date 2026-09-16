@@ -196,6 +196,24 @@ class Stage2ControllerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Layer 0"):
             controller.set_prompt_plan(prompt_length=4, plan=bad_plan)
 
+    def test_optional_selected_raw_score_change_metrics(self):
+        controller = Stage2PlannedDynamicAsymmetryController(
+            reference=self.reference,
+            selection=self.selection,
+            alpha=0.5,
+            layer0_included=False,
+            capture_score_change_metrics=True,
+        )
+        controller.set_prompt_plan(prompt_length=4, plan=self._plan())
+        controller.apply(0, antisymmetric_scores(4, 2.0, heads=2))
+        controller.apply(1, antisymmetric_scores(4, 2.0, heads=2))
+        metrics = controller.summary()["selected_raw_score_change"]
+        self.assertEqual(metrics["count"], 1)
+        self.assertEqual(metrics["mean_absolute"], 1.0)
+        self.assertEqual(metrics["rms"], 1.0)
+        self.assertEqual(metrics["l2"], 1.0)
+        self.assertEqual(metrics["max_absolute"], 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()
