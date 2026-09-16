@@ -167,6 +167,7 @@ class Stage2PlannedDynamicAsymmetryController(PlannedDynamicAsymmetryController)
         layer0_included: bool,
         expected_score_dtype: torch.dtype | None = None,
         capture_score_change_metrics: bool = False,
+        component: str = "antisymmetric",
     ):
         if float(alpha) not in (0.5, 1.0):
             raise ValueError("Stage 2 alpha must be exactly 0.5 or 1.0")
@@ -182,6 +183,7 @@ class Stage2PlannedDynamicAsymmetryController(PlannedDynamicAsymmetryController)
             alpha=float(alpha),
             expected_score_dtype=expected_score_dtype,
             capture_score_change_metrics=capture_score_change_metrics,
+            component=component,
         )
 
     def set_prompt_plan(self, *, prompt_length: int, plan: Mapping[str, object]) -> None:
@@ -197,7 +199,11 @@ class Stage2PlannedDynamicAsymmetryController(PlannedDynamicAsymmetryController)
             raise ReferenceInterventionRuntimeError("Stage 2 selection plan is missing")
         summary.update(
             {
-                "intervention_variant": "dynamic_full_prompt_stage2_planned_pure_asym",
+                "intervention_variant": (
+                    "dynamic_full_prompt_stage2_planned_pure_asym"
+                    if self.component == "antisymmetric"
+                    else "dynamic_full_prompt_stage2_planned_pure_sym"
+                ),
                 "selection_rule": self.condition["family"],
                 "selection": self.condition,
                 "tau": self.condition.get("tau"),
@@ -226,6 +232,7 @@ def patch_llama_stage2_dynamic_asymmetry_attention(
     alpha: float,
     layer0_included: bool,
     capture_score_change_metrics: bool = False,
+    component: str = "antisymmetric",
 ):
     controller = Stage2PlannedDynamicAsymmetryController(
         reference=reference,
@@ -234,6 +241,7 @@ def patch_llama_stage2_dynamic_asymmetry_attention(
         layer0_included=layer0_included,
         expected_score_dtype=torch.float16,
         capture_score_change_metrics=capture_score_change_metrics,
+        component=component,
     )
     patched = []
     try:

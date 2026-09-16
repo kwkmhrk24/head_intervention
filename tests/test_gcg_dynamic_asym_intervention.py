@@ -18,6 +18,7 @@ from utils.gcg_dynamic_asym_intervention import (
     DynamicAsymmetryController,
     FullPromptAsymmetryMomentCollector,
     compute_equal_prompt_reference_statistics,
+    full_prompt_component_moments,
     full_prompt_asymmetry_moments,
     patch_llama_dynamic_asymmetry_attention,
     validate_tau,
@@ -36,6 +37,17 @@ def scores_with_constant_lower(length: int, value: float, heads: int = 1):
 
 
 class FullPromptReferenceTests(unittest.TestCase):
+    def test_symmetric_full_strict_lower_moments(self):
+        scores = torch.zeros((1, 1, 3, 3), dtype=torch.float32)
+        scores[0, 0, 2, 0] = 6.0
+        scores[0, 0, 0, 2] = 2.0
+        means, mean_squares, count = full_prompt_component_moments(
+            scores, component="symmetric"
+        )
+        self.assertEqual(count, 3)
+        self.assertAlmostEqual(means.item(), 4.0 / 3.0)
+        self.assertAlmostEqual(mean_squares.item(), 16.0 / 3.0)
+
     def test_full_strict_lower_includes_positions_outside_tail16(self):
         scores = torch.zeros((1, 2, 20, 20), dtype=torch.float32)
         scores[0, 0, 2, 0] = 6.0
@@ -139,6 +151,33 @@ class DynamicAsymmetryControllerTests(unittest.TestCase):
         self.assertEqual(summary["max_asym_expected_error_float32"], 0.0)
         self.assertEqual(summary["max_selected_distance_to_mu_after_float32"], 0.0)
         self.assertTrue(summary["all_scores_finite"])
+
+    def test_symmetric_pair_preserves_asym_and_reaches_mu(self):
+        controller = DynamicAsymmetryController(
+            mu=torch.zeros((1, 1), dtype=torch.float32),
+            sigma=torch.ones((1, 1), dtype=torch.float32),
+            tau=0.5,
+            alpha=1.0,
+            component="symmetric",
+        )
+        scores = torch.zeros((1, 1, 3, 3), dtype=torch.float32)
+        scores[0, 0, 2, 0] = 4.0
+        before = scores.clone()
+        controller.set_prompt_context(prompt_length=3)
+        result = controller.apply(0, scores)
+        before_asym = (before - before.transpose(-1, -2)) / 2
+        after_asym = (result - result.transpose(-1, -2)) / 2
+        torch.testing.assert_close(after_asym, before_asym, atol=0, rtol=0)
+        after_sym = (result + result.transpose(-1, -2)) / 2
+        self.assertEqual(after_sym[0, 0, 2, 0].item(), 0.0)
+        self.assertEqual(result[0, 0, 2, 0].item(), 2.0)
+        self.assertEqual(result[0, 0, 0, 2].item(), -2.0)
+        summary = controller.summary()
+        self.assertEqual(summary["component"], "symmetric")
+        self.assertEqual(summary["selected_element_intervention_count"], 1)
+        self.assertEqual(summary["max_antisymmetric_component_change_float32"], 0.0)
+        self.assertEqual(summary["max_unselected_element_change"], 0.0)
+        self.assertEqual(summary["max_diagonal_change_float32"], 0.0)
 
     def test_alpha_half_moves_selected_asym_halfway(self):
         controller = self.make_controller(alpha=0.5)
@@ -249,6 +288,10 @@ class ReferenceEntrypointTests(unittest.TestCase):
     def test_autodan_reference_source_is_explicit(self):
         args = parse_args(["--source", "autodan-selection20-official"])
         self.assertEqual(args.source, "autodan-selection20-official")
+
+    def test_symmetric_component_is_explicit(self):
+        args = parse_args(["--component", "symmetric"])
+        self.assertEqual(args.component, "symmetric")
 
     def test_build_requires_new_output_directory(self):
         args = parse_args(["--stage", "build-reference"])

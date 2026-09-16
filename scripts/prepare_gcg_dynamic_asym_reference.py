@@ -63,6 +63,8 @@ DEFAULT_SELECTION_MANIFEST = (
 )
 REFERENCE_FILE = "selection20_original_full_prompt_asym_reference.pt"
 AUTODAN_REFERENCE_FILE = "autodan_selection20_official_full_prompt_asym_reference.pt"
+GCG_SYM_REFERENCE_FILE = "selection20_original_full_prompt_sym_reference.pt"
+AUTODAN_SYM_REFERENCE_FILE = "autodan_selection20_official_full_prompt_sym_reference.pt"
 MANIFEST_FILE = "reference_manifest.json"
 DEFAULT_AUTODAN_SELECTION_MANIFEST = (
     "data/outputs/gcg_position_element_topk/autodan_selection20/"
@@ -92,6 +94,11 @@ def parse_args(argv=None):
         default="cpu-preflight",
     )
     parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument(
+        "--component",
+        choices=("antisymmetric", "symmetric"),
+        default="antisymmetric",
+    )
     parser.add_argument(
         "--source",
         choices=("gcg-selection20-original", "autodan-selection20-official"),
@@ -171,13 +178,15 @@ def tokenize_original_prompt(tokenizer, prompt: str) -> torch.Tensor:
     return inputs.input_ids
 
 
-def collect_reference_moments(model, tokenizer, records):
+def collect_reference_moments(model, tokenizer, records, *, component="antisymmetric"):
     prompt_means = torch.empty(
         (SELECTION_COUNT, NUM_LAYERS, NUM_HEADS), dtype=torch.float64
     )
     prompt_mean_squares = torch.empty_like(prompt_means)
     prompt_records = []
-    with patch_llama_full_prompt_moment_collection(model) as collector:
+    with patch_llama_full_prompt_moment_collection(
+        model, component=component
+    ) as collector:
         for position, record in enumerate(records):
             input_ids = record.get("input_ids")
             if input_ids is None:
@@ -267,6 +276,7 @@ def preflight_summary(records, selection_manifest, args) -> dict:
         "prompt_weighting": "equal_weight_per_prompt",
         "jailbreak_reference_data_used": False,
         "tau": None,
+        "component": args.component,
     }
 
 
@@ -305,6 +315,7 @@ def main(argv=None):
             "prompt_weighting": "equal_weight_per_prompt",
             "jailbreak_reference_data_used": True,
             "tau": None,
+            "component": args.component,
         }
     else:
         records, selection_manifest = load_selection20_original_prompts(
@@ -325,7 +336,7 @@ def main(argv=None):
         )
     model_summary = llama_model_config_summary(model)
     prompt_means, prompt_mean_squares, prompt_records = collect_reference_moments(
-        model, tokenizer, records
+        model, tokenizer, records, component=args.component
     )
     statistics = compute_equal_prompt_reference_statistics(
         prompt_means,
@@ -340,10 +351,14 @@ def main(argv=None):
         ),
         "prompt_weighting": "equal_weight_per_prompt",
         "position_scope": "full_prompt_strict_lower_i_gt_j",
-        "component": "A_asym=(S-S^T)/2",
+        "component": (
+            "A_asym=(S-S^T)/2"
+            if args.component == "antisymmetric"
+            else "A_sym=(S+S^T)/2"
+        ),
         "prompt_count": SELECTION_COUNT,
-        "mu_definition": "mean_p(mean_strict_lower(A_asym_p))",
-        "mean_q_definition": "mean_p(mean_strict_lower(A_asym_p^2))",
+        "mu_definition": f"mean_p(mean_strict_lower(A_{args.component}_p))",
+        "mean_q_definition": f"mean_p(mean_strict_lower(A_{args.component}_p^2))",
         "variance_definition": "mean_q-mu^2",
         "sigma_definition": "sqrt(max(variance,0))",
         "negative_variance_policy": (
@@ -411,7 +426,9 @@ def main(argv=None):
     ensure_output_directory_absent(output_dir)
     output_dir.mkdir(parents=True)
     reference_path = output_dir / (
-        AUTODAN_REFERENCE_FILE if is_autodan else REFERENCE_FILE
+        (AUTODAN_REFERENCE_FILE if is_autodan else REFERENCE_FILE)
+        if args.component == "antisymmetric"
+        else (AUTODAN_SYM_REFERENCE_FILE if is_autodan else GCG_SYM_REFERENCE_FILE)
     )
     save_torch_artifact(reference_path, payload)
     manifest_payload = {

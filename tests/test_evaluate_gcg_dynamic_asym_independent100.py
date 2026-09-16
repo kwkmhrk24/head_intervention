@@ -36,6 +36,10 @@ class Independent100DynamicAsymTest(unittest.TestCase):
         args = parse_args(["--dataset", "autodan130"])
         self.assertEqual(args.dataset, "autodan130")
 
+    def test_symmetric_component_cli(self):
+        args = parse_args(["--component", "symmetric"])
+        self.assertEqual(args.component, "symmetric")
+
     def test_frozen_autodan_evaluation110_partition(self):
         indices = autodan_evaluation_indices()
         self.assertEqual(len(indices), 110)

@@ -137,6 +137,11 @@ def parse_args(argv=None):
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--reference", default=DEFAULT_REFERENCE)
     parser.add_argument(
+        "--component",
+        choices=("antisymmetric", "symmetric"),
+        default="antisymmetric",
+    )
+    parser.add_argument(
         "--reference-source",
         choices=("gcg-selection20-original", "autodan-selection20-official"),
         default="gcg-selection20-original",
@@ -168,10 +173,33 @@ def validate_request(args) -> Path | None:
 
 def load_requested_reference(args):
     if args.reference_source == "gcg-selection20-original":
-        return validate_and_load_reference(args.reference)
+        if args.component == "antisymmetric":
+            reference_path, reference = validate_and_load_reference(args.reference)
+        else:
+            reference_path = Path(args.reference).resolve()
+            reference = load_dynamic_reference(reference_path)
+        expected = (
+            "A_asym=(S-S^T)/2"
+            if args.component == "antisymmetric"
+            else "A_sym=(S+S^T)/2"
+        )
+        if reference.metadata.get("component") != expected:
+            raise ValueError("GCG dynamic reference component mismatch")
+        if (
+            reference.metadata.get("reference_condition")
+            != "selection20_original_only"
+            or reference.metadata.get("jailbreak_reference_data_used") is not False
+        ):
+            raise ValueError("GCG dynamic reference provenance mismatch")
+        return reference_path, reference
     reference_path = Path(args.reference).resolve()
     reference = load_dynamic_reference(reference_path)
     metadata = reference.metadata
+    expected_component = (
+        "A_asym=(S-S^T)/2"
+        if args.component == "antisymmetric"
+        else "A_sym=(S+S^T)/2"
+    )
     if (
         metadata.get("reference_condition")
         != "autodan_selection20_official_jailbreak_only"
@@ -179,6 +207,7 @@ def load_requested_reference(args):
         or metadata.get("selection_manifest_sha256")
         != EXPECTED_AUTODAN_SELECTION_MANIFEST_SHA256
         or metadata.get("prompt_format") != OFFICIAL_FORMAT
+        or metadata.get("component") != expected_component
     ):
         raise ValueError("AutoDAN dynamic reference provenance mismatch")
     return reference_path, reference
@@ -213,6 +242,7 @@ def validate_frozen_inputs(args) -> tuple[dict, list[dict]]:
     reference_sha256 = sha256_file(reference_path)
     if (
         args.reference_source == "gcg-selection20-original"
+        and args.component == "antisymmetric"
         and reference_sha256 != EXPECTED_REFERENCE_SHA256
     ):
         raise ValueError("GCG reference SHA-256 mismatch")
@@ -371,7 +401,10 @@ def run(args, output_dir: Path, provenance: dict, baseline: list[dict]) -> dict:
         ):
             raise RuntimeError(f"{args.dataset} input differs from reused baseline")
         with patch_llama_abs_z_collection(
-            model, layer_count=NUM_LAYERS, head_count=NUM_HEADS
+            model,
+            layer_count=NUM_LAYERS,
+            head_count=NUM_HEADS,
+            component=args.component,
         ) as collector:
             collector.set_prompt_context(
                 prompt_length=record["prompt_length"],
@@ -400,6 +433,7 @@ def run(args, output_dir: Path, provenance: dict, baseline: list[dict]) -> dict:
             selection=selection,
             alpha=ALPHA,
             layer0_included=LAYER0_INCLUDED,
+            component=args.component,
         ) as controller:
             controller.set_prompt_plan(prompt_length=record["prompt_length"], plan=plan)
             generated = generate_with_first_logits(model, tokenizer, record["input_ids"])
@@ -445,7 +479,8 @@ def run(args, output_dir: Path, provenance: dict, baseline: list[dict]) -> dict:
 
     summary = {
         "schema_version": 1,
-        "experiment_role": f"fixed_gcg_method_{args.dataset}_evaluation",
+        "experiment_role": f"fixed_dynamic_{args.component}_{args.dataset}_evaluation",
+        "component": args.component,
         "selection": selection,
         "alpha": ALPHA,
         "layer0_included": LAYER0_INCLUDED,
@@ -469,13 +504,14 @@ def run(args, output_dir: Path, provenance: dict, baseline: list[dict]) -> dict:
         "sandbox_exempt_gpu": args.sandbox_exempt_gpu,
         "scientific_conditions": {
             "dataset": args.dataset,
+            "component": args.component,
             "autodan_split": args.autodan_split if args.dataset == "autodan130" else None,
             "reference_source": args.reference_source,
             "selection": selection,
             "alpha": ALPHA,
             "layer0_included": LAYER0_INCLUDED,
             "position_scope": "full_prompt_strict_lower_i_gt_j",
-            "intervention": "pure_asym_pairwise",
+            "intervention": f"pure_{args.component}_pairwise",
             "timing": "first_prefill_only",
             "cap_rate": 0.005,
             "development68_used": False,
@@ -517,6 +553,7 @@ def main(argv=None):
     payload = {
         "status": "cpu_preflight_passed",
         "selection": fixed_selection(),
+        "component": args.component,
         "alpha": ALPHA,
         "layer0_included": LAYER0_INCLUDED,
         "cap_rate": 0.005,

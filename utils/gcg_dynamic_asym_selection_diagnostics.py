@@ -409,6 +409,7 @@ class FullPromptAbsZCollector:
         layer_count: int,
         head_count: int,
         expected_score_dtype: torch.dtype | None = None,
+        component: str = "antisymmetric",
     ):
         if type(layer_count) is not int or layer_count <= 0:
             raise ValueError("layer_count must be a positive integer")
@@ -417,6 +418,9 @@ class FullPromptAbsZCollector:
         self.layer_count = layer_count
         self.head_count = head_count
         self.expected_score_dtype = expected_score_dtype
+        if component not in ("antisymmetric", "symmetric"):
+            raise ValueError("component must be antisymmetric or symmetric")
+        self.component = component
         self._reference_cache: dict[
             tuple[int, str], tuple[torch.Tensor, torch.Tensor]
         ] = {}
@@ -523,8 +527,9 @@ class FullPromptAbsZCollector:
         rows, cols = strict_lower_indices(query_length, device=attention_scores.device)
         elements_per_head = query_length * (query_length - 1) // 2
         scores = attention_scores.float()
-        asymmetry = (scores - scores.transpose(-1, -2)) / 2.0
-        current_lower = asymmetry[0, :, rows, cols]
+        sign = -1.0 if self.component == "antisymmetric" else 1.0
+        component_values = (scores + sign * scores.transpose(-1, -2)) / 2.0
+        current_lower = component_values[0, :, rows, cols]
         mu, safe_sigma = self._layer_reference(layer, attention_scores.device)
         abs_z = (
             (current_lower - mu.view(-1, 1)) / safe_sigma.view(-1, 1)
@@ -580,6 +585,7 @@ class FullPromptAbsZCollector:
             "pre_score_nonfinite_count": self.pre_score_nonfinite_count,
             "z_nonfinite_count": self.z_nonfinite_count,
             "all_finite": True,
+            "component": self.component,
         }
 
 
@@ -589,6 +595,7 @@ def patch_llama_abs_z_collection(
     *,
     layer_count: int,
     head_count: int,
+    component: str = "antisymmetric",
 ):
     """Patch eager Llama attention only to observe full-prompt absolute z-scores."""
 
@@ -596,6 +603,7 @@ def patch_llama_abs_z_collection(
         layer_count=layer_count,
         head_count=head_count,
         expected_score_dtype=torch.float16,
+        component=component,
     )
     patched = []
     try:
