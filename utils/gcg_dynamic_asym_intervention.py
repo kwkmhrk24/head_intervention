@@ -493,6 +493,17 @@ class DynamicAsymmetryController:
             self._tril_cache[key] = cached
         return cached
 
+    def _selection_mask(
+        self,
+        *,
+        layer: int,
+        z_scores: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return the selected lower-triangle elements for this layer."""
+
+        del layer
+        return z_scores.abs() > self.tau
+
     def apply(self, layer: int, attention_scores: torch.Tensor) -> torch.Tensor:
         self.attention_forward_call_count += 1
         if type(layer) is not int or not 0 <= layer < self.layer_count:
@@ -551,7 +562,11 @@ class DynamicAsymmetryController:
             raise ReferenceInterventionRuntimeError(
                 "dynamic intervention z-scores contain NaN or infinity"
             )
-        selected = z_scores.abs() > self.tau
+        selected = self._selection_mask(layer=layer, z_scores=z_scores)
+        if selected.dtype != torch.bool or selected.shape != z_scores.shape:
+            raise ReferenceInterventionRuntimeError(
+                "dynamic intervention selection mask shape/dtype mismatch"
+            )
         selected_count = int(selected.sum().item())
         component_delta = self.alpha * (mu.view(1, -1, 1) - current_lower)
         component_delta = torch.where(selected, component_delta, 0.0)
