@@ -301,7 +301,6 @@ def validate_dynamic_reference_payload(payload: Mapping[str, object]) -> None:
     if not isinstance(metadata, Mapping):
         raise ValueError("dynamic reference metadata must be a mapping")
     expected_metadata = {
-        "reference_condition": "selection20_original_only",
         "prompt_weighting": "equal_weight_per_prompt",
         "position_scope": "full_prompt_strict_lower_i_gt_j",
         "component": "A_asym=(S-S^T)/2",
@@ -310,6 +309,18 @@ def validate_dynamic_reference_payload(payload: Mapping[str, object]) -> None:
     for key, expected_value in expected_metadata.items():
         if metadata.get(key) != expected_value:
             raise ValueError(f"dynamic reference metadata mismatch for {key}")
+    condition = metadata.get("reference_condition")
+    if condition == "selection20_original_only":
+        if metadata.get("jailbreak_reference_data_used") is not False:
+            raise ValueError("GCG original reference metadata mismatch")
+    elif condition == "autodan_selection20_official_jailbreak_only":
+        if (
+            metadata.get("jailbreak_reference_data_used") is not True
+            or metadata.get("prompt_format") != "official_fastchat_34062e9"
+        ):
+            raise ValueError("AutoDAN reference metadata mismatch")
+    else:
+        raise ValueError("dynamic reference condition is unsupported")
 
     recomputed = compute_equal_prompt_reference_statistics(
         payload["prompt_means"],

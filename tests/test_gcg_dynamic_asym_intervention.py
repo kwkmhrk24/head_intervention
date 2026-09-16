@@ -246,6 +246,10 @@ class ReferenceEntrypointTests(unittest.TestCase):
         self.assertFalse(hasattr(args, "tau"))
         self.assertIsNone(validate_request(args))
 
+    def test_autodan_reference_source_is_explicit(self):
+        args = parse_args(["--source", "autodan-selection20-official"])
+        self.assertEqual(args.source, "autodan-selection20-official")
+
     def test_build_requires_new_output_directory(self):
         args = parse_args(["--stage", "build-reference"])
         with self.assertRaisesRegex(ValueError, "output-dir"):

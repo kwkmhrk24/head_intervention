@@ -5,6 +5,7 @@ from scripts.diagnose_dynamic_asym_score_logit_propagation import (
 )
 
 from scripts.evaluate_gcg_dynamic_asym_independent100 import (
+    autodan_evaluation_indices,
     fixed_selection,
     parse_args,
     summarize,
@@ -34,6 +35,13 @@ class Independent100DynamicAsymTest(unittest.TestCase):
     def test_autodan_dataset_cli(self):
         args = parse_args(["--dataset", "autodan130"])
         self.assertEqual(args.dataset, "autodan130")
+
+    def test_frozen_autodan_evaluation110_partition(self):
+        indices = autodan_evaluation_indices()
+        self.assertEqual(len(indices), 110)
+        self.assertEqual(len(set(indices)), 110)
+        self.assertNotIn(1, indices)
+        self.assertIn(0, indices)
 
     def test_minimal_summary(self):
         baseline = [{"success": True}, {"success": False}]

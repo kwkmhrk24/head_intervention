@@ -65,6 +65,7 @@ from utils.experiment_runtime import git_state, git_value, seed_everything  # no
 from utils.gcg_dynamic_asym_selection_diagnostics import (  # noqa: E402
     patch_llama_abs_z_collection,
 )
+from utils.gcg_dynamic_asym_intervention import load_dynamic_reference  # noqa: E402
 from utils.gcg_dynamic_asym_stage2 import (  # noqa: E402
     build_stage2_selection_plan,
     patch_llama_stage2_dynamic_asymmetry_attention,
@@ -85,6 +86,9 @@ from utils.harmbench_gcg_independent_test import (  # noqa: E402
     validate_model_revision,
     verify_all_configured_sources,
 )
+from scripts.run_autodan_position_element_selection_ablation import (  # noqa: E402
+    EXPECTED_SELECTION_INDICES as AUTODAN_SELECTION_INDICES,
+)
 
 
 SEED = 42
@@ -92,6 +96,13 @@ CONDITION_NAME = "proportional_0p1pct"
 ALPHA = 1.0
 LAYER0_INCLUDED = False
 EXPECTED_BASELINE_SUCCESS_COUNT = 53
+AUTODAN_SELECTION_MANIFEST = (
+    "data/outputs/gcg_position_element_topk/autodan_selection20/"
+    "official_fastchat_34062e9_20260914T163205Z/selection_manifest.json"
+)
+EXPECTED_AUTODAN_SELECTION_MANIFEST_SHA256 = (
+    "494c6beba4f6367ff353c0716ae986734b7bcbdeb823a342fc78ba8fb9741318"
+)
 SOURCE_PATHS = (
     "scripts/evaluate_gcg_dynamic_asym_independent100.py",
     "scripts/evaluate_gcg_pure_symmetric_autodan_transfer.py",
@@ -125,6 +136,11 @@ def parse_args(argv=None):
     parser.add_argument("--dataset", choices=("independent100", "autodan130"), default="independent100")
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--reference", default=DEFAULT_REFERENCE)
+    parser.add_argument(
+        "--reference-source",
+        choices=("gcg-selection20-original", "autodan-selection20-official"),
+        default="gcg-selection20-original",
+    )
     parser.add_argument("--independent-config", default=DEFAULT_INDEPENDENT_CONFIG)
     parser.add_argument("--independent-input-manifest", default=DEFAULT_INDEPENDENT_INPUT_MANIFEST)
     parser.add_argument("--independent-attack-run-dir", default=DEFAULT_ATTACK_RUN)
@@ -132,6 +148,9 @@ def parse_args(argv=None):
     parser.add_argument("--reused-baseline", default=DEFAULT_REUSED_BASELINE)
     parser.add_argument("--autodan-input", default=DEFAULT_AUTODAN_INPUT)
     parser.add_argument("--official-baseline-dir", default=DEFAULT_OFFICIAL_BASELINE_DIR)
+    parser.add_argument(
+        "--autodan-split", choices=("full130", "evaluation110"), default="full130"
+    )
     parser.add_argument("--output-dir")
     parser.add_argument("--sandbox-exempt-gpu", action="store_true")
     return parser.parse_args(argv)
@@ -147,10 +166,56 @@ def validate_request(args) -> Path | None:
     return ensure_output_directory_absent(Path(args.output_dir).resolve())
 
 
+def load_requested_reference(args):
+    if args.reference_source == "gcg-selection20-original":
+        return validate_and_load_reference(args.reference)
+    reference_path = Path(args.reference).resolve()
+    reference = load_dynamic_reference(reference_path)
+    metadata = reference.metadata
+    if (
+        metadata.get("reference_condition")
+        != "autodan_selection20_official_jailbreak_only"
+        or metadata.get("selection_dataset_indices") != AUTODAN_SELECTION_INDICES
+        or metadata.get("selection_manifest_sha256")
+        != EXPECTED_AUTODAN_SELECTION_MANIFEST_SHA256
+        or metadata.get("prompt_format") != OFFICIAL_FORMAT
+    ):
+        raise ValueError("AutoDAN dynamic reference provenance mismatch")
+    return reference_path, reference
+
+
+def autodan_evaluation_indices() -> list[int]:
+    path = Path(AUTODAN_SELECTION_MANIFEST).resolve()
+    if sha256_file(path) != EXPECTED_AUTODAN_SELECTION_MANIFEST_SHA256:
+        raise ValueError("AutoDAN Selection20 manifest SHA-256 mismatch")
+    manifest = read_json(path)
+    if (
+        manifest.get("selection_indices") != AUTODAN_SELECTION_INDICES
+        or manifest.get("evaluation_count") != 110
+        or manifest.get("format") != OFFICIAL_FORMAT
+    ):
+        raise ValueError("AutoDAN evaluation110 split mismatch")
+    return [int(value) for value in manifest["evaluation_indices"]]
+
+
+def restrict_autodan_baseline(args, baseline: list[dict]) -> list[dict]:
+    if args.dataset != "autodan130" or args.autodan_split == "full130":
+        return baseline
+    indices = set(autodan_evaluation_indices())
+    filtered = [row for row in baseline if int(row["dataset_index"]) in indices]
+    if len(filtered) != 110 or sum(bool(row["success"]) for row in filtered) != 29:
+        raise ValueError("AutoDAN evaluation110 baseline mismatch")
+    return filtered
+
+
 def validate_frozen_inputs(args) -> tuple[dict, list[dict]]:
-    reference_path, _ = validate_and_load_reference(args.reference)
-    if sha256_file(reference_path) != EXPECTED_REFERENCE_SHA256:
-        raise ValueError("reference SHA-256 mismatch")
+    reference_path, reference = load_requested_reference(args)
+    reference_sha256 = sha256_file(reference_path)
+    if (
+        args.reference_source == "gcg-selection20-original"
+        and reference_sha256 != EXPECTED_REFERENCE_SHA256
+    ):
+        raise ValueError("GCG reference SHA-256 mismatch")
     if args.dataset == "autodan130":
         raw_records, raw_provenance = load_autodan_transfer_records(
             Path(args.autodan_input)
@@ -178,7 +243,9 @@ def validate_frozen_inputs(args) -> tuple[dict, list[dict]]:
         )
         return {
             "reference": str(reference_path),
-            "reference_sha256": EXPECTED_REFERENCE_SHA256,
+            "reference_sha256": reference_sha256,
+            "reference_source": args.reference_source,
+            "reference_metadata": reference.metadata,
             "dataset": "autodan130_official_format",
             "raw_provenance": raw_provenance,
             "official_format": OFFICIAL_FORMAT,
@@ -217,7 +284,9 @@ def validate_frozen_inputs(args) -> tuple[dict, list[dict]]:
         raise ValueError("reused baseline success count mismatch")
     provenance = {
         "reference": str(reference_path),
-        "reference_sha256": EXPECTED_REFERENCE_SHA256,
+        "reference_sha256": reference_sha256,
+        "reference_source": args.reference_source,
+        "reference_metadata": reference.metadata,
         "independent_config": str(config_path),
         "independent_config_sha256": sha256_file(config_path),
         "independent_input_manifest": str(manifest_path),
@@ -265,7 +334,7 @@ def run(args, output_dir: Path, provenance: dict, baseline: list[dict]) -> dict:
         raise RuntimeError("CUDA is required; refusing CPU model execution")
     seed_everything(SEED)
     model, tokenizer = load_model_and_tokenizer(Path(args.model).resolve())
-    _, reference = validate_and_load_reference(args.reference)
+    _, reference = load_requested_reference(args)
     if args.dataset == "autodan130":
         raw_records, _ = load_autodan_transfer_records(Path(args.autodan_input))
         records = format_autodan_records(
@@ -280,6 +349,14 @@ def run(args, output_dir: Path, provenance: dict, baseline: list[dict]) -> dict:
         )
         records = format_records(records, tokenizer)
         validate_formatted_evaluation_identity(records)
+    baseline = restrict_autodan_baseline(args, baseline)
+    if args.dataset == "autodan130" and args.autodan_split == "evaluation110":
+        evaluation_indices = set(autodan_evaluation_indices())
+        records = [
+            row for row in records if int(row["dataset_index"]) in evaluation_indices
+        ]
+        if len(records) != 110:
+            raise ValueError("AutoDAN evaluation110 formatted record count mismatch")
     baseline_by_index = {int(row["dataset_index"]): row for row in baseline}
     selection = fixed_selection()
     rows = []
@@ -392,6 +469,8 @@ def run(args, output_dir: Path, provenance: dict, baseline: list[dict]) -> dict:
         "sandbox_exempt_gpu": args.sandbox_exempt_gpu,
         "scientific_conditions": {
             "dataset": args.dataset,
+            "autodan_split": args.autodan_split if args.dataset == "autodan130" else None,
+            "reference_source": args.reference_source,
             "selection": selection,
             "alpha": ALPHA,
             "layer0_included": LAYER0_INCLUDED,
@@ -434,6 +513,7 @@ def main(argv=None):
     args = parse_args(argv)
     output_dir = validate_request(args)
     provenance, baseline = validate_frozen_inputs(args)
+    baseline = restrict_autodan_baseline(args, baseline)
     payload = {
         "status": "cpu_preflight_passed",
         "selection": fixed_selection(),
@@ -441,6 +521,8 @@ def main(argv=None):
         "layer0_included": LAYER0_INCLUDED,
         "cap_rate": 0.005,
         "dataset": args.dataset,
+        "autodan_split": args.autodan_split if args.dataset == "autodan130" else None,
+        "reference_source": args.reference_source,
         "prompt_count": len(baseline),
         "baseline_successful_count": sum(bool(row["success"]) for row in baseline),
         "reference_sha256": provenance["reference_sha256"],

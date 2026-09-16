@@ -22,7 +22,9 @@ if str(REPO_ROOT) not in sys.path:
 
 from utils.artifact_io import (  # noqa: E402
     ensure_output_directory_absent,
+    read_json,
     sha256_file,
+    sha256_text,
     utc_now,
     write_json,
 )
@@ -42,6 +44,15 @@ from utils.gcg_wasserstein_reference import (  # noqa: E402
     save_torch_artifact,
 )
 from utils.prompt_utils import apply_template  # noqa: E402
+from scripts.evaluate_gcg_position_element_topk_intervention import (  # noqa: E402
+    format_autodan_records,
+)
+from scripts.run_autodan_position_element_selection_ablation import (  # noqa: E402
+    EXPECTED_SELECTION_INDICES as AUTODAN_SELECTION_INDICES,
+    OFFICIAL_FORMAT as AUTODAN_OFFICIAL_FORMAT,
+    parse_args as parse_autodan_args,
+    validate_sources as validate_autodan_sources,
+)
 
 
 DEFAULT_MODEL = "/mnt/mp_nas_mks/labmember/h.kawakami/models/Llama-2-7b-chat-hf"
@@ -51,13 +62,23 @@ DEFAULT_SELECTION_MANIFEST = (
     "codex_gpu_20260802T061114Z/split_manifest.json"
 )
 REFERENCE_FILE = "selection20_original_full_prompt_asym_reference.pt"
+AUTODAN_REFERENCE_FILE = "autodan_selection20_official_full_prompt_asym_reference.pt"
 MANIFEST_FILE = "reference_manifest.json"
+DEFAULT_AUTODAN_SELECTION_MANIFEST = (
+    "data/outputs/gcg_position_element_topk/autodan_selection20/"
+    "official_fastchat_34062e9_20260914T163205Z/selection_manifest.json"
+)
+EXPECTED_AUTODAN_SELECTION_MANIFEST_SHA256 = (
+    "494c6beba4f6367ff353c0716ae986734b7bcbdeb823a342fc78ba8fb9741318"
+)
 SCORE_CAPTURE_POSITION = (
     "post-RoPE, after repeat_kv, immediately after QK^T/sqrt(head_dim), "
     "pre-mask, pre-softmax"
 )
 SOURCE_CODE_PATHS = (
     "scripts/prepare_gcg_dynamic_asym_reference.py",
+    "scripts/evaluate_gcg_position_element_topk_intervention.py",
+    "scripts/run_autodan_position_element_selection_ablation.py",
     "utils/gcg_dynamic_asym_intervention.py",
     "utils/reference_asym_score_intervention.py",
 )
@@ -71,8 +92,17 @@ def parse_args(argv=None):
         default="cpu-preflight",
     )
     parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument(
+        "--source",
+        choices=("gcg-selection20-original", "autodan-selection20-official"),
+        default="gcg-selection20-original",
+    )
     parser.add_argument("--original-input", default=DEFAULT_ORIGINAL_INPUT)
     parser.add_argument("--selection-manifest", default=DEFAULT_SELECTION_MANIFEST)
+    parser.add_argument(
+        "--autodan-selection-manifest",
+        default=DEFAULT_AUTODAN_SELECTION_MANIFEST,
+    )
     parser.add_argument(
         "--output-dir",
         help="Required only for --stage build-reference; must not already exist.",
@@ -149,7 +179,9 @@ def collect_reference_moments(model, tokenizer, records):
     prompt_records = []
     with patch_llama_full_prompt_moment_collection(model) as collector:
         for position, record in enumerate(records):
-            input_ids = tokenize_original_prompt(tokenizer, record["prompt"])
+            input_ids = record.get("input_ids")
+            if input_ids is None:
+                input_ids = tokenize_original_prompt(tokenizer, record["prompt"])
             prompt_length = int(input_ids.shape[-1])
             collector.clear()
             collector.set_prompt_context(prompt_length=prompt_length)
@@ -168,7 +200,10 @@ def collect_reference_moments(model, tokenizer, records):
                     "row_position": record["row_position"],
                     "dataset_index": record["dataset_index"],
                     "prompt_id": record["prompt_id"],
-                    "original_prompt_sha256": record["original_prompt_sha256"],
+                    "prompt_sha256": record.get(
+                        "original_prompt_sha256",
+                        record.get("autodan_prompt_sha256"),
+                    ),
                     "prompt_length": prompt_length,
                     "strict_lower_element_count_per_head": element_count,
                 }
@@ -179,6 +214,41 @@ def collect_reference_moments(model, tokenizer, records):
                 flush=True,
             )
     return prompt_means, prompt_mean_squares, prompt_records
+
+
+def load_autodan_selection20_records(selection_manifest_path, tokenizer=None):
+    selection_path = Path(selection_manifest_path).resolve()
+    if sha256_file(selection_path) != EXPECTED_AUTODAN_SELECTION_MANIFEST_SHA256:
+        raise ValueError("frozen AutoDAN Selection20 manifest SHA-256 mismatch")
+    saved = read_json(selection_path)
+    if (
+        saved.get("selection_indices") != AUTODAN_SELECTION_INDICES
+        or saved.get("selection_count") != SELECTION_COUNT
+        or saved.get("evaluation_count") != 110
+        or saved.get("format") != AUTODAN_OFFICIAL_FORMAT
+    ):
+        raise ValueError("frozen AutoDAN Selection20 manifest mismatch")
+    autodan_args = parse_autodan_args(["--stage", "cpu-validate"])
+    raw_rows, _, _, split = validate_autodan_sources(
+        autodan_args, tokenizer=tokenizer
+    )
+    if split["selection_indices"] != AUTODAN_SELECTION_INDICES:
+        raise ValueError("revalidated AutoDAN Selection20 indices mismatch")
+    records = [
+        {
+            "dataset_index": index,
+            "row_position": index,
+            "prompt_id": f"autodan_{index}",
+            "prompt": raw_rows[index]["user prompt"],
+            "autodan_prompt_sha256": sha256_text(raw_rows[index]["user prompt"]),
+        }
+        for index in AUTODAN_SELECTION_INDICES
+    ]
+    if tokenizer is not None:
+        records = format_autodan_records(
+            records, tokenizer, prompt_format=AUTODAN_OFFICIAL_FORMAT
+        )
+    return records, saved
 
 
 def preflight_summary(records, selection_manifest, args) -> dict:
@@ -219,11 +289,29 @@ def runtime_provenance(repo_root: str | Path = REPO_ROOT) -> dict:
 def main(argv=None):
     args = parse_args(argv)
     output_dir = validate_request(args)
-    records, selection_manifest = load_selection20_original_prompts(
-        split_manifest_path=args.selection_manifest,
-        original_input_path=args.original_input,
-    )
-    summary = preflight_summary(records, selection_manifest, args)
+    if args.source == "autodan-selection20-official":
+        records, selection_manifest = load_autodan_selection20_records(
+            args.autodan_selection_manifest
+        )
+        summary = {
+            "stage": args.stage,
+            "reference_condition": "autodan_selection20_official_jailbreak_only",
+            "selection_count": len(records),
+            "selection_dataset_indices": AUTODAN_SELECTION_INDICES,
+            "selection_manifest": str(Path(args.autodan_selection_manifest).resolve()),
+            "selection_manifest_sha256": EXPECTED_AUTODAN_SELECTION_MANIFEST_SHA256,
+            "prompt_format": AUTODAN_OFFICIAL_FORMAT,
+            "position_scope": "full_prompt_strict_lower_i_gt_j",
+            "prompt_weighting": "equal_weight_per_prompt",
+            "jailbreak_reference_data_used": True,
+            "tau": None,
+        }
+    else:
+        records, selection_manifest = load_selection20_original_prompts(
+            split_manifest_path=args.selection_manifest,
+            original_input_path=args.original_input,
+        )
+        summary = preflight_summary(records, selection_manifest, args)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     if args.stage == "cpu-preflight":
         print("CPU provenance preflight complete; no files created.")
@@ -231,6 +319,10 @@ def main(argv=None):
 
     provenance = runtime_provenance()
     model, tokenizer = load_eager_model(args.model)
+    if args.source == "autodan-selection20-official":
+        records, selection_manifest = load_autodan_selection20_records(
+            args.autodan_selection_manifest, tokenizer
+        )
     model_summary = llama_model_config_summary(model)
     prompt_means, prompt_mean_squares, prompt_records = collect_reference_moments(
         model, tokenizer, records
@@ -239,8 +331,13 @@ def main(argv=None):
         prompt_means,
         prompt_mean_squares,
     )
+    is_autodan = args.source == "autodan-selection20-official"
     metadata = {
-        "reference_condition": "selection20_original_only",
+        "reference_condition": (
+            "autodan_selection20_official_jailbreak_only"
+            if is_autodan
+            else "selection20_original_only"
+        ),
         "prompt_weighting": "equal_weight_per_prompt",
         "position_scope": "full_prompt_strict_lower_i_gt_j",
         "component": "A_asym=(S-S^T)/2",
@@ -263,17 +360,40 @@ def main(argv=None):
         "attention_implementation": "eager",
         "model_path": str(Path(args.model).resolve()),
         "model_config": model_summary,
-        "selection_manifest": str(Path(args.selection_manifest).resolve()),
-        "selection_manifest_sha256": sha256_file(args.selection_manifest),
-        "original_input": str(Path(args.original_input).resolve()),
-        "original_input_sha256": selection_manifest["original_input_sha256"],
-        "selection_row_positions": selection_manifest["selection_row_positions"],
-        "selection_dataset_indices": selection_manifest["selection_dataset_indices"],
-        "jailbreak_reference_data_used": False,
+        "selection_manifest": str(
+            Path(
+                args.autodan_selection_manifest if is_autodan else args.selection_manifest
+            ).resolve()
+        ),
+        "selection_manifest_sha256": (
+            EXPECTED_AUTODAN_SELECTION_MANIFEST_SHA256
+            if is_autodan
+            else sha256_file(args.selection_manifest)
+        ),
+        "selection_row_positions": (
+            AUTODAN_SELECTION_INDICES
+            if is_autodan
+            else selection_manifest["selection_row_positions"]
+        ),
+        "selection_dataset_indices": (
+            AUTODAN_SELECTION_INDICES
+            if is_autodan
+            else selection_manifest["selection_dataset_indices"]
+        ),
+        "jailbreak_reference_data_used": is_autodan,
         "git_head": provenance["git_head"],
         "git_branch": provenance["git_branch"],
         "created_at": utc_now(),
     }
+    if is_autodan:
+        metadata["prompt_format"] = AUTODAN_OFFICIAL_FORMAT
+    else:
+        metadata.update(
+            {
+                "original_input": str(Path(args.original_input).resolve()),
+                "original_input_sha256": selection_manifest["original_input_sha256"],
+            }
+        )
     payload = {
         "schema_version": REFERENCE_SCHEMA_VERSION,
         "mu": statistics["mu"],
@@ -290,7 +410,9 @@ def main(argv=None):
     # directories and artifacts remain immutable.
     ensure_output_directory_absent(output_dir)
     output_dir.mkdir(parents=True)
-    reference_path = output_dir / REFERENCE_FILE
+    reference_path = output_dir / (
+        AUTODAN_REFERENCE_FILE if is_autodan else REFERENCE_FILE
+    )
     save_torch_artifact(reference_path, payload)
     manifest_payload = {
         **summary,
@@ -302,7 +424,7 @@ def main(argv=None):
         "source_code_sha256": provenance["source_code_sha256"],
         "model_path": metadata["model_path"],
         "model_config": model_summary,
-        "reference_file": REFERENCE_FILE,
+        "reference_file": reference_path.name,
         "reference_sha256": sha256_file(reference_path),
         "mu_shape": list(statistics["mu"].shape),
         "sigma_shape": list(statistics["sigma"].shape),
@@ -311,6 +433,12 @@ def main(argv=None):
         ],
         "sigma_floor_head_count": statistics["sigma_floor_head_count"],
         "prompt_records": prompt_records,
+        "prompt_length": {
+            "min": min(row["prompt_length"] for row in prompt_records),
+            "mean": sum(row["prompt_length"] for row in prompt_records)
+            / len(prompt_records),
+            "max": max(row["prompt_length"] for row in prompt_records),
+        },
         "tau": None,
     }
     write_json(output_dir / MANIFEST_FILE, manifest_payload)
