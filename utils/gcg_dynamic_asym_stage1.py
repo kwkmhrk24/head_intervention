@@ -120,8 +120,15 @@ def build_stage1_selection_plan(
     layer_count: int,
     head_count: int,
     elements_per_head: int,
+    eligible_mask: torch.Tensor | None = None,
+    cap_candidate_count: int | None = None,
 ) -> dict:
-    """Build one deterministic global Layer×Head×position selection plan."""
+    """Build one deterministic global Layer×Head×position selection plan.
+
+    ``eligible_mask`` restricts the candidate set before applying the selection
+    rule.  ``cap_candidate_count`` only controls the 0.5% cap denominator.  The
+    defaults retain the original Stage 1 behavior exactly.
+    """
 
     if not isinstance(abs_z, torch.Tensor) or abs_z.ndim != 1:
         raise TypeError("abs_z must be a rank-1 tensor")
@@ -132,19 +139,42 @@ def build_stage1_selection_plan(
     expected_candidates = layer_count * head_count * elements_per_head
     if abs_z.numel() != expected_candidates:
         raise ValueError("abs_z candidate count does not match its structure")
-    cap = cap_count(expected_candidates)
+    if eligible_mask is None:
+        eligible_indices = torch.arange(expected_candidates, dtype=torch.int64)
+    else:
+        if (
+            not isinstance(eligible_mask, torch.Tensor)
+            or eligible_mask.dtype != torch.bool
+            or eligible_mask.device.type != "cpu"
+            or eligible_mask.ndim != 1
+            or eligible_mask.numel() != expected_candidates
+        ):
+            raise ValueError("eligible_mask must be rank-1 CPU bool with candidate shape")
+        eligible_indices = torch.nonzero(eligible_mask, as_tuple=False).flatten()
+    eligible_candidate_count = int(eligible_indices.numel())
+    if eligible_candidate_count <= 0:
+        raise ValueError("selection candidate set is empty")
+    if cap_candidate_count is None:
+        cap_candidate_count = expected_candidates
+    if (
+        type(cap_candidate_count) is not int
+        or not eligible_candidate_count <= cap_candidate_count <= expected_candidates
+    ):
+        raise ValueError("cap_candidate_count is outside the valid candidate range")
+    cap = cap_count(cap_candidate_count)
     if cap <= 0:
         raise ValueError("0.5% cap produced no selectable elements")
 
     family = condition.get("family")
     requested_count, eligible_count = _condition_selection_count(
-        condition, expected_candidates
+        condition, eligible_candidate_count
     )
     if family in ("fixed_top_n", "proportional_top_n"):
-        selected_count = min(requested_count, cap)
+        selected_count = min(requested_count, cap, eligible_candidate_count)
         if selected_count <= 0:
             raise ValueError("Stage 1 Top-N condition selected no elements")
-        selected_indices = stable_top_indices(abs_z, selected_count)
+        local_indices = stable_top_indices(abs_z[eligible_indices], selected_count)
+        selected_indices = eligible_indices[local_indices].contiguous()
     elif family == "z_score_threshold":
         tau = condition.get("tau")
         if isinstance(tau, bool) or not isinstance(tau, (int, float)):
@@ -152,17 +182,16 @@ def build_stage1_selection_plan(
         tau = float(tau)
         if not math.isfinite(tau) or tau < 0:
             raise ValueError("threshold tau must be finite and non-negative")
-        eligible_indices = torch.nonzero(
-            abs_z > tau, as_tuple=False
-        ).flatten().to(torch.int64)
-        eligible_count = int(eligible_indices.numel())
+        threshold_indices = eligible_indices[abs_z[eligible_indices] > tau].contiguous()
+        eligible_count = int(threshold_indices.numel())
         requested_count = eligible_count
         if eligible_count > cap:
-            selected_indices = stable_top_indices(abs_z, cap)
+            local_indices = stable_top_indices(abs_z[threshold_indices], cap)
+            selected_indices = threshold_indices[local_indices].contiguous()
             if not bool((abs_z[selected_indices] > tau).all().item()):
                 raise AssertionError("threshold cap selected an ineligible element")
         else:
-            selected_indices = eligible_indices.contiguous()
+            selected_indices = threshold_indices
         selected_count = int(selected_indices.numel())
     else:
         raise ValueError("unknown Stage 1 selection family")
@@ -183,6 +212,9 @@ def build_stage1_selection_plan(
     return {
         "condition": dict(condition),
         "candidate_count": expected_candidates,
+        "eligible_candidate_count": eligible_candidate_count,
+        "excluded_candidate_count": expected_candidates - eligible_candidate_count,
+        "cap_candidate_count": cap_candidate_count,
         "cap_rate": CAP_RATE,
         "cap_count": cap,
         "requested_or_threshold_eligible_count": requested_count,
