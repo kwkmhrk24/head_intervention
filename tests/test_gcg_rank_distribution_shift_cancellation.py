@@ -1,11 +1,16 @@
 import unittest
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
 
 import torch
 
 from scripts.evaluate_gcg_rank_distribution_shift_cancellation import (
     DATASET_GROUPS,
     INTERVENTION_TIMING,
+    load_holdout_development_records,
     parse_args,
+    run_gpu,
 )
 from scripts.prepare_gcg_rank_distribution_shift_cancellation import (
     parse_args as parse_prepare_args,
@@ -24,7 +29,19 @@ from utils.gcg_wasserstein_reference import (
     NUM_HEADS,
     NUM_LAYERS,
     SELECTION_COUNT,
+    read_json,
+    read_jsonl,
+    sha256_file,
+    sha256_text,
     strict_lower_indices,
+    write_json,
+    write_jsonl,
+)
+from utils.gcg_first_token_holdout import (
+    EVALUATION_ROLE,
+    EXCLUDED_AMBIGUOUS_INDICES,
+    HOLDOUT_INDICES,
+    _records_sha256,
 )
 
 
@@ -86,6 +103,12 @@ class ShiftConstructionTests(unittest.TestCase):
         self.assertEqual(args.stage, "cpu-validate")
         self.assertEqual(args.alpha, 1.0)
         self.assertEqual(tuple(args.dataset_groups), DATASET_GROUPS)
+        self.assertEqual(DATASET_GROUPS, ("selection20", "holdout48"))
+        self.assertEqual(
+            tuple(parse_args(["--shift-artifact-dir", "/tmp/shift",
+                              "--dataset-groups", "holdout48"]).dataset_groups),
+            ("holdout48",),
+        )
         self.assertEqual(INTERVENTION_TIMING, "first_token_only")
         self.assertEqual(ALL_RANK_COUNT, 122880)
         with self.assertRaises(SystemExit):
@@ -94,6 +117,158 @@ class ShiftConstructionTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             parse_prepare_args(["--output-dir", "/tmp/out",
                                 "--dataset-groups", "independent100"])
+
+
+class DevelopmentEvaluatorTests(unittest.TestCase):
+    def test_holdout_uses_fixed_audited_manifest_without_advbench(self):
+        with tempfile.TemporaryDirectory() as temp:
+            run_dir = Path(temp)
+            (run_dir / "baseline").mkdir()
+            records = []
+            baseline = []
+            raw_hash = "a" * 64
+            for index in range(50):
+                included = index not in EXCLUDED_AMBIGUOUS_INDICES
+                for duplicate in range(2 if not included else 1):
+                    original = f"Original {index}"
+                    gcg = f"{original} GCG {duplicate}"
+                    records.append({
+                        "dataset_index": index,
+                        "raw_file_position": len(records),
+                        "raw_archive_index": index,
+                        "original_prompt": original,
+                        "GCG_prompt": gcg,
+                        "original_prompt_sha256": sha256_text(original),
+                        "GCG_prompt_sha256": sha256_text(gcg),
+                        "raw_artifact_sha256": raw_hash,
+                        "included": included,
+                        "exclusion_reason": None if included else "ambiguous_duplicate",
+                    })
+                    if included:
+                        baseline.append({
+                            "prompt_id": f"llama:gcg-holdout:{index}",
+                            "row_position": len(baseline),
+                            "dataset_index": index,
+                            "prompt": gcg,
+                            "response": "response",
+                            "response_token_ids": [1],
+                            "response_token_count": 1,
+                            "success": index % 2 == 0,
+                            "generation_failed": False,
+                        })
+            manifest = {
+                "evaluation_role": EVALUATION_ROLE,
+                "fully_unseen_across_all_prior_research": False,
+                "unused_for_current_gcg_head_selection": True,
+                "unused_for_current_reference_construction": True,
+                "unused_for_current_gcg_evaluation": True,
+                "original_behaviors_previously_used_in_autodan_research": True,
+                "raw_artifact_sha256": raw_hash,
+                "advbench_sha256": "b" * 64,
+                "records": records,
+                "records_sha256": _records_sha256(records),
+            }
+            manifest_path = run_dir / "holdout_manifest.json"
+            write_json(manifest_path, manifest)
+            write_json(run_dir / "run_manifest.json", {
+                "status": "complete",
+                "holdout_manifest_sha256_fixed_before_baseline": sha256_file(manifest_path),
+                "holdout_manifest_records_sha256": manifest["records_sha256"],
+                "included_dataset_indices": list(HOLDOUT_INDICES),
+                "excluded_dataset_indices": list(EXCLUDED_AMBIGUOUS_INDICES),
+                "included_count": 48,
+                "raw_artifact_sha256": raw_hash,
+                "advbench_sha256": manifest["advbench_sha256"],
+            })
+            write_jsonl(run_dir / "baseline/prompt_results.jsonl", baseline)
+            loaded, provenance = load_holdout_development_records(run_dir)
+            self.assertEqual(len(loaded), 48)
+            self.assertEqual(tuple(row["dataset_index"] for row in loaded), HOLDOUT_INDICES)
+            self.assertFalse(provenance["advbench_or_raw_archive_opened"])
+            self.assertEqual(loaded[0]["baseline_response"], "response")
+
+    def test_same_frozen_shift_runs_both_groups_and_saves_separate_results(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output_dir = Path(temp) / "evaluation"
+            args = parse_args([
+                "--shift-artifact-dir", str(Path(temp) / "frozen-shift"),
+                "--stage", "run", "--output-dir", str(output_dir),
+            ])
+            mean_shift = torch.zeros(SHIFT_SHAPE, dtype=torch.float32)
+            groups = {
+                "selection20": [{"dataset_index": 68, "input_ids": torch.tensor([[1, 2]])}],
+                "holdout48": [{"dataset_index": 0, "input_ids": torch.tensor([[3, 4]])}],
+            }
+            seen = []
+
+            def fake_baseline(records, **kwargs):
+                return [{**row, "response": "response", "response_token_ids": [1],
+                         "success": True, "first_logits": torch.zeros(2),
+                         "generation_failed": False} for row in records]
+
+            def fake_condition(records, baseline_by_index, *, selection, label, **kwargs):
+                self.assertIs(selection, mean_shift)
+                self.assertTrue(torch.equal(
+                    records[0]["input_ids"], baseline_by_index[records[0]["dataset_index"]]["input_ids"]
+                ))
+                seen.append(label)
+                return ([{
+                    "dataset_group": label, "input_ids_match_baseline": True,
+                    "first_token_logit_metrics": {"argmax_equal": True},
+                    "diagnostics": {"selected_rank_intervention_count": ALL_RANK_COUNT},
+                    "transition": "still_attack_success", "success": True,
+                }], {
+                    "dataset_group": label, "prompt_count": 1, "input_ids_match_count": 1,
+                    "selected_rank_intervention_count": ALL_RANK_COUNT, "alpha": 1.0,
+                    "attack_success_count": 1, "asr": 1.0,
+                    "newly_defended_count": 0, "still_attack_success_count": 1,
+                    "newly_worsened_count": 0, "still_defended_count": 0,
+                    "response_changed_count": 0, "first_token_argmax_changed_count": 0,
+                    "selected_value_crossing_count": 0,
+                    "later_forward_intervention_count": 0,
+                })
+
+            with (
+                patch("scripts.evaluate_gcg_rank_distribution_shift_cancellation.torch.cuda.is_available", return_value=True),
+                patch("scripts.evaluate_gcg_rank_distribution_shift_cancellation.torch.cuda.get_device_name", return_value="mock GPU"),
+                patch("scripts.evaluate_gcg_rank_distribution_shift_cancellation.load_validated_shift",
+                      return_value=(mean_shift, {"source_selection_manifest_sha256": "s" * 64},
+                                    {"mean_shift_sha256": "d" * 64}, {"verified": True}, None, None)),
+                patch("scripts.evaluate_gcg_rank_distribution_shift_cancellation.load_development_groups",
+                      return_value=(groups, {"selection20": {}, "holdout48": {}})),
+                patch("scripts.evaluate_gcg_rank_distribution_shift_cancellation.seed_everything"),
+                patch("scripts.evaluate_gcg_rank_distribution_shift_cancellation.load_model_and_tokenizer",
+                      return_value=(object(), object())),
+                patch("scripts.evaluate_gcg_rank_distribution_shift_cancellation.validate_loaded_model",
+                      return_value={"validated": True}),
+                patch("scripts.evaluate_gcg_rank_distribution_shift_cancellation.format_records",
+                      side_effect=lambda rows, tokenizer: rows),
+                patch("scripts.evaluate_gcg_rank_distribution_shift_cancellation.start_cuda_measurement",
+                      return_value=0.0),
+                patch("scripts.evaluate_gcg_rank_distribution_shift_cancellation.finish_cuda_measurement",
+                      return_value={}),
+                patch("scripts.evaluate_gcg_rank_distribution_shift_cancellation.run_baseline",
+                      side_effect=fake_baseline),
+                patch("scripts.evaluate_gcg_rank_distribution_shift_cancellation.run_condition",
+                      side_effect=fake_condition),
+            ):
+                result = run_gpu(args)
+            self.assertEqual(seen, list(DATASET_GROUPS))
+            self.assertEqual(result["dataset_groups"], list(DATASET_GROUPS))
+            manifest = read_json(output_dir / "run_manifest.json")
+            self.assertTrue(manifest["holdout48_used"])
+            self.assertFalse(manifest["holdout48_used_for_shift"])
+            self.assertFalse(manifest["independent100_used"])
+            self.assertEqual(manifest["shift_artifact_verification"]["mean_shift_sha256"], "d" * 64)
+            for group_name in DATASET_GROUPS:
+                baseline_summary = read_json(output_dir / f"{group_name}_baseline_summary.json")
+                condition_summary = read_json(output_dir / f"{group_name}_summary.json")
+                rows = read_jsonl(output_dir / f"{group_name}_prompt_results.jsonl")
+                self.assertEqual(baseline_summary["attack_success_count"], 1)
+                self.assertEqual(baseline_summary["asr"], 1.0)
+                self.assertEqual(condition_summary["asr"], 1.0)
+                self.assertTrue(condition_summary["runtime_invariants_passed"])
+                self.assertEqual(rows[0]["dataset_group"], group_name)
 
 
 class ShiftRuntimeTests(unittest.TestCase):
