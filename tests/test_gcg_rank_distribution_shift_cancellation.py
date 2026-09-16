@@ -12,6 +12,12 @@ from scripts.evaluate_gcg_rank_distribution_shift_cancellation import (
     parse_args,
     run_gpu,
 )
+from scripts.evaluate_gcg_rank_distribution_shift_cancellation_independent100 import (
+    EXPECTED_INDICES,
+    parse_args as parse_independent_args,
+    validate_independent_identity,
+    verify_baseline_reproduction,
+)
 from scripts.prepare_gcg_rank_distribution_shift_cancellation import (
     parse_args as parse_prepare_args,
 )
@@ -269,6 +275,77 @@ class DevelopmentEvaluatorTests(unittest.TestCase):
                 self.assertEqual(condition_summary["asr"], 1.0)
                 self.assertTrue(condition_summary["runtime_invariants_passed"])
                 self.assertEqual(rows[0]["dataset_group"], group_name)
+
+
+class Independent100EvaluatorTests(unittest.TestCase):
+    @staticmethod
+    def frozen_rows():
+        records = []
+        prior = []
+        for index in EXPECTED_INDICES:
+            prompt = f"behavior {index} suffix"
+            formatted = f"<s>[INST] {prompt} [/INST]"
+            ids = [1, index, 2]
+            records.append({
+                "dataset_index": index,
+                "prompt": prompt,
+                "formatted_prompt": formatted,
+                "saved_formatted_prompt": formatted,
+                "saved_non_target_input_ids": ids,
+                "input_ids": torch.tensor([ids]),
+            })
+            prior.append({
+                "dataset_index": index,
+                "prompt": prompt,
+                "formatted_prompt": formatted,
+                "input_ids": ids,
+                "response": "baseline",
+                "response_token_ids": [42],
+                "success": index < 273,
+            })
+        return records, prior
+
+    def test_dedicated_entrypoint_is_fixed_and_development_cli_still_rejects(self):
+        args = parse_independent_args(["--shift-artifact-dir", "/tmp/shift"])
+        self.assertEqual(args.stage, "cpu-validate")
+        self.assertFalse(hasattr(args, "alpha"))
+        self.assertFalse(hasattr(args, "dataset_groups"))
+        with self.assertRaises(SystemExit):
+            parse_independent_args([
+                "--shift-artifact-dir", "/tmp/shift", "--alpha", "0.5"
+            ])
+        with self.assertRaises(SystemExit):
+            parse_args([
+                "--shift-artifact-dir", "/tmp/shift",
+                "--dataset-groups", "independent100",
+            ])
+
+    def test_fixed_position_inputs_match_and_overlap_is_zero(self):
+        records, prior = self.frozen_rows()
+        audit = validate_independent_identity(records, prior)
+        self.assertEqual(audit["record_count"], 100)
+        self.assertEqual(audit["position_input_ids_match_count"], 100)
+        self.assertEqual(audit["selection20_overlap_count"], 0)
+        self.assertEqual(audit["holdout48_overlap_count"], 0)
+        records[5]["input_ids"][0, -1] = 99
+        with self.assertRaisesRegex(ValueError, "input identity mismatch"):
+            validate_independent_identity(records, prior)
+
+    def test_baseline_53_gate_precedes_intervention(self):
+        records, prior = self.frozen_rows()
+        baseline = []
+        for record, saved in zip(records, prior):
+            baseline.append({
+                **record,
+                "response": saved["response"],
+                "response_token_ids": saved["response_token_ids"],
+                "success": saved["success"],
+                "generation_failed": False,
+            })
+        verify_baseline_reproduction(baseline, prior)
+        baseline[0]["response_token_ids"] = [999]
+        with self.assertRaisesRegex(RuntimeError, "refusing final intervention"):
+            verify_baseline_reproduction(baseline, prior)
 
 
 class ShiftRuntimeTests(unittest.TestCase):
