@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from contextlib import contextmanager
 
@@ -306,6 +307,97 @@ def zero_count_summary(layer_count: int, head_count: int) -> dict:
         "head_counts": [0] * head_count,
         "layer_head_counts": [[0] * head_count for _ in range(layer_count)],
     }
+
+
+def prompt_selected_count_summary(counts: Sequence[int]) -> dict:
+    """Summarize per-prompt selection counts using population standard deviation."""
+
+    if isinstance(counts, (str, bytes)) or not counts:
+        raise ValueError("prompt selection counts must be a non-empty sequence")
+    values = tuple(counts)
+    if any(type(value) is not int or value < 0 for value in values):
+        raise ValueError("prompt selection counts must be non-negative integers")
+    tensor = torch.tensor(values, dtype=torch.float64)
+    return {
+        "prompt_count": len(values),
+        "mean": float(tensor.mean().item()),
+        "median": float(torch.quantile(tensor, 0.5).item()),
+        "min": int(tensor.min().item()),
+        "max": int(tensor.max().item()),
+        "std": float(tensor.std(correction=0).item()),
+        "std_definition": "population_ddof_0",
+    }
+
+
+def threshold_selection_summary(
+    abs_z: torch.Tensor,
+    *,
+    tau: float,
+    layer_count: int,
+    head_count: int,
+    elements_per_head: int,
+) -> tuple[dict, dict, torch.Tensor]:
+    """Select strictly above ``tau`` and summarize the selected identities."""
+
+    if not isinstance(tau, (int, float)) or isinstance(tau, bool):
+        raise TypeError("tau must be a real number")
+    tau = float(tau)
+    if not math.isfinite(tau) or tau < 0:
+        raise ValueError("tau must be finite and non-negative")
+    if not isinstance(abs_z, torch.Tensor) or abs_z.ndim != 1:
+        raise TypeError("abs_z must be a rank-1 tensor")
+    if not abs_z.is_floating_point():
+        raise TypeError("abs_z must be floating point")
+    if abs_z.device.type != "cpu":
+        raise ValueError("abs_z must be on CPU")
+    if not bool(torch.isfinite(abs_z).all().item()):
+        raise ValueError("abs_z contains NaN or infinity")
+    expected_candidates = layer_count * head_count * elements_per_head
+    if abs_z.numel() != expected_candidates:
+        raise ValueError("abs_z candidate count does not match its structure")
+
+    selected_indices = torch.nonzero(abs_z > tau, as_tuple=False).flatten().to(torch.int64)
+    selected_values = abs_z[selected_indices].contiguous()
+    if selected_indices.numel():
+        counts = selection_count_summary(
+            selected_indices,
+            layer_count=layer_count,
+            head_count=head_count,
+            elements_per_head=elements_per_head,
+        )
+        layer_head_flat = [
+            value for row in counts["layer_head_counts"] for value in row
+        ]
+        selected_distribution = distribution_summary(selected_values)
+        if not selected_distribution["min"] > tau:
+            raise AssertionError("threshold selection did not enforce strict > tau")
+        head_concentration = concentration_summary(
+            counts["head_counts"], labels=tuple(range(head_count))
+        )
+        layer_head_concentration = concentration_summary(
+            layer_head_flat,
+            labels=tuple(
+                (layer, head)
+                for layer in range(layer_count)
+                for head in range(head_count)
+            ),
+        )
+    else:
+        counts = zero_count_summary(layer_count, head_count)
+        selected_distribution = None
+        head_concentration = None
+        layer_head_concentration = None
+    summary = {
+        "tau": tau,
+        "selection_rule": "abs_z > tau",
+        "selected_count": int(selected_indices.numel()),
+        "selected_fraction": int(selected_indices.numel()) / expected_candidates,
+        "selected_abs_z": selected_distribution,
+        **counts,
+        "head_concentration": head_concentration,
+        "layer_head_concentration": layer_head_concentration,
+    }
+    return summary, counts, selected_values
 
 
 class FullPromptAbsZCollector:
