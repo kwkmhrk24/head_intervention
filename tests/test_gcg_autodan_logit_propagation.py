@@ -1,17 +1,153 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
 from scripts.diagnose_gcg_autodan_logit_propagation import (
+    METRICS,
     RELATIONS,
+    build_summary_payloads,
     classify_direction,
     decision_metrics,
     distribution,
+    load_fixed_existing_diagnostic,
+    parse_args,
     selected_score_metrics,
+    summarize_existing,
 )
 
 
 class LogitPropagationDiagnosticsTests(unittest.TestCase):
+    @staticmethod
+    def _synthetic_rows():
+        rows = []
+        for dataset, count in (("GCG", 6), ("AutoDAN", 6)):
+            for index in range(count):
+                gcg = dataset == "GCG"
+                score_l2 = (10.0 if gcg else 20.0) + index / 10
+                logit_l2 = (20.0 if gcg else 4.0) + index / 10
+                row = {
+                    "dataset": dataset,
+                    "dataset_index": (
+                        220 + index if gcg else 10 if index == 0 else index
+                    ),
+                    "baseline_attack_success": index < 3,
+                    "intervention_attack_success": index < (2 if gcg else 3),
+                    "argmax_changed": gcg and index < 2,
+                    "baseline_margin": (1.0 if gcg else 5.0) + index / 100,
+                    "max_absolute_logit_difference": (
+                        2.0 if gcg else 0.4
+                    ) + index / 100,
+                    "logit_l2": logit_l2,
+                    "kl_baseline_to_intervention": (
+                        0.2 if gcg else 0.01
+                    ) + index / 1000,
+                    "baseline_top1_delta_logit": -index / 100,
+                    "intervention_residual_margin": (
+                        0.5 if gcg else 5.0
+                    ) + index / 100,
+                    "boundary_progress": (
+                        0.5 if gcg else 0.0
+                    ) + index / 1000,
+                    "selected_score_change_mean_abs": score_l2 / 500**0.5,
+                    "selected_score_change_rms": score_l2 / 500**0.5,
+                    "selected_score_change_max_abs": score_l2 / 4,
+                    "selected_score_change_l2": score_l2,
+                    "selected_reference_before_mean_abs": score_l2 / 500**0.5,
+                    "logit_l2_per_selected_score_change_l2": logit_l2 / score_l2,
+                    "max_logit_change_per_selected_score_change_l2": (
+                        (2.0 if gcg else 0.4) + index / 100
+                    )
+                    / score_l2,
+                }
+                self_missing = set(METRICS) - set(row)
+                if self_missing:
+                    raise AssertionError(f"missing synthetic metrics: {self_missing}")
+                rows.append(row)
+        return rows
+
+    def test_summarize_existing_is_cpu_only_and_reproduces_hypotheses(self):
+        rows = self._synthetic_rows()
+        gcg, autodan, comparison = build_summary_payloads(rows)
+        source = {
+            "source_dir": "/fixed/source",
+            "artifact_manifest_sha256": "a" * 64,
+            "per_prompt_diagnostics_sha256": "b" * 64,
+            "run_manifest": {
+                "model": "/model",
+                "model_revision": "revision",
+                "gcg_prompt_format": "saved IDs",
+                "autodan_prompt_format": "official_fastchat_34062e9",
+                "metric_definitions": {"bootstrap": "fixed"},
+            },
+            "gcg_summary": gcg,
+            "autodan_summary": autodan,
+            "comparison_summary": comparison,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            args = SimpleNamespace(
+                source_diagnostic_dir="/fixed/source",
+                output_dir=str(Path(temporary) / "summary"),
+            )
+            with mock.patch(
+                "scripts.diagnose_gcg_autodan_logit_propagation."
+                "load_fixed_existing_diagnostic",
+                return_value=(rows, source),
+            ), mock.patch.object(
+                torch.cuda,
+                "is_available",
+                side_effect=AssertionError("summarization must not query CUDA"),
+            ):
+                result = summarize_existing(args)
+            self.assertFalse(result["gpu_used"])
+            self.assertEqual(
+                result["hypotheses"],
+                {
+                    "H1_larger_AutoDAN_baseline_margin": "supported",
+                    "H2_smaller_AutoDAN_selected_attention_change": "not supported",
+                    "H3_weaker_AutoDAN_attention_to_logit_propagation": "supported",
+                    "H4_sufficient_logit_change_but_weaker_boundary_progress": "not supported",
+                },
+            )
+            output = Path(result["output_dir"])
+            self.assertEqual(
+                {path.name for path in output.iterdir()},
+                {
+                    "gcg_summary.json",
+                    "autodan_summary.json",
+                    "comparison_summary.json",
+                    "run_manifest.json",
+                    "artifact_manifest.json",
+                },
+            )
+            manifest = json.loads((output / "run_manifest.json").read_text())
+            self.assertTrue(manifest["cpu_only_resummarization"])
+            self.assertFalse(manifest["gpu_forward_performed"])
+
+    def test_summarize_existing_rejects_wrong_fixed_manifest_hash(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary)
+            (source / "artifact_manifest.json").write_text("{}\n")
+            with self.assertRaisesRegex(ValueError, "manifest SHA-256 mismatch"):
+                load_fixed_existing_diagnostic(source)
+
+    def test_summarize_existing_stage_requires_output(self):
+        with self.assertRaises(SystemExit):
+            parse_args(["--stage", "summarize-existing"])
+        args = parse_args(
+            [
+                "--stage",
+                "summarize-existing",
+                "--output-dir",
+                "/tmp/summary",
+            ]
+        )
+        self.assertEqual(args.stage, "summarize-existing")
+
     def test_all_requested_metric_relations_are_frozen(self):
         self.assertEqual(
             RELATIONS,

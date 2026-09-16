@@ -74,6 +74,16 @@ AUTODAN_RUN = REPO_ROOT / (
     "evaluation110_official_fastchat_34062e9_20260914T163404Z"
 )
 AUTODAN_RAW = REPO_ROOT / "data/raw/llama2/llama2_AutoDAN.json"
+DEFAULT_EXISTING_DIAGNOSTIC = REPO_ROOT / (
+    "data/outputs/gcg_position_element_topk/gcg_autodan_logit_propagation/"
+    "diagnosis_20260915T162334Z"
+)
+EXPECTED_EXISTING_DIAGNOSTIC_MANIFEST_SHA256 = (
+    "2ff6d9cb5aecf009dfdda03fc0e67e791d7515644797ed2d1e6570751e3cbaff"
+)
+EXPECTED_EXISTING_PER_PROMPT_SHA256 = (
+    "ae5594c3ac66b5f4a99727b81010e5ae02df71515b079964f400f6436b41494a"
+)
 EXPECTED_SOURCE_HASHES = {
     GCG_RUN / "artifact_manifest.json":
         "6ef7ee37c8e3c0540840237e9c21efb4225bfb9cd312fee9574089dbf7a8b1ba",
@@ -107,13 +117,20 @@ BOOTSTRAP_SEED = 42
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--stage", choices=("cpu-preflight", "run"), required=True)
+    parser.add_argument(
+        "--stage",
+        choices=("cpu-preflight", "run", "summarize-existing"),
+        required=True,
+    )
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--gcg-artifact-dir", default=DEFAULT_ARTIFACT_DIR)
+    parser.add_argument(
+        "--source-diagnostic-dir", default=str(DEFAULT_EXISTING_DIAGNOSTIC)
+    )
     parser.add_argument("--output-dir")
     args = parser.parse_args(argv)
-    if args.stage == "run" and not args.output_dir:
-        parser.error("--output-dir is required for --stage run")
+    if args.stage in ("run", "summarize-existing") and not args.output_dir:
+        parser.error(f"--output-dir is required for --stage {args.stage}")
     return args
 
 
@@ -478,6 +495,302 @@ def comparison(gcg_rows, autodan_rows) -> dict:
     }
 
 
+def build_summary_payloads(rows: list[dict]) -> tuple[dict, dict, dict]:
+    gcg_rows = [row for row in rows if row["dataset"] == "GCG"]
+    autodan_rows = [row for row in rows if row["dataset"] == "AutoDAN"]
+    if not gcg_rows or not autodan_rows:
+        raise ValueError("both GCG and AutoDAN diagnostics are required")
+    gcg_summary = {
+        "all_prompts": summarize(gcg_rows),
+        "baseline_attack_success": summarize(
+            [row for row in gcg_rows if row["baseline_attack_success"]]
+        ),
+        "argmax_changed": summarize(
+            [row for row in gcg_rows if row["argmax_changed"]]
+        ),
+        "argmax_unchanged": summarize(
+            [row for row in gcg_rows if not row["argmax_changed"]]
+        ),
+    }
+    autodan_summary = {
+        "all_prompts": summarize(autodan_rows),
+        "baseline_attack_success": summarize(
+            [row for row in autodan_rows if row["baseline_attack_success"]]
+        ),
+        "sensitivity_excluding_index10": summarize(
+            [row for row in autodan_rows if row["dataset_index"] != 10]
+        ),
+    }
+    comparison_summary = comparison(gcg_rows, autodan_rows)
+    comparison_summary["baseline_attack_success_comparison"] = {
+        metric: mean_difference_ci(
+            [row for row in gcg_rows if row["baseline_attack_success"]],
+            [row for row in autodan_rows if row["baseline_attack_success"]],
+            metric,
+        )
+        for metric in (
+            "baseline_margin",
+            "selected_score_change_l2",
+            "logit_l2_per_selected_score_change_l2",
+            "logit_l2",
+            "boundary_progress",
+        )
+    }
+    return gcg_summary, autodan_summary, comparison_summary
+
+
+def validate_existing_diagnostic_rows(
+    rows: list[dict], source_run: dict
+) -> None:
+    gcg_rows = [row for row in rows if row.get("dataset") == "GCG"]
+    autodan_rows = [row for row in rows if row.get("dataset") == "AutoDAN"]
+    expected_autodan_indices = [
+        index for index in range(130) if index not in EXPECTED_SELECTION_INDICES
+    ]
+    if [row.get("dataset_index") for row in gcg_rows] != list(range(220, 320)):
+        raise ValueError("fixed GCG independent100 indices mismatch")
+    if [row.get("dataset_index") for row in autodan_rows] != expected_autodan_indices:
+        raise ValueError("fixed AutoDAN evaluation110 indices mismatch")
+    if (
+        sum(bool(row["baseline_attack_success"]) for row in gcg_rows) != 53
+        or sum(bool(row["intervention_attack_success"]) for row in gcg_rows) != 38
+        or sum(bool(row["argmax_changed"]) for row in gcg_rows) != 23
+        or sum(bool(row["baseline_attack_success"]) for row in autodan_rows) != 29
+        or sum(bool(row["intervention_attack_success"]) for row in autodan_rows) != 29
+        or sum(bool(row["argmax_changed"]) for row in autodan_rows) != 0
+    ):
+        raise ValueError("fixed diagnostic outcome counts mismatch")
+    for row in rows:
+        if float(row["baseline_margin"]) <= 0:
+            raise ValueError("baseline margin must be positive")
+        if float(row["selected_score_change_l2"]) <= 0:
+            raise ValueError("selected-score-change L2 must be positive")
+        if not all(
+            math.isfinite(float(row[metric]))
+            for metric in METRICS
+        ):
+            raise ValueError("per-prompt diagnostic contains NaN or infinity")
+        trace = row.get("selected_element_values_rank_order")
+        if not isinstance(trace, dict) or any(
+            len(trace.get(key, ())) != K
+            for key in ("score_before", "reference", "score_after_float32", "score_after")
+        ):
+            raise ValueError("per-prompt selected-value trace is incomplete")
+        if not all(
+            math.isfinite(float(value))
+            for key in ("score_before", "reference", "score_after_float32", "score_after")
+            for value in trace[key]
+        ):
+            raise ValueError("selected-value trace contains NaN or infinity")
+        runtime_diagnostics = row.get("runtime_diagnostics")
+        if runtime_diagnostics is not None:
+            validate_prompt_runtime_invariants(runtime_diagnostics, k=K)
+        elif not (
+            row["dataset"] == "GCG"
+            and row.get("metric_source")
+            == "reused_full230_mechanism_except_baseline_top2_token"
+            and source_run["validation"].get(
+                "gcg_existing_runtime_invariant_pass_count"
+            )
+            == 100
+        ):
+            raise ValueError("per-prompt runtime diagnostics are missing")
+
+
+def load_fixed_existing_diagnostic(source_dir: Path) -> tuple[list[dict], dict]:
+    source_dir = source_dir.resolve()
+    manifest_path = source_dir / "artifact_manifest.json"
+    observed_manifest_sha256 = sha256_file(manifest_path)
+    if observed_manifest_sha256 != EXPECTED_EXISTING_DIAGNOSTIC_MANIFEST_SHA256:
+        raise ValueError(
+            "fixed diagnostic artifact manifest SHA-256 mismatch: "
+            f"expected={EXPECTED_EXISTING_DIAGNOSTIC_MANIFEST_SHA256} "
+            f"observed={observed_manifest_sha256}"
+        )
+    artifact_manifest = verify_listed_artifacts(source_dir)
+    listed_hashes = {
+        record["relative_path"]: record["sha256"]
+        for record in artifact_manifest.get(
+            "artifacts", artifact_manifest.get("files", [])
+        )
+    }
+    if (
+        listed_hashes.get("per_prompt_diagnostics.jsonl")
+        != EXPECTED_EXISTING_PER_PROMPT_SHA256
+    ):
+        raise ValueError("fixed per-prompt diagnostic SHA-256 mismatch")
+    source_run = read_json(source_dir / "run_manifest.json")
+    if (
+        source_run.get("k") != K
+        or source_run.get("alpha") != ALPHA
+        or source_run.get("intervention_timing") != INTERVENTION_TIMING
+        or source_run.get("tail_tokens") != TAIL_TOKENS
+        or source_run.get("model_revision") != MODEL_REPOSITORY_HEAD
+        or source_run.get("autodan_prompt_format") != OFFICIAL_FORMAT
+        or source_run.get("validation", {}).get(
+            "autodan_runtime_invariant_pass_count"
+        )
+        != 110
+    ):
+        raise ValueError("fixed diagnostic scientific conditions mismatch")
+    rows = read_jsonl(source_dir / "per_prompt_diagnostics.jsonl")
+    validate_existing_diagnostic_rows(rows, source_run)
+    return rows, {
+        "source_dir": str(source_dir),
+        "artifact_manifest_sha256": observed_manifest_sha256,
+        "per_prompt_diagnostics_sha256": EXPECTED_EXISTING_PER_PROMPT_SHA256,
+        "run_manifest": source_run,
+        "gcg_summary": read_json(source_dir / "gcg_summary.json"),
+        "autodan_summary": read_json(source_dir / "autodan_summary.json"),
+        "comparison_summary": read_json(source_dir / "comparison_summary.json"),
+    }
+
+
+def validate_resummary_matches_existing(
+    *,
+    source: dict,
+    gcg_summary: dict,
+    autodan_summary: dict,
+    comparison_summary: dict,
+) -> None:
+    for saved, regenerated in (
+        (source["gcg_summary"], gcg_summary),
+        (source["autodan_summary"], autodan_summary),
+    ):
+        if set(saved) != set(regenerated):
+            raise ValueError("regenerated summary groups differ from fixed result")
+        for group_name, saved_group in saved.items():
+            current_group = regenerated[group_name]
+            for key in ("prompt_count", "argmax_changed_count", "metrics"):
+                if current_group[key] != saved_group[key]:
+                    raise ValueError(
+                        f"regenerated {group_name} {key} differs from fixed result"
+                    )
+            for relation_name, relation in saved_group["relations"].items():
+                if current_group["relations"].get(relation_name) != relation:
+                    raise ValueError(
+                        f"regenerated {group_name} relation differs: {relation_name}"
+                    )
+    if comparison_summary != source["comparison_summary"]:
+        raise ValueError("regenerated comparison/hypotheses differ from fixed result")
+
+
+def summarize_existing(args) -> dict:
+    started = time.perf_counter()
+    rows, source = load_fixed_existing_diagnostic(
+        Path(args.source_diagnostic_dir)
+    )
+    gcg_summary, autodan_summary, comparison_summary = build_summary_payloads(rows)
+    validate_resummary_matches_existing(
+        source=source,
+        gcg_summary=gcg_summary,
+        autodan_summary=autodan_summary,
+        comparison_summary=comparison_summary,
+    )
+    output_dir = ensure_output_absent(Path(args.output_dir)).resolve()
+    output_dir.mkdir(parents=True)
+    source_run = source["run_manifest"]
+    run_manifest = {
+        "schema_version": 1,
+        "status": "complete",
+        "stage": "summarize-existing",
+        "analysis_role": "post_hoc_diagnostic_no_tuning",
+        "created_at": utc_now(),
+        "execution_git_head": git_value(REPO_ROOT, "rev-parse", "HEAD"),
+        "execution_git_branch": git_value(
+            REPO_ROOT, "branch", "--show-current"
+        ),
+        "execution_git_status_porcelain": git_value(
+            REPO_ROOT, "status", "--porcelain"
+        ).splitlines(),
+        **source_hashes(),
+        "cpu_only_resummarization": True,
+        "gpu_forward_performed": False,
+        "source_diagnostic_artifact": {
+            "path": source["source_dir"],
+            "artifact_manifest_sha256": source[
+                "artifact_manifest_sha256"
+            ],
+            "per_prompt_diagnostics_sha256": source[
+                "per_prompt_diagnostics_sha256"
+            ],
+        },
+        "model": source_run["model"],
+        "model_revision": source_run["model_revision"],
+        "gcg_prompt_format": source_run["gcg_prompt_format"],
+        "autodan_prompt_format": source_run["autodan_prompt_format"],
+        "k": K,
+        "alpha": ALPHA,
+        "intervention_timing": INTERVENTION_TIMING,
+        "tail_tokens": TAIL_TOKENS,
+        "bootstrap_seed": BOOTSTRAP_SEED,
+        "bootstrap_replicates": BOOTSTRAP_REPLICATES,
+        "metric_definitions": {
+            **source_run["metric_definitions"],
+            "relations": (
+                "Pearson product-moment correlation of finite raw metric values "
+                "for the five predeclared pairs; undefined for constant vectors; "
+                "no rank correlation used"
+            ),
+        },
+        "hypothesis_rule": comparison_summary["hypothesis_rule"],
+        "validation": {
+            "fixed_source_manifest_hash": True,
+            "fixed_per_prompt_hash": True,
+            "per_prompt_values_unchanged": True,
+            "source_summary_and_hypotheses_reproduced": True,
+            "prompt_count": len(rows),
+            "gcg_prompt_count": sum(row["dataset"] == "GCG" for row in rows),
+            "autodan_prompt_count": sum(
+                row["dataset"] == "AutoDAN" for row in rows
+            ),
+            "finite_metrics": True,
+            "zero_denominator_count": 0,
+        },
+        "runtime": {
+            "device": "cpu",
+            "gpu_used": False,
+            "elapsed_seconds": time.perf_counter() - started,
+        },
+    }
+    write_json(output_dir / "gcg_summary.json", gcg_summary)
+    write_json(output_dir / "autodan_summary.json", autodan_summary)
+    write_json(output_dir / "comparison_summary.json", comparison_summary)
+    write_json(output_dir / "run_manifest.json", run_manifest)
+    artifact_files = (
+        "gcg_summary.json",
+        "autodan_summary.json",
+        "comparison_summary.json",
+        "run_manifest.json",
+    )
+    write_json(
+        output_dir / "artifact_manifest.json",
+        {
+            "schema_version": 1,
+            "files": [
+                {
+                    "relative_path": name,
+                    "sha256": sha256_file(output_dir / name),
+                }
+                for name in artifact_files
+            ],
+        },
+    )
+    return {
+        "status": "complete",
+        "stage": "summarize-existing",
+        "gpu_used": False,
+        "output_dir": str(output_dir),
+        "source_artifact_manifest_sha256": source[
+            "artifact_manifest_sha256"
+        ],
+        "hypotheses": comparison_summary["hypotheses"],
+        "artifact_manifest_sha256": sha256_file(
+            output_dir / "artifact_manifest.json"
+        ),
+    }
+
+
 def run(args, frozen) -> dict:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is unavailable; GPU diagnosis cannot run")
@@ -619,27 +932,7 @@ def run(args, frozen) -> dict:
         row["argmax_changed"] for row in auto_rows
     ) != 0:
         raise RuntimeError("argmax changes differ from frozen outcomes")
-    gcg_summary = {
-        "all_prompts": summarize(gcg_rows),
-        "baseline_attack_success": summarize([row for row in gcg_rows if row["baseline_attack_success"]]),
-        "argmax_changed": summarize([row for row in gcg_rows if row["argmax_changed"]]),
-        "argmax_unchanged": summarize([row for row in gcg_rows if not row["argmax_changed"]]),
-    }
-    autodan_summary = {
-        "all_prompts": summarize(auto_rows),
-        "baseline_attack_success": summarize([row for row in auto_rows if row["baseline_attack_success"]]),
-        "sensitivity_excluding_index10": summarize([row for row in auto_rows if row["dataset_index"] != 10]),
-    }
-    comparison_summary = comparison(gcg_rows, auto_rows)
-    comparison_summary["baseline_attack_success_comparison"] = {
-        metric: mean_difference_ci(
-            [row for row in gcg_rows if row["baseline_attack_success"]],
-            [row for row in auto_rows if row["baseline_attack_success"]],
-            metric,
-        ) for metric in ("baseline_margin", "selected_score_change_l2",
-                         "logit_l2_per_selected_score_change_l2", "logit_l2",
-                         "boundary_progress")
-    }
+    gcg_summary, autodan_summary, comparison_summary = build_summary_payloads(rows)
     runtime = {
         "elapsed_seconds": time.perf_counter() - started,
         "peak_allocated_vram_mib": torch.cuda.max_memory_allocated() / 2**20,
@@ -717,6 +1010,9 @@ def run(args, frozen) -> dict:
 
 def main(argv=None):
     args = parse_args(argv)
+    if args.stage == "summarize-existing":
+        print(json.dumps(summarize_existing(args), indent=2))
+        return
     frozen = preflight(args)
     if args.stage == "cpu-preflight":
         print(json.dumps({
