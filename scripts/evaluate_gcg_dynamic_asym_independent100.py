@@ -1,0 +1,388 @@
+#!/usr/bin/env python3
+"""Evaluate the frozen dynamic Asym finalist on frozen GCG independent100."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import statistics
+import sys
+from pathlib import Path
+
+import torch
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scripts.evaluate_gcg_dynamic_asym_stage1 import (  # noqa: E402
+    DEFAULT_MODEL,
+    DEFAULT_REFERENCE,
+    EXPECTED_REFERENCE_SHA256,
+    validate_and_load_reference,
+)
+from scripts.evaluate_gcg_first_token_reference_ablation import (  # noqa: E402
+    format_records,
+    generate_with_first_logits,
+    load_model_and_tokenizer,
+)
+from scripts.evaluate_gcg_position_element_topk_intervention import (  # noqa: E402
+    DEFAULT_INDEPENDENT_ADAPTER,
+    DEFAULT_INDEPENDENT_CONFIG,
+    DEFAULT_INDEPENDENT_INPUT_MANIFEST,
+    serialized_input_ids,
+)
+from scripts.evaluate_gcg_symmetric_position_element_topk_intervention import (  # noqa: E402
+    DEFAULT_ATTACK_RUN,
+    DEFAULT_REUSED_BASELINE,
+    EXPECTED_REUSED_BASELINE_SHA256,
+)
+from utils.artifact_io import (  # noqa: E402
+    ensure_output_directory_absent,
+    read_json,
+    read_jsonl,
+    sha256_file,
+    utc_now,
+    write_json,
+    write_jsonl,
+)
+from utils.experiment_runtime import git_state, git_value, seed_everything  # noqa: E402
+from utils.gcg_dynamic_asym_selection_diagnostics import (  # noqa: E402
+    patch_llama_abs_z_collection,
+)
+from utils.gcg_dynamic_asym_stage2 import (  # noqa: E402
+    build_stage2_selection_plan,
+    patch_llama_stage2_dynamic_asymmetry_attention,
+    stage2_selection_conditions,
+)
+from utils.gcg_first_token_reference_ablation import (  # noqa: E402
+    validate_first_token_response_invariant,
+)
+from utils.gcg_reference_intervention_diagnostics import compare_token_sequences  # noqa: E402
+from utils.gcg_wasserstein_reference import NUM_HEADS, NUM_LAYERS  # noqa: E402
+from utils.gcg_wasserstein_reference_evaluation import classify_transition  # noqa: E402
+from utils.harmbench_gcg_independent_test import (  # noqa: E402
+    load_independent_evaluation_records,
+    validate_fixed_config,
+    validate_formatted_evaluation_identity,
+    validate_harmbench_revision,
+    validate_input_manifest,
+    validate_model_revision,
+    verify_all_configured_sources,
+)
+
+
+SEED = 42
+CONDITION_NAME = "proportional_0p1pct"
+ALPHA = 1.0
+LAYER0_INCLUDED = False
+EXPECTED_BASELINE_SUCCESS_COUNT = 53
+SOURCE_PATHS = (
+    "scripts/evaluate_gcg_dynamic_asym_independent100.py",
+    "utils/gcg_dynamic_asym_stage2.py",
+    "utils/gcg_dynamic_asym_stage1.py",
+    "utils/gcg_dynamic_asym_intervention.py",
+)
+
+
+def fixed_selection() -> dict:
+    matches = [
+        row for row in stage2_selection_conditions() if row["name"] == CONDITION_NAME
+    ]
+    expected = {
+        "name": CONDITION_NAME,
+        "family": "proportional_top_n",
+        "top_n": None,
+        "rate": 0.001,
+        "rate_numerator": 1,
+        "tau": None,
+    }
+    if len(matches) != 1 or matches[0] != expected:
+        raise RuntimeError("frozen independent100 selection condition drifted")
+    return matches[0]
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--stage", choices=("cpu-preflight", "run"), default="cpu-preflight")
+    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--reference", default=DEFAULT_REFERENCE)
+    parser.add_argument("--independent-config", default=DEFAULT_INDEPENDENT_CONFIG)
+    parser.add_argument("--independent-input-manifest", default=DEFAULT_INDEPENDENT_INPUT_MANIFEST)
+    parser.add_argument("--independent-attack-run-dir", default=DEFAULT_ATTACK_RUN)
+    parser.add_argument("--independent-adapter", default=DEFAULT_INDEPENDENT_ADAPTER)
+    parser.add_argument("--reused-baseline", default=DEFAULT_REUSED_BASELINE)
+    parser.add_argument("--output-dir")
+    parser.add_argument("--sandbox-exempt-gpu", action="store_true")
+    return parser.parse_args(argv)
+
+
+def validate_request(args) -> Path | None:
+    if args.stage == "cpu-preflight":
+        if args.output_dir is not None or args.sandbox_exempt_gpu:
+            raise ValueError("cpu-preflight cannot write output or claim GPU execution")
+        return None
+    if not args.output_dir:
+        raise ValueError("--output-dir is required for --stage run")
+    return ensure_output_directory_absent(Path(args.output_dir).resolve())
+
+
+def validate_frozen_inputs(args) -> tuple[dict, list[dict]]:
+    reference_path, _ = validate_and_load_reference(args.reference)
+    if sha256_file(reference_path) != EXPECTED_REFERENCE_SHA256:
+        raise ValueError("reference SHA-256 mismatch")
+    config_path = Path(args.independent_config).resolve()
+    manifest_path = Path(args.independent_input_manifest).resolve()
+    attack_run = Path(args.independent_attack_run_dir).resolve()
+    adapter_path = Path(args.independent_adapter).resolve()
+    config = read_json(config_path)
+    validate_fixed_config(config)
+    source_hashes = verify_all_configured_sources(config)
+    harmbench_revision = validate_harmbench_revision(config)
+    model_revision = validate_model_revision(config)
+    input_validation = validate_input_manifest(read_json(manifest_path), config)
+    final_manifest = read_json(attack_run / "final_manifest.json")
+    for key, expected in (
+        ("status", "complete_validated"),
+        ("complete_count", 100),
+        ("missing_count", 0),
+        ("duplicate_count", 0),
+        ("processing_failure_history_count", 0),
+    ):
+        if final_manifest.get(key) != expected:
+            raise ValueError(f"independent100 final manifest {key} mismatch")
+    baseline_path = Path(args.reused_baseline).resolve()
+    if sha256_file(baseline_path) != EXPECTED_REUSED_BASELINE_SHA256:
+        raise ValueError("reused independent100 baseline SHA-256 mismatch")
+    baseline = read_jsonl(baseline_path)
+    indices = [int(row["dataset_index"]) for row in baseline]
+    if len(baseline) != 100 or len(set(indices)) != 100 or set(indices) != set(range(220, 320)):
+        raise ValueError("reused baseline is not the complete independent100 set")
+    if sum(bool(row["success"]) for row in baseline) != EXPECTED_BASELINE_SUCCESS_COUNT:
+        raise ValueError("reused baseline success count mismatch")
+    provenance = {
+        "reference": str(reference_path),
+        "reference_sha256": EXPECTED_REFERENCE_SHA256,
+        "independent_config": str(config_path),
+        "independent_config_sha256": sha256_file(config_path),
+        "independent_input_manifest": str(manifest_path),
+        "independent_input_manifest_sha256": sha256_file(manifest_path),
+        "independent_attack_run_dir": str(attack_run),
+        "independent_attack_final_manifest_sha256": sha256_file(attack_run / "final_manifest.json"),
+        "independent_adapter": str(adapter_path),
+        "independent_adapter_sha256": sha256_file(adapter_path),
+        "reused_baseline": str(baseline_path),
+        "reused_baseline_sha256": EXPECTED_REUSED_BASELINE_SHA256,
+        "input_count": len(input_validation),
+        "source_hashes": source_hashes,
+        "harmbench_revision": harmbench_revision,
+        "model_revision": model_revision,
+    }
+    return provenance, baseline
+
+
+def summarize(rows: list[dict], baseline: list[dict]) -> dict:
+    counts = [int(row["selected_count"]) for row in rows]
+    fractions = [float(row["selected_fraction"]) for row in rows]
+    return {
+        "prompt_count": len(rows),
+        "baseline_successful_count": sum(bool(row["success"]) for row in baseline),
+        "baseline_asr": sum(bool(row["success"]) for row in baseline) / len(baseline),
+        "intervention_successful_count": sum(bool(row["success"]) for row in rows),
+        "intervention_asr": sum(bool(row["success"]) for row in rows) / len(rows),
+        "improvement_count": sum(row["transition"] == "newly_defended" for row in rows),
+        "worsening_count": sum(row["transition"] == "newly_worsened" for row in rows),
+        "response_changed_count": sum(not row["response_equal"] for row in rows),
+        "selected_count_mean": statistics.fmean(counts),
+        "selected_fraction_mean": statistics.fmean(fractions),
+        "cap_activated_prompt_count": sum(bool(row["cap_activated"]) for row in rows),
+        "cap_violation_count": sum(row["selected_count"] > row["cap_count"] for row in rows),
+        "generation_failure_count": 0,
+        "nonfinite_count": 0,
+        "decode_intervention_count": sum(
+            int(row["diagnostics"]["later_forward_intervention_count"]) for row in rows
+        ),
+    }
+
+
+def run(args, output_dir: Path, provenance: dict, baseline: list[dict]) -> dict:
+    if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
+        raise RuntimeError("CUDA is required; refusing CPU model execution")
+    seed_everything(SEED)
+    model, tokenizer = load_model_and_tokenizer(Path(args.model).resolve())
+    _, reference = validate_and_load_reference(args.reference)
+    records = load_independent_evaluation_records(
+        config_path=args.independent_config,
+        input_manifest_path=args.independent_input_manifest,
+        attack_run_dir=args.independent_attack_run_dir,
+        adapter_path=args.independent_adapter,
+    )
+    records = format_records(records, tokenizer)
+    validate_formatted_evaluation_identity(records)
+    baseline_by_index = {int(row["dataset_index"]): row for row in baseline}
+    selection = fixed_selection()
+    rows = []
+    for position, record in enumerate(records, 1):
+        base = baseline_by_index[int(record["dataset_index"])]
+        if serialized_input_ids(record["input_ids"]) != base["input_ids"]:
+            raise RuntimeError("independent100 input IDs differ from reused baseline")
+        with patch_llama_abs_z_collection(
+            model, layer_count=NUM_LAYERS, head_count=NUM_HEADS
+        ) as collector:
+            collector.set_prompt_context(
+                prompt_length=record["prompt_length"],
+                excluded_selection_position=0,
+                mu=reference.mu,
+                sigma=reference.sigma,
+            )
+            with torch.inference_mode():
+                model.model(
+                    input_ids=record["input_ids"].to(model.device),
+                    use_cache=False,
+                    return_dict=True,
+                )
+            abs_z, collection = collector.result()
+        plan = build_stage2_selection_plan(
+            abs_z,
+            selection=selection,
+            layer_count=NUM_LAYERS,
+            head_count=NUM_HEADS,
+            elements_per_head=collection["strict_lower_elements_per_head"],
+            layer0_included=LAYER0_INCLUDED,
+        )
+        with patch_llama_stage2_dynamic_asymmetry_attention(
+            model,
+            reference=reference,
+            selection=selection,
+            alpha=ALPHA,
+            layer0_included=LAYER0_INCLUDED,
+        ) as controller:
+            controller.set_prompt_plan(prompt_length=record["prompt_length"], plan=plan)
+            generated = generate_with_first_logits(model, tokenizer, record["input_ids"])
+            if generated["generation_failed"]:
+                raise RuntimeError(f"generation failed at dataset_index={record['dataset_index']}")
+            controller.assert_complete_prefill()
+            diagnostics = controller.summary()
+        comparison = compare_token_sequences(
+            base["response_token_ids"], generated["response_token_ids"]
+        )
+        validate_first_token_response_invariant(
+            response_equal=comparison["response_equal"],
+            first_different_token_position=comparison["first_different_token_position"],
+        )
+        if (
+            collection["all_finite"] is not True
+            or diagnostics["all_scores_finite"] is not True
+            or diagnostics["later_forward_intervention_count"] != 0
+            or diagnostics["selected_element_intervention_count"] != plan["selected_count"]
+            or diagnostics["max_unselected_element_change"] != 0.0
+            or diagnostics["max_diagonal_change_float32"] != 0.0
+            or plan["selected_count"] > plan["cap_count"]
+        ):
+            raise RuntimeError("runtime numerical, timing, or cap invariant failed")
+        rows.append(
+            {
+                "dataset_index": record["dataset_index"],
+                "prompt_id": record["prompt_id"],
+                "prompt_length": record["prompt_length"],
+                "baseline_response": base["response"],
+                "baseline_success": bool(base["success"]),
+                **{key: value for key, value in generated.items() if key != "first_logits"},
+                **comparison,
+                "transition": classify_transition(bool(base["success"]), bool(generated["success"])),
+                "selected_count": plan["selected_count"],
+                "selected_fraction": plan["selected_fraction"],
+                "cap_count": plan["cap_count"],
+                "cap_activated": plan["cap_activated"],
+                "diagnostics": diagnostics,
+            }
+        )
+        print(f"[independent100 {position}/100] index={record['dataset_index']} success={generated['success']} selected={plan['selected_count']}", flush=True)
+
+    summary = {
+        "schema_version": 1,
+        "experiment_role": "final_independent100_evaluation",
+        "selection": selection,
+        "alpha": ALPHA,
+        "layer0_included": LAYER0_INCLUDED,
+        "cap_rate": 0.005,
+        **summarize(rows, baseline),
+    }
+    ensure_output_directory_absent(output_dir)
+    output_dir.mkdir(parents=True)
+    results_path = output_dir / "prompt_results.jsonl"
+    summary_path = output_dir / "summary.json"
+    write_jsonl(results_path, rows)
+    write_json(summary_path, summary)
+    head, branch = git_state(REPO_ROOT)
+    run_manifest = {
+        "schema_version": 1,
+        "status": "complete",
+        "created_at": utc_now(),
+        "git_head": head,
+        "git_branch": branch,
+        "dirty_status": git_value(REPO_ROOT, "status", "--porcelain").splitlines(),
+        "sandbox_exempt_gpu": args.sandbox_exempt_gpu,
+        "scientific_conditions": {
+            "selection": selection,
+            "alpha": ALPHA,
+            "layer0_included": LAYER0_INCLUDED,
+            "position_scope": "full_prompt_strict_lower_i_gt_j",
+            "intervention": "pure_asym_pairwise",
+            "timing": "first_prefill_only",
+            "cap_rate": 0.005,
+            "development68_used": False,
+            "autodan_used": False,
+        },
+        "provenance": provenance,
+        "source_code_sha256": {path: sha256_file(REPO_ROOT / path) for path in SOURCE_PATHS},
+        "gpu": torch.cuda.get_device_name(0),
+        "files": {
+            results_path.name: sha256_file(results_path),
+            summary_path.name: sha256_file(summary_path),
+        },
+    }
+    manifest_path = output_dir / "run_manifest.json"
+    write_json(manifest_path, run_manifest)
+    artifact_manifest = {
+        "schema_version": 1,
+        "files": [
+            {"path": path.name, "sha256": sha256_file(path)}
+            for path in (results_path, summary_path, manifest_path)
+        ],
+    }
+    artifact_path = output_dir / "artifact_manifest.json"
+    write_json(artifact_path, artifact_manifest)
+    return {
+        "output_dir": str(output_dir),
+        "summary_sha256": sha256_file(summary_path),
+        "artifact_manifest_sha256": sha256_file(artifact_path),
+        "summary": summary,
+    }
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    output_dir = validate_request(args)
+    provenance, baseline = validate_frozen_inputs(args)
+    payload = {
+        "status": "cpu_preflight_passed",
+        "selection": fixed_selection(),
+        "alpha": ALPHA,
+        "layer0_included": LAYER0_INCLUDED,
+        "cap_rate": 0.005,
+        "independent100_count": len(baseline),
+        "baseline_successful_count": EXPECTED_BASELINE_SUCCESS_COUNT,
+        "reference_sha256": provenance["reference_sha256"],
+        "development68_used": False,
+        "autodan_used": False,
+    }
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    if args.stage == "cpu-preflight":
+        return
+    print(json.dumps(run(args, output_dir, provenance, baseline), ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()
