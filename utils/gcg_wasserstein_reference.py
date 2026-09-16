@@ -805,8 +805,9 @@ def extract_prompt_scores(
     row_position: int,
     dataset_index: int,
     tail_tokens: int = TAIL_TOKENS,
+    component: str = "antisymmetric",
 ) -> tuple[torch.Tensor, int]:
-    """Extract runtime-dtype eager pre-mask S_asym lower values for one prompt."""
+    """Extract eager pre-mask component values for one prompt's strict lower tail."""
 
     from utils.prompt_utils import apply_template
 
@@ -827,6 +828,7 @@ def extract_prompt_scores(
         row_position=row_position,
         dataset_index=dataset_index,
         tail_tokens=tail_tokens,
+        component=component,
     )
 
 
@@ -837,8 +839,15 @@ def extract_prompt_scores_from_input_ids(
     row_position: int,
     dataset_index: int,
     tail_tokens: int = TAIL_TOKENS,
+    component: str = "antisymmetric",
 ) -> tuple[torch.Tensor, int]:
     """Run the established score extraction on preformatted exact input IDs."""
+
+    if component not in ("antisymmetric", "symmetric"):
+        raise ValueError(
+            "component must be 'antisymmetric' or 'symmetric', "
+            f"found {component!r}"
+        )
 
     from transformers.models.llama import modeling_llama
 
@@ -925,8 +934,13 @@ def extract_prompt_scores_from_input_ids(
             score_tail = attention_scores[
                 :, :, -tail_tokens:, -tail_tokens:
             ]
-            asym_tail = (score_tail - score_tail.transpose(-1, -2)) / 2
-            lower_values = asym_tail[:, :, lower[0], lower[1]]
+            transpose = score_tail.transpose(-1, -2)
+            component_tail = (
+                (score_tail - transpose) / 2
+                if component == "antisymmetric"
+                else (score_tail + transpose) / 2
+            )
+            lower_values = component_tail[:, :, lower[0], lower[1]]
             destination[layer_index].copy_(
                 lower_values[0].to(device="cpu", dtype=torch.float32)
             )
@@ -943,6 +957,7 @@ def extract_selection_scores(
     jailbreak_rows: Sequence[Mapping[str, object]],
     selected_records: Sequence[Mapping[str, object]],
     progress: Callable[[str], None] | None = None,
+    component: str = "antisymmetric",
 ) -> tuple[torch.Tensor, torch.Tensor, list[dict]]:
     if len(selected_records) != SELECTION_COUNT:
         raise ValueError("selection score extraction requires exactly 20 records")
@@ -981,6 +996,7 @@ def extract_selection_scores(
             prompt=original_row["prompt"],
             row_position=row_position,
             dataset_index=dataset_index,
+            component=component,
         )
         jailbreak_score, jailbreak_length = extract_prompt_scores(
             model=model,
@@ -988,6 +1004,7 @@ def extract_selection_scores(
             prompt=jailbreak_row["prompt"],
             row_position=row_position,
             dataset_index=dataset_index,
+            component=component,
         )
         original_values[selection_position].copy_(original_score)
         jailbreak_values[selection_position].copy_(jailbreak_score)

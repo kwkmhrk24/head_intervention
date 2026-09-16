@@ -39,6 +39,7 @@ from utils.reference_asym_score_intervention import (
 TOP_K_VALUES = (10, 50, 100, 500)
 WASSERSTEIN_TOP5_HEADS = ((31, 22), (13, 4), (5, 30), (9, 18), (27, 24))
 RANKING_METRIC = "abs(mean_p(jailbreak_asym-original_asym))"
+SYMMETRIC_RANKING_METRIC = "abs(mean_p(jailbreak_sym-original_sym))"
 SIGN_CONSISTENCY_DEFINITION = (
     "fraction of paired prompt deltas whose sign agrees with the signed mean; "
     "when the signed mean is exactly zero, fraction of exactly-zero deltas"
@@ -96,6 +97,8 @@ def compute_original_mean_reference(original: torch.Tensor) -> torch.Tensor:
 def compute_position_element_ranking(
     original: torch.Tensor,
     jailbreak: torch.Tensor,
+    *,
+    component: str = "antisymmetric",
 ) -> list[dict]:
     """Rank all position elements by absolute paired selection mean delta.
 
@@ -103,6 +106,8 @@ def compute_position_element_ranking(
     ``position`` (the row-major order from :func:`torch.tril_indices`).
     """
 
+    if component not in ("antisymmetric", "symmetric"):
+        raise ValueError("component must be 'antisymmetric' or 'symmetric'")
     _validate_paired_scores(original, jailbreak)
     delta = jailbreak - original
     mean_original = original.mean(dim=0, dtype=torch.float32)
@@ -246,6 +251,7 @@ class PositionElementSelection:
     masks: Mapping[int, torch.Tensor]
     original_mean_reference: torch.Tensor
     k_values: tuple[int, ...]
+    component: str = "antisymmetric"
 
     def mask_for_k(self, k: int) -> torch.Tensor:
         if type(k) is not int or k not in self.masks:
@@ -262,11 +268,14 @@ def build_position_element_selection(
     jailbreak: torch.Tensor,
     *,
     k_values: Sequence[int] = TOP_K_VALUES,
+    component: str = "antisymmetric",
 ) -> PositionElementSelection:
     """Construct ranking, nested masks, and original-only mean reference."""
 
     values = validate_top_k_values(k_values)
-    ranking = compute_position_element_ranking(original, jailbreak)
+    ranking = compute_position_element_ranking(
+        original, jailbreak, component=component
+    )
     masks = build_topk_element_masks(ranking, k_values=values)
     reference = compute_original_mean_reference(original)
     return PositionElementSelection(
@@ -274,6 +283,7 @@ def build_position_element_selection(
         masks=masks,
         original_mean_reference=reference,
         k_values=values,
+        component=component,
     )
 
 
@@ -348,7 +358,17 @@ def selection_diagnostics(selection: PositionElementSelection) -> dict:
             }
         )
     return {
-        "ranking_metric": RANKING_METRIC,
+        "component": selection.component,
+        "decomposition": (
+            "(S + S^T) / 2"
+            if selection.component == "symmetric"
+            else "(S - S^T) / 2"
+        ),
+        "ranking_metric": (
+            SYMMETRIC_RANKING_METRIC
+            if selection.component == "symmetric"
+            else RANKING_METRIC
+        ),
         "sign_consistency_definition": SIGN_CONSISTENCY_DEFINITION,
         "selection_prompt_count": SELECTION_COUNT,
         "candidate_element_count": len(selection.ranking),
@@ -648,6 +668,245 @@ class PositionElementTopKController:
         }
 
 
+class SymmetricPositionElementTopKController(PositionElementTopKController):
+    """Move selected lower raw scores toward an ``S_sym`` reference.
+
+    The paired upper score is intentionally fixed.  Therefore changing the
+    symmetric component by ``delta`` requires changing the lower raw score by
+    ``2 * delta``.
+    """
+
+    def apply(self, layer: int, attention_scores: torch.Tensor) -> torch.Tensor:
+        if layer not in self.selected_layers:
+            return attention_scores
+        self.attention_forward_call_count += 1
+        if self.alpha == 0.0:
+            self.alpha_zero_bypass_count += 1
+            return attention_scores
+        if not isinstance(attention_scores, torch.Tensor) or attention_scores.ndim != 4:
+            raise ReferenceInterventionRuntimeError(
+                "attention scores must have shape batch,head,query,key"
+            )
+        if not attention_scores.is_floating_point():
+            raise ReferenceInterventionRuntimeError("attention scores must be floating point")
+        if self.expected_score_dtype is not None and attention_scores.dtype != self.expected_score_dtype:
+            raise ReferenceInterventionRuntimeError("attention score dtype mismatch")
+        batch, heads, query_length, key_length = attention_scores.shape
+        if batch != 1 or heads != self.head_count or query_length != key_length:
+            raise ReferenceInterventionRuntimeError("attention score shape mismatch")
+        if self.intervention_timing == "first_token_only":
+            if self.prompt_length is None:
+                raise ReferenceInterventionRuntimeError(
+                    "first_token_only requires prompt context"
+                )
+            if query_length < self.prompt_length:
+                raise ReferenceInterventionRuntimeError(
+                    "current sequence length is shorter than prompt length"
+                )
+            if query_length > self.prompt_length:
+                self.later_forward_skip_count += 1
+                return attention_scores
+            self.first_forward_detected = True
+        elif self.prompt_length is not None:
+            if query_length < self.prompt_length:
+                raise ReferenceInterventionRuntimeError(
+                    "current sequence length is shorter than prompt length"
+                )
+            self.first_forward_detected |= query_length == self.prompt_length
+        if query_length < self.tail_tokens:
+            self.short_sequence_skip_count += 1
+            return attention_scores
+        if not bool(torch.isfinite(attention_scores).all().item()):
+            raise ReferenceInterventionRuntimeError(
+                "pre-intervention attention scores contain NaN or infinity"
+            )
+
+        reference, mask = self._layer_values(layer, attention_scores.device)
+        rows, cols = self._tril.to(attention_scores.device)
+        original_block = attention_scores[
+            :, :, -self.tail_tokens :, -self.tail_tokens :
+        ].float()
+        current_sym = (original_block + original_block.transpose(-1, -2)) / 2
+        current_lower = current_sym[:, :, rows, cols]
+        component_delta = self.alpha * (reference.unsqueeze(0) - current_lower)
+        component_delta = torch.where(mask.unsqueeze(0), component_delta, 0.0)
+        raw_lower_delta = 2.0 * component_delta
+        constructed_delta = torch.zeros_like(original_block)
+        constructed_delta[:, :, rows, cols] = raw_lower_delta
+        intervened_float32 = original_block + constructed_delta
+        intervened_cast = intervened_float32.to(attention_scores.dtype)
+
+        expected_component = current_lower + component_delta
+        realized_sym = (
+            intervened_cast.float() + intervened_cast.float().transpose(-1, -2)
+        ) / 2
+        realized_lower = realized_sym[:, :, rows, cols]
+        if self.capture_selected_values:
+            identities = mask.nonzero(as_tuple=False).detach().cpu().tolist()
+            values = zip(
+                identities,
+                current_lower[0].masked_select(mask).detach().cpu().tolist(),
+                reference.masked_select(mask).detach().cpu().tolist(),
+                expected_component[0].masked_select(mask).detach().cpu().tolist(),
+                realized_lower[0].masked_select(mask).detach().cpu().tolist(),
+            )
+            for (head, position), before, target, constructed_after, after in values:
+                self._selected_value_records.append(
+                    {
+                        "layer": layer,
+                        "head": int(head),
+                        "position": int(position),
+                        "score_before": float(before),
+                        "reference": float(target),
+                        "score_after_float32": float(constructed_after),
+                        "score_after": float(after),
+                    }
+                )
+
+        modified = attention_scores.clone()
+        modified[:, :, -self.tail_tokens :, -self.tail_tokens :] = intervened_cast
+        if not bool(torch.isfinite(modified).all().item()):
+            raise ReferenceInterventionRuntimeError(
+                "post-intervention attention scores contain NaN or infinity"
+            )
+        realized_delta = intervened_cast.float() - original_block
+        selected_lower_mask = torch.zeros(
+            (self.head_count, self.tail_tokens, self.tail_tokens),
+            dtype=torch.bool,
+            device=attention_scores.device,
+        )
+        selected_lower_mask[:, rows, cols] = mask
+        outside_element_change = _max_abs(
+            realized_delta.masked_select(~selected_lower_mask.unsqueeze(0))
+        )
+        upper_mask = torch.triu(
+            torch.ones(
+                (self.tail_tokens, self.tail_tokens),
+                dtype=torch.bool,
+                device=attention_scores.device,
+            ),
+            diagonal=1,
+        )
+        upper_change = _max_abs(
+            realized_delta.masked_select(upper_mask.view(1, 1, self.tail_tokens, self.tail_tokens))
+        )
+        diagonal_change = _max_abs(
+            torch.diagonal(realized_delta, dim1=-2, dim2=-1)
+        )
+        prefix = query_length - self.tail_tokens
+        outside_tail_change = 0.0
+        if prefix:
+            outside_tail_change = max(
+                _max_abs(modified[:, :, :prefix, :] - attention_scores[:, :, :prefix, :]),
+                _max_abs(
+                    modified[:, :, -self.tail_tokens :, :prefix]
+                    - attention_scores[:, :, -self.tail_tokens :, :prefix]
+                ),
+            )
+        if any(
+            value != 0.0
+            for value in (
+                outside_element_change,
+                outside_tail_change,
+                upper_change,
+                diagonal_change,
+            )
+        ):
+            raise ReferenceInterventionRuntimeError(
+                "symmetric intervention changed an unselected, upper, diagonal, "
+                "or outside-tail raw score"
+            )
+
+        selected_raw_delta = realized_delta[:, :, rows, cols].masked_select(
+            mask.unsqueeze(0)
+        )
+        selected_changed_count = int(torch.count_nonzero(selected_raw_delta).item())
+        if selected_changed_count == 0:
+            raise ReferenceInterventionRuntimeError(
+                "selected lower-triangle raw scores did not change"
+            )
+        selected_target_error = _max_abs(
+            (realized_lower - expected_component).masked_select(mask.unsqueeze(0))
+        )
+        constructed_target_error = _max_abs(
+            (
+                (intervened_float32 + intervened_float32.transpose(-1, -2)) / 2
+            )[:, :, rows, cols].masked_select(mask.unsqueeze(0))
+            - expected_component.masked_select(mask.unsqueeze(0))
+        )
+
+        selected_in_layer = int(mask.sum().item())
+        self.intervention_call_count += 1
+        self.selected_element_intervention_count += selected_in_layer
+        if self.prompt_length is not None:
+            if query_length == self.prompt_length:
+                self.first_forward_intervened = True
+            elif query_length > self.prompt_length:
+                self.later_forward_intervention_count += selected_in_layer
+        self._records.append(
+            {
+                "layer": layer,
+                "sequence_length": query_length,
+                "selected_element_count": selected_in_layer,
+                "selected_lower_changed_count": selected_changed_count,
+                "max_symmetric_target_error_float32": constructed_target_error,
+                "max_symmetric_target_error_after_cast": selected_target_error,
+                "max_upper_triangle_change": upper_change,
+                "max_diagonal_change_float32": diagonal_change,
+                "max_unselected_element_change": outside_element_change,
+                "max_outside_tail_change": outside_tail_change,
+                "max_absolute_raw_lower_delta_float32": _max_abs(raw_lower_delta),
+            }
+        )
+        return modified
+
+    def summary(self) -> dict:
+        def maximum(key: str) -> float:
+            return max((float(record[key]) for record in self._records), default=0.0)
+
+        return {
+            "component": "symmetric",
+            "decomposition": "(S + S^T) / 2",
+            "raw_score_intervention": (
+                "S_ij' = S_ij + 2*alpha*(reference_sym_ij-current_sym_ij), "
+                "selected strict-lower i>j only; S_ji fixed"
+            ),
+            "alpha": self.alpha,
+            "intervention_timing": self.intervention_timing,
+            "selected_layers": list(self.selected_layers),
+            "selected_element_count": self.selected_element_count,
+            "prompt_length": self.prompt_length,
+            "attention_forward_call_count": self.attention_forward_call_count,
+            "intervention_call_count": self.intervention_call_count,
+            "selected_element_intervention_count": self.selected_element_intervention_count,
+            "selected_lower_changed_count": sum(
+                int(record["selected_lower_changed_count"]) for record in self._records
+            ),
+            "alpha_zero_bypass_count": self.alpha_zero_bypass_count,
+            "short_sequence_skip_count": self.short_sequence_skip_count,
+            "first_forward_detected": self.first_forward_detected,
+            "first_forward_intervened": self.first_forward_intervened,
+            "later_forward_intervention_count": self.later_forward_intervention_count,
+            "later_forward_skip_count": self.later_forward_skip_count,
+            "max_symmetric_target_error_float32": maximum(
+                "max_symmetric_target_error_float32"
+            ),
+            "max_symmetric_target_error_after_cast": maximum(
+                "max_symmetric_target_error_after_cast"
+            ),
+            "max_upper_triangle_change": maximum("max_upper_triangle_change"),
+            "max_diagonal_change_float32": maximum("max_diagonal_change_float32"),
+            "max_unselected_element_change": maximum(
+                "max_unselected_element_change"
+            ),
+            "max_outside_tail_change": maximum("max_outside_tail_change"),
+            "max_absolute_raw_lower_delta_float32": maximum(
+                "max_absolute_raw_lower_delta_float32"
+            ),
+            "all_scores_finite": True,
+        }
+
+
 @contextmanager
 def patch_llama_position_element_attention(
     model,
@@ -682,6 +941,60 @@ def patch_llama_position_element_attention(
                 raise TypeError(
                     "position-element intervention requires eager LlamaAttention; "
                     f"layer={layer_index}, found={type(module).__name__}"
+                )
+            if module.layer_idx != layer_index:
+                raise ValueError(f"attention layer_idx mismatch at layer={layer_index}")
+            had_instance_forward = "forward" in module.__dict__
+            previous_instance_forward = module.__dict__.get("forward")
+            replacement = _patched_llama_attention_forward(controller)
+            module.forward = types.MethodType(replacement, module)
+            patched.append((module, had_instance_forward, previous_instance_forward))
+        yield controller
+    finally:
+        for module, had_instance_forward, previous_instance_forward in reversed(patched):
+            if had_instance_forward:
+                module.forward = previous_instance_forward
+            else:
+                module.__dict__.pop("forward", None)
+
+
+@contextmanager
+def patch_llama_symmetric_position_element_attention(
+    model,
+    *,
+    selection: PositionElementSelection,
+    k: int,
+    alpha: float,
+    intervention_timing: str = "first_token_only",
+    capture_selected_values: bool = False,
+):
+    """Temporarily install the strict-lower symmetric Top-k intervention."""
+
+    if selection.component != "symmetric":
+        raise ValueError("symmetric patch requires a symmetric selection")
+    mask = selection.mask_for_k(k)
+    if transformers.__version__ != SUPPORTED_TRANSFORMERS_VERSION:
+        raise RuntimeError(
+            f"expected Transformers {SUPPORTED_TRANSFORMERS_VERSION}, "
+            f"found {transformers.__version__}"
+        )
+    controller = SymmetricPositionElementTopKController(
+        reference_mean=selection.original_mean_reference,
+        element_mask=mask,
+        alpha=alpha,
+        expected_score_dtype=torch.float16,
+        intervention_timing=intervention_timing,
+        capture_selected_values=capture_selected_values,
+    )
+    patched = []
+    try:
+        for layer_index in controller.selected_layers:
+            module = model.model.layers[layer_index].self_attn
+            if type(module) is not modeling_llama.LlamaAttention:
+                raise TypeError(
+                    "symmetric position-element intervention requires eager "
+                    f"LlamaAttention; layer={layer_index}, "
+                    f"found={type(module).__name__}"
                 )
             if module.layer_idx != layer_index:
                 raise ValueError(f"attention layer_idx mismatch at layer={layer_index}")
