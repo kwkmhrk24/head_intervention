@@ -66,6 +66,22 @@ class Independent100DynamicAsymTest(unittest.TestCase):
             "positive",
         )
 
+    def test_absolute_intervention_target_cli_and_validation(self):
+        args = parse_args(["--absolute-intervention-target", "positive"])
+        self.assertEqual(args.absolute_intervention_target, "positive")
+        self.assertIsNone(validate_request(args))
+        with self.assertRaisesRegex(ValueError, "selection-direction absolute"):
+            validate_request(
+                parse_args(
+                    [
+                        "--selection-direction",
+                        "positive",
+                        "--absolute-intervention-target",
+                        "negative",
+                    ]
+                )
+            )
+
     def test_half_percent_uses_layer0_excluded_candidates_and_full_cap(self):
         plan = build_stage2_selection_plan(
             torch.arange(4000, dtype=torch.float32),

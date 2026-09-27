@@ -19,6 +19,10 @@ from utils.gcg_dynamic_asym_stage1 import (
     build_stage1_selection_plan,
     stage1_conditions,
 )
+from utils.gcg_dynamic_asym_selection_diagnostics import (
+    distribution_summary,
+    selection_count_summary,
+)
 from utils.reference_asym_score_intervention import ReferenceInterventionRuntimeError
 
 
@@ -54,6 +58,7 @@ STAGE2_REUSED_VARIANT = {
     "layer0_included": True,
     "reused_from_stage1": True,
 }
+ABSOLUTE_INTERVENTION_TARGETS = ("all", "positive", "negative")
 
 
 def stage2_selection_conditions() -> tuple[dict, ...]:
@@ -159,6 +164,130 @@ def build_stage2_selection_plan(
     return plan
 
 
+def restrict_absolute_plan_to_intervention_sign(
+    plan: Mapping[str, object],
+    signed_z: torch.Tensor,
+    *,
+    intervention_target_sign: str,
+    layer_count: int,
+    head_count: int,
+    elements_per_head: int,
+) -> dict:
+    """Restrict an already-ranked absolute Top-N plan without re-ranking."""
+
+    if intervention_target_sign not in ABSOLUTE_INTERVENTION_TARGETS:
+        raise ValueError("absolute intervention target must be all, positive, or negative")
+    if plan.get("selection_direction") != "absolute":
+        raise ValueError("sign-restricted intervention requires an absolute selection plan")
+    expected_candidates = layer_count * head_count * elements_per_head
+    if (
+        not isinstance(signed_z, torch.Tensor)
+        or signed_z.ndim != 1
+        or signed_z.device.type != "cpu"
+        or not signed_z.is_floating_point()
+        or signed_z.numel() != expected_candidates
+        or not bool(torch.isfinite(signed_z).all().item())
+    ):
+        raise ValueError("signed_z must be a finite rank-1 CPU candidate vector")
+    absolute_indices = plan.get("selected_indices")
+    if (
+        not isinstance(absolute_indices, torch.Tensor)
+        or absolute_indices.dtype != torch.int64
+        or absolute_indices.device.type != "cpu"
+        or absolute_indices.ndim != 1
+        or absolute_indices.numel() != plan.get("selected_count")
+    ):
+        raise ValueError("absolute plan selected indices are invalid")
+    absolute_z = signed_z[absolute_indices]
+    positive_mask = absolute_z > 0
+    negative_mask = absolute_z < 0
+    if not bool((positive_mask | negative_mask).all().item()):
+        raise AssertionError("absolute Top-N contains a zero z-score")
+    positive_indices = absolute_indices[positive_mask].contiguous()
+    negative_indices = absolute_indices[negative_mask].contiguous()
+    if torch.isin(positive_indices, negative_indices).any().item():
+        raise AssertionError("absolute sign subsets overlap")
+    if positive_indices.numel() + negative_indices.numel() != absolute_indices.numel():
+        raise AssertionError("absolute sign subsets do not partition the Top-N plan")
+
+    absolute_count = int(absolute_indices.numel())
+    absolute_positive_count = int(positive_indices.numel())
+    absolute_negative_count = int(negative_indices.numel())
+    if (
+        plan.get("positive_selected_count") != absolute_positive_count
+        or plan.get("negative_selected_count") != absolute_negative_count
+    ):
+        raise AssertionError("absolute plan sign counts disagree with signed z-scores")
+
+    restricted = dict(plan)
+    restricted.update(
+        {
+            "intervention_target_sign": intervention_target_sign,
+            "absolute_top_n_count": absolute_count,
+            "absolute_positive_selected_count": absolute_positive_count,
+            "absolute_negative_selected_count": absolute_negative_count,
+            "absolute_selected_fraction": absolute_count / expected_candidates,
+        }
+    )
+    if intervention_target_sign == "all":
+        restricted["intervention_subset_excluded_count"] = 0
+        return restricted
+
+    selected_indices = (
+        positive_indices
+        if intervention_target_sign == "positive"
+        else negative_indices
+    )
+    selected_z = signed_z[selected_indices]
+    selected_count = int(selected_indices.numel())
+    if selected_count:
+        counts = selection_count_summary(
+            selected_indices,
+            layer_count=layer_count,
+            head_count=head_count,
+            elements_per_head=elements_per_head,
+        )
+        selected_abs_z_summary = distribution_summary(selected_z.abs())
+        selected_z_summary = distribution_summary(selected_z)
+    else:
+        counts = {
+            "layer_counts": [0] * layer_count,
+            "head_counts": [0] * head_count,
+            "layer_head_counts": [[0] * head_count for _ in range(layer_count)],
+        }
+        selected_abs_z_summary = None
+        selected_z_summary = None
+    restricted.update(
+        {
+            "selected_indices": selected_indices,
+            "actual_selected_count": selected_count,
+            "selected_count": selected_count,
+            "selected_fraction": selected_count / expected_candidates,
+            "selected_abs_z": selected_abs_z_summary,
+            "selected_z": selected_z_summary,
+            "positive_selected_count": (
+                selected_count if intervention_target_sign == "positive" else 0
+            ),
+            "negative_selected_count": (
+                selected_count if intervention_target_sign == "negative" else 0
+            ),
+            "intervention_subset_excluded_count": absolute_count - selected_count,
+            **counts,
+        }
+    )
+    if selected_count > int(plan["cap_count"]):
+        raise AssertionError("sign-restricted intervention exceeds the absolute cap")
+    if intervention_target_sign == "positive" and not bool(
+        (selected_z > 0).all().item()
+    ):
+        raise AssertionError("positive-only intervention contains a non-positive z-score")
+    if intervention_target_sign == "negative" and not bool(
+        (selected_z < 0).all().item()
+    ):
+        raise AssertionError("negative-only intervention contains a non-negative z-score")
+    return restricted
+
+
 class Stage2PlannedDynamicAsymmetryController(PlannedDynamicAsymmetryController):
     """Apply Stage 2 plans while reusing the existing Pure Asym implementation."""
 
@@ -219,6 +348,18 @@ class Stage2PlannedDynamicAsymmetryController(PlannedDynamicAsymmetryController)
                     "eligible_candidate_count"
                 ],
                 "selection_direction": self._plan_metadata["selection_direction"],
+                "intervention_target_sign": self._plan_metadata.get(
+                    "intervention_target_sign", "all"
+                ),
+                "absolute_top_n_count": self._plan_metadata.get(
+                    "absolute_top_n_count"
+                ),
+                "absolute_positive_selected_count": self._plan_metadata.get(
+                    "absolute_positive_selected_count"
+                ),
+                "absolute_negative_selected_count": self._plan_metadata.get(
+                    "absolute_negative_selected_count"
+                ),
                 "requested_count": self._plan_metadata["requested_count"],
                 "sign_eligible_candidate_count": self._plan_metadata[
                     "sign_eligible_candidate_count"

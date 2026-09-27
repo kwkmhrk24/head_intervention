@@ -7,6 +7,7 @@ from utils.gcg_dynamic_asym_intervention import DynamicAsymmetryReference
 from utils.gcg_dynamic_asym_stage2 import (
     Stage2PlannedDynamicAsymmetryController,
     build_stage2_selection_plan,
+    restrict_absolute_plan_to_intervention_sign,
     stage2_new_conditions,
     stage2_selection_conditions,
     validate_stage2_conditions,
@@ -137,6 +138,62 @@ class Stage2SelectionPlanTests(unittest.TestCase):
         self.assertEqual(directional["selected_count"], legacy["selected_count"])
         self.assertTrue(
             torch.equal(directional["selected_indices"], legacy["selected_indices"])
+        )
+
+    def test_absolute_sign_subsets_partition_without_reranking(self):
+        signed_z = torch.arange(-2000, 2000, dtype=torch.float32) + 0.5
+        absolute = build_stage2_selection_plan(
+            signed_z.abs(),
+            signed_z=signed_z,
+            selection_direction="absolute",
+            selection=self.selections[0],
+            layer0_included=False,
+            **self.structure,
+        )
+        plans = {
+            target: restrict_absolute_plan_to_intervention_sign(
+                absolute,
+                signed_z,
+                intervention_target_sign=target,
+                **self.structure,
+            )
+            for target in ("all", "positive", "negative")
+        }
+        for key, value in absolute.items():
+            if isinstance(value, torch.Tensor):
+                self.assertTrue(torch.equal(plans["all"][key], value))
+            else:
+                self.assertEqual(plans["all"][key], value)
+        positive = set(plans["positive"]["selected_indices"].tolist())
+        negative = set(plans["negative"]["selected_indices"].tolist())
+        self.assertFalse(positive & negative)
+        self.assertEqual(positive | negative, set(absolute["selected_indices"].tolist()))
+        self.assertTrue(
+            (signed_z[plans["positive"]["selected_indices"]] > 0).all().item()
+        )
+        self.assertTrue(
+            (signed_z[plans["negative"]["selected_indices"]] < 0).all().item()
+        )
+        self.assertTrue(
+            torch.equal(
+                plans["positive"]["selected_indices"],
+                absolute["selected_indices"][
+                    signed_z[absolute["selected_indices"]] > 0
+                ],
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                plans["negative"]["selected_indices"],
+                absolute["selected_indices"][
+                    signed_z[absolute["selected_indices"]] < 0
+                ],
+            )
+        )
+        self.assertEqual(
+            plans["positive"]["selected_count"]
+            + plans["negative"]["selected_count"],
+            plans["all"]["selected_count"],
         )
 
 

@@ -67,8 +67,10 @@ from utils.gcg_dynamic_asym_selection_diagnostics import (  # noqa: E402
 )
 from utils.gcg_dynamic_asym_intervention import load_dynamic_reference  # noqa: E402
 from utils.gcg_dynamic_asym_stage2 import (  # noqa: E402
+    ABSOLUTE_INTERVENTION_TARGETS,
     build_stage2_selection_plan,
     patch_llama_stage2_dynamic_asymmetry_attention,
+    restrict_absolute_plan_to_intervention_sign,
     stage2_selection_conditions,
 )
 from utils.gcg_first_token_reference_ablation import (  # noqa: E402
@@ -158,6 +160,11 @@ def parse_args(argv=None):
         default="absolute",
     )
     parser.add_argument(
+        "--absolute-intervention-target",
+        choices=ABSOLUTE_INTERVENTION_TARGETS,
+        default="all",
+    )
+    parser.add_argument(
         "--reference-source",
         choices=("gcg-selection20-original", "autodan-selection20-official"),
         default="gcg-selection20-original",
@@ -178,6 +185,18 @@ def parse_args(argv=None):
 
 
 def validate_request(args) -> Path | None:
+    if (
+        args.absolute_intervention_target != "all"
+        and args.selection_direction != "absolute"
+    ):
+        raise ValueError(
+            "sign-restricted absolute intervention requires --selection-direction absolute"
+        )
+    if (
+        args.absolute_intervention_target != "all"
+        and args.component != "antisymmetric"
+    ):
+        raise ValueError("sign-restricted absolute intervention is fixed to antisymmetric")
     if args.stage == "cpu-preflight":
         if args.output_dir is not None or args.sandbox_exempt_gpu:
             raise ValueError("cpu-preflight cannot write output or claim GPU execution")
@@ -368,6 +387,21 @@ def summarize(rows: list[dict], baseline: list[dict]) -> dict:
         if selected_z_count
         else None
     )
+    absolute_counts = [
+        int(row["absolute_top_n_count"])
+        for row in rows
+        if row.get("absolute_top_n_count") is not None
+    ]
+    absolute_positive_counts = [
+        int(row["absolute_positive_selected_count"])
+        for row in rows
+        if row.get("absolute_positive_selected_count") is not None
+    ]
+    absolute_negative_counts = [
+        int(row["absolute_negative_selected_count"])
+        for row in rows
+        if row.get("absolute_negative_selected_count") is not None
+    ]
     return {
         "prompt_count": len(rows),
         "baseline_successful_count": sum(bool(row["success"]) for row in baseline),
@@ -396,6 +430,19 @@ def summarize(rows: list[dict], baseline: list[dict]) -> dict:
             int(row["negative_selected_count"]) for row in rows
         ),
         "selected_z": selected_z_summary,
+        "absolute_top_n_count_mean": (
+            statistics.fmean(absolute_counts) if absolute_counts else None
+        ),
+        "absolute_positive_selected_count_mean": (
+            statistics.fmean(absolute_positive_counts)
+            if absolute_positive_counts
+            else None
+        ),
+        "absolute_negative_selected_count_mean": (
+            statistics.fmean(absolute_negative_counts)
+            if absolute_negative_counts
+            else None
+        ),
         "cap_activated_prompt_count": sum(bool(row["cap_activated"]) for row in rows),
         "cap_violation_count": sum(row["selected_count"] > row["cap_count"] for row in rows),
         "generation_failure_count": 0,
@@ -477,6 +524,15 @@ def run(args, output_dir: Path, provenance: dict, baseline: list[dict]) -> dict:
             signed_z=z_scores,
             selection_direction=args.selection_direction,
         )
+        if args.selection_direction == "absolute":
+            plan = restrict_absolute_plan_to_intervention_sign(
+                plan,
+                z_scores,
+                intervention_target_sign=args.absolute_intervention_target,
+                layer_count=NUM_LAYERS,
+                head_count=NUM_HEADS,
+                elements_per_head=collection["strict_lower_elements_per_head"],
+            )
         with patch_llama_stage2_dynamic_asymmetry_attention(
             model,
             reference=reference,
@@ -519,6 +575,16 @@ def run(args, output_dir: Path, provenance: dict, baseline: list[dict]) -> dict:
                 **comparison,
                 "transition": classify_transition(bool(base["success"]), bool(generated["success"])),
                 "selection_direction": plan["selection_direction"],
+                "intervention_target_sign": plan.get(
+                    "intervention_target_sign", "all"
+                ),
+                "absolute_top_n_count": plan.get("absolute_top_n_count"),
+                "absolute_positive_selected_count": plan.get(
+                    "absolute_positive_selected_count"
+                ),
+                "absolute_negative_selected_count": plan.get(
+                    "absolute_negative_selected_count"
+                ),
                 "requested_count": plan["requested_count"],
                 "nominal_selected_count": plan["requested_or_threshold_eligible_count"],
                 "sign_eligible_candidate_count": plan[
@@ -542,6 +608,7 @@ def run(args, output_dir: Path, provenance: dict, baseline: list[dict]) -> dict:
         "experiment_role": f"fixed_dynamic_{args.component}_{args.dataset}_evaluation",
         "component": args.component,
         "selection_direction": args.selection_direction,
+        "intervention_target_sign": args.absolute_intervention_target,
         "selection": selection,
         "alpha": ALPHA,
         "layer0_included": LAYER0_INCLUDED,
@@ -567,6 +634,7 @@ def run(args, output_dir: Path, provenance: dict, baseline: list[dict]) -> dict:
             "dataset": args.dataset,
             "component": args.component,
             "selection_direction": args.selection_direction,
+            "intervention_target_sign": args.absolute_intervention_target,
             "autodan_split": args.autodan_split if args.dataset == "autodan130" else None,
             "reference_source": args.reference_source,
             "selection": selection,
@@ -617,6 +685,7 @@ def main(argv=None):
         "selection": fixed_selection(args.proportional_rate),
         "component": args.component,
         "selection_direction": args.selection_direction,
+        "intervention_target_sign": args.absolute_intervention_target,
         "alpha": ALPHA,
         "layer0_included": LAYER0_INCLUDED,
         "cap_rate": 0.005,
