@@ -117,6 +117,28 @@ class Stage2SelectionPlanTests(unittest.TestCase):
         self.assertEqual(excluded["selected_count"], 1)
         self.assertEqual(excluded["selected_indices"].tolist(), [1000])
 
+    def test_absolute_direction_preserves_indices_and_order(self):
+        signed_z = torch.arange(-2000, 2000, dtype=torch.float32)
+        absolute_z = signed_z.abs()
+        legacy = build_stage2_selection_plan(
+            absolute_z,
+            selection=self.selections[0],
+            layer0_included=False,
+            **self.structure,
+        )
+        directional = build_stage2_selection_plan(
+            absolute_z,
+            signed_z=signed_z,
+            selection_direction="absolute",
+            selection=self.selections[0],
+            layer0_included=False,
+            **self.structure,
+        )
+        self.assertEqual(directional["selected_count"], legacy["selected_count"])
+        self.assertTrue(
+            torch.equal(directional["selected_indices"], legacy["selected_indices"])
+        )
+
 
 class Stage2ControllerTests(unittest.TestCase):
     def setUp(self):
@@ -142,8 +164,15 @@ class Stage2ControllerTests(unittest.TestCase):
             "cap_activated": False,
             "cap_excluded_count": 0,
             "requested_or_threshold_eligible_count": 1,
+            "requested_count": 1,
+            "selection_direction": "absolute",
+            "sign_eligible_candidate_count": 12,
+            "selection_shortfall_count": 0,
             "threshold_eligible_count": None,
             "selected_abs_z": {},
+            "selected_z": {},
+            "positive_selected_count": 1,
+            "negative_selected_count": 0,
             "layer_counts": [0, 1],
             "head_counts": [1, 0],
             "layer_head_counts": [[0, 0], [1, 0]],

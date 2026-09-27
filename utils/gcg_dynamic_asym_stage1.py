@@ -30,6 +30,7 @@ CAP_RATE = CAP_NUMERATOR / RATE_DENOMINATOR
 FIXED_TOP_VALUES = (250, 500, 750)
 PROPORTIONAL_RATE_NUMERATORS = (1, 2, 4)
 THRESHOLD_VALUES = (3.0, 2.8, 2.7)
+SELECTION_DIRECTIONS = ("absolute", "positive", "negative")
 
 
 def stage1_conditions() -> tuple[dict, ...]:
@@ -122,6 +123,8 @@ def build_stage1_selection_plan(
     elements_per_head: int,
     eligible_mask: torch.Tensor | None = None,
     cap_candidate_count: int | None = None,
+    signed_z: torch.Tensor | None = None,
+    selection_direction: str = "absolute",
 ) -> dict:
     """Build one deterministic global Layer×Head×position selection plan.
 
@@ -136,9 +139,26 @@ def build_stage1_selection_plan(
         raise ValueError("abs_z must be a floating-point CPU tensor")
     if not bool(torch.isfinite(abs_z).all().item()):
         raise ValueError("abs_z contains NaN or infinity")
+    if selection_direction not in SELECTION_DIRECTIONS:
+        raise ValueError("selection_direction must be absolute, positive, or negative")
     expected_candidates = layer_count * head_count * elements_per_head
     if abs_z.numel() != expected_candidates:
         raise ValueError("abs_z candidate count does not match its structure")
+    if signed_z is not None:
+        if (
+            not isinstance(signed_z, torch.Tensor)
+            or signed_z.ndim != 1
+            or signed_z.device.type != "cpu"
+            or not signed_z.is_floating_point()
+            or signed_z.numel() != expected_candidates
+        ):
+            raise ValueError("signed_z must be a floating-point CPU candidate vector")
+        if not bool(torch.isfinite(signed_z).all().item()):
+            raise ValueError("signed_z contains NaN or infinity")
+        if not torch.equal(abs_z, signed_z.abs()):
+            raise ValueError("abs_z does not exactly match abs(signed_z)")
+    elif selection_direction != "absolute":
+        raise ValueError("signed_z is required for directional selection")
     if eligible_mask is None:
         eligible_indices = torch.arange(expected_candidates, dtype=torch.int64)
     else:
@@ -169,12 +189,29 @@ def build_stage1_selection_plan(
     requested_count, eligible_count = _condition_selection_count(
         condition, eligible_candidate_count
     )
+    if selection_direction == "absolute":
+        sign_eligible_indices = eligible_indices
+        ranking_values = abs_z
+    elif selection_direction == "positive":
+        sign_eligible_indices = eligible_indices[
+            signed_z[eligible_indices] > 0
+        ].contiguous()
+        ranking_values = signed_z
+    else:
+        sign_eligible_indices = eligible_indices[
+            signed_z[eligible_indices] < 0
+        ].contiguous()
+        ranking_values = -signed_z
+    sign_eligible_candidate_count = int(sign_eligible_indices.numel())
     if family in ("fixed_top_n", "proportional_top_n"):
-        selected_count = min(requested_count, cap, eligible_candidate_count)
-        if selected_count <= 0:
-            raise ValueError("Stage 1 Top-N condition selected no elements")
-        local_indices = stable_top_indices(abs_z[eligible_indices], selected_count)
-        selected_indices = eligible_indices[local_indices].contiguous()
+        selected_count = min(requested_count, cap, sign_eligible_candidate_count)
+        if selected_count:
+            local_indices = stable_top_indices(
+                ranking_values[sign_eligible_indices], selected_count
+            )
+            selected_indices = sign_eligible_indices[local_indices].contiguous()
+        else:
+            selected_indices = torch.empty(0, dtype=torch.int64)
     elif family == "z_score_threshold":
         tau = condition.get("tau")
         if isinstance(tau, bool) or not isinstance(tau, (int, float)):
@@ -182,13 +219,15 @@ def build_stage1_selection_plan(
         tau = float(tau)
         if not math.isfinite(tau) or tau < 0:
             raise ValueError("threshold tau must be finite and non-negative")
-        threshold_indices = eligible_indices[abs_z[eligible_indices] > tau].contiguous()
+        threshold_indices = sign_eligible_indices[
+            ranking_values[sign_eligible_indices] > tau
+        ].contiguous()
         eligible_count = int(threshold_indices.numel())
         requested_count = eligible_count
         if eligible_count > cap:
-            local_indices = stable_top_indices(abs_z[threshold_indices], cap)
+            local_indices = stable_top_indices(ranking_values[threshold_indices], cap)
             selected_indices = threshold_indices[local_indices].contiguous()
-            if not bool((abs_z[selected_indices] > tau).all().item()):
+            if not bool((ranking_values[selected_indices] > tau).all().item()):
                 raise AssertionError("threshold cap selected an ineligible element")
         else:
             selected_indices = threshold_indices
@@ -196,35 +235,79 @@ def build_stage1_selection_plan(
     else:
         raise ValueError("unknown Stage 1 selection family")
 
-    cap_activated = requested_count > cap
-    cap_excluded_count = max(0, requested_count - cap)
+    pre_cap_selected_count = min(requested_count, sign_eligible_candidate_count)
+    cap_activated = pre_cap_selected_count > cap
+    cap_excluded_count = max(0, pre_cap_selected_count - cap)
+    selection_shortfall_count = (
+        max(0, min(requested_count, cap) - selected_count)
+        if family in ("fixed_top_n", "proportional_top_n")
+        else 0
+    )
     if selected_count > cap:
         raise AssertionError("Stage 1 plan exceeds the 0.5% cap")
     if cap_activated != (cap_excluded_count > 0):
         raise AssertionError("Stage 1 cap activation accounting mismatch")
-    counts = selection_count_summary(
-        selected_indices,
-        layer_count=layer_count,
-        head_count=head_count,
-        elements_per_head=elements_per_head,
-    )
+    if selected_count:
+        counts = selection_count_summary(
+            selected_indices,
+            layer_count=layer_count,
+            head_count=head_count,
+            elements_per_head=elements_per_head,
+        )
+    else:
+        counts = {
+            "layer_counts": [0] * layer_count,
+            "head_counts": [0] * head_count,
+            "layer_head_counts": [[0] * head_count for _ in range(layer_count)],
+        }
     selected_values = abs_z[selected_indices]
+    selected_signed_z = signed_z[selected_indices] if signed_z is not None else None
+    if selection_direction == "positive" and selected_count and not bool(
+        (selected_signed_z > 0).all().item()
+    ):
+        raise AssertionError("positive direction selected a non-positive z-score")
+    if selection_direction == "negative" and selected_count and not bool(
+        (selected_signed_z < 0).all().item()
+    ):
+        raise AssertionError("negative direction selected a non-negative z-score")
     return {
         "condition": dict(condition),
+        "selection_direction": selection_direction,
         "candidate_count": expected_candidates,
         "eligible_candidate_count": eligible_candidate_count,
         "excluded_candidate_count": expected_candidates - eligible_candidate_count,
         "cap_candidate_count": cap_candidate_count,
         "cap_rate": CAP_RATE,
         "cap_count": cap,
+        "requested_count": requested_count,
         "requested_or_threshold_eligible_count": requested_count,
+        "sign_eligible_candidate_count": sign_eligible_candidate_count,
         "threshold_eligible_count": eligible_count if family == "z_score_threshold" else None,
+        "selection_shortfall_count": selection_shortfall_count,
+        "actual_selected_count": selected_count,
         "selected_count": selected_count,
         "selected_fraction": selected_count / expected_candidates,
         "cap_activated": cap_activated,
         "cap_excluded_count": cap_excluded_count,
         "selected_indices": selected_indices,
-        "selected_abs_z": distribution_summary(selected_values),
+        "selected_abs_z": (
+            distribution_summary(selected_values) if selected_count else None
+        ),
+        "selected_z": (
+            distribution_summary(selected_signed_z)
+            if selected_signed_z is not None and selected_count
+            else None
+        ),
+        "positive_selected_count": (
+            int((selected_signed_z > 0).sum().item())
+            if selected_signed_z is not None
+            else None
+        ),
+        "negative_selected_count": (
+            int((selected_signed_z < 0).sum().item())
+            if selected_signed_z is not None
+            else None
+        ),
         **counts,
     }
 
@@ -339,6 +422,21 @@ class PlannedDynamicAsymmetryController(DynamicAsymmetryController):
                 "layer0_included": True,
                 "cap_rate": CAP_RATE,
                 "cap_count": self._plan_metadata["cap_count"],
+                "selection_direction": self._plan_metadata["selection_direction"],
+                "requested_count": self._plan_metadata["requested_count"],
+                "sign_eligible_candidate_count": self._plan_metadata[
+                    "sign_eligible_candidate_count"
+                ],
+                "selection_shortfall_count": self._plan_metadata[
+                    "selection_shortfall_count"
+                ],
+                "selected_z": self._plan_metadata["selected_z"],
+                "positive_selected_count": self._plan_metadata[
+                    "positive_selected_count"
+                ],
+                "negative_selected_count": self._plan_metadata[
+                    "negative_selected_count"
+                ],
                 "cap_activated": self._plan_metadata["cap_activated"],
                 "cap_excluded_count": self._plan_metadata["cap_excluded_count"],
                 "planned_selected_count": self._plan_metadata["selected_count"],

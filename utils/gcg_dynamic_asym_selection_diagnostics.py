@@ -401,7 +401,7 @@ def threshold_selection_summary(
 
 
 class FullPromptAbsZCollector:
-    """Collect full strict-lower absolute z-scores without changing scores."""
+    """Collect full strict-lower z-scores without changing attention scores."""
 
     def __init__(
         self,
@@ -433,7 +433,7 @@ class FullPromptAbsZCollector:
         self.sigma: torch.Tensor | None = None
         self.sigma_floor_head_count = 0
         self._reference_cache.clear()
-        self._abs_z_by_layer: dict[int, torch.Tensor] = {}
+        self._z_by_layer: dict[int, torch.Tensor] = {}
         self._element_counts: dict[int, int] = {}
         self.pre_score_nonfinite_count = 0
         self.z_nonfinite_count = 0
@@ -446,7 +446,7 @@ class FullPromptAbsZCollector:
         mu: torch.Tensor,
         sigma: torch.Tensor,
     ) -> None:
-        if self._abs_z_by_layer:
+        if self._z_by_layer:
             raise ReferenceInterventionRuntimeError(
                 "diagnostic context must be set before attention forwards"
             )
@@ -498,7 +498,7 @@ class FullPromptAbsZCollector:
             raise ReferenceInterventionRuntimeError("diagnostic prompt context is missing")
         if type(layer) is not int or not 0 <= layer < self.layer_count:
             raise ReferenceInterventionRuntimeError("diagnostic layer index is invalid")
-        if layer in self._abs_z_by_layer:
+        if layer in self._z_by_layer:
             raise ReferenceInterventionRuntimeError("diagnostic saw a layer more than once")
         if not isinstance(attention_scores, torch.Tensor) or attention_scores.ndim != 4:
             raise ReferenceInterventionRuntimeError(
@@ -531,26 +531,26 @@ class FullPromptAbsZCollector:
         component_values = (scores + sign * scores.transpose(-1, -2)) / 2.0
         current_lower = component_values[0, :, rows, cols]
         mu, safe_sigma = self._layer_reference(layer, attention_scores.device)
-        abs_z = (
-            (current_lower - mu.view(-1, 1)) / safe_sigma.view(-1, 1)
-        ).abs()
-        nonfinite_z = int((~torch.isfinite(abs_z)).sum().item())
+        z_scores = (current_lower - mu.view(-1, 1)) / safe_sigma.view(-1, 1)
+        nonfinite_z = int((~torch.isfinite(z_scores)).sum().item())
         self.z_nonfinite_count += nonfinite_z
         if nonfinite_z:
             raise ReferenceInterventionRuntimeError(
-                "diagnostic absolute z-scores contain NaN or infinity"
+                "diagnostic z-scores contain NaN or infinity"
             )
-        if tuple(abs_z.shape) != (self.head_count, elements_per_head):
-            raise AssertionError("diagnostic absolute z-score shape mismatch")
-        self._abs_z_by_layer[layer] = abs_z.detach().to(
+        if tuple(z_scores.shape) != (self.head_count, elements_per_head):
+            raise AssertionError("diagnostic z-score shape mismatch")
+        self._z_by_layer[layer] = z_scores.detach().to(
             device="cpu", dtype=torch.float32
         ).contiguous()
         self._element_counts[layer] = elements_per_head
         return attention_scores
 
-    def result(self) -> tuple[torch.Tensor, dict]:
+    def result(self, *, signed: bool = False) -> tuple[torch.Tensor, dict]:
+        if type(signed) is not bool:
+            raise TypeError("signed must be bool")
         expected_layers = set(range(self.layer_count))
-        if set(self._abs_z_by_layer) != expected_layers:
+        if set(self._z_by_layer) != expected_layers:
             raise ReferenceInterventionRuntimeError(
                 "diagnostic did not observe every attention layer exactly once"
             )
@@ -561,12 +561,14 @@ class FullPromptAbsZCollector:
             )
         elements_per_head = element_counts.pop()
         stacked = torch.stack(
-            [self._abs_z_by_layer[layer] for layer in range(self.layer_count)]
+            [self._z_by_layer[layer] for layer in range(self.layer_count)]
         )
         expected_shape = (self.layer_count, self.head_count, elements_per_head)
         if tuple(stacked.shape) != expected_shape:
-            raise AssertionError("diagnostic stacked absolute z-score shape mismatch")
+            raise AssertionError("diagnostic stacked z-score shape mismatch")
         flattened = stacked.reshape(-1).contiguous()
+        if not signed:
+            flattened = flattened.abs()
         expected_candidates = candidate_count(
             self.prompt_length,
             layer_count=self.layer_count,

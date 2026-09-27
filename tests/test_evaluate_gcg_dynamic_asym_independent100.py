@@ -60,6 +60,12 @@ class Independent100DynamicAsymTest(unittest.TestCase):
         args = parse_args(["--proportional-rate", "0.005"])
         self.assertEqual(args.proportional_rate, 0.005)
 
+    def test_selection_direction_cli(self):
+        self.assertEqual(
+            parse_args(["--selection-direction", "positive"]).selection_direction,
+            "positive",
+        )
+
     def test_half_percent_uses_layer0_excluded_candidates_and_full_cap(self):
         plan = build_stage2_selection_plan(
             torch.arange(4000, dtype=torch.float32),
@@ -90,8 +96,13 @@ class Independent100DynamicAsymTest(unittest.TestCase):
                 "transition": "newly_defended",
                 "response_equal": False,
                 "nominal_selected_count": 10,
+                "sign_eligible_candidate_count": 100,
+                "selection_shortfall_count": 0,
                 "selected_count": 10,
                 "selected_fraction": 0.001,
+                "selected_z": {"count": 10, "min": 1.0, "mean": 2.0, "max": 3.0},
+                "positive_selected_count": 10,
+                "negative_selected_count": 0,
                 "cap_count": 50,
                 "cap_activated": False,
                 "diagnostics": {"later_forward_intervention_count": 0},
@@ -101,8 +112,13 @@ class Independent100DynamicAsymTest(unittest.TestCase):
                 "transition": "newly_worsened",
                 "response_equal": True,
                 "nominal_selected_count": 20,
+                "sign_eligible_candidate_count": 200,
+                "selection_shortfall_count": 0,
                 "selected_count": 20,
                 "selected_fraction": 0.001,
+                "selected_z": {"count": 20, "min": 2.0, "mean": 3.0, "max": 4.0},
+                "positive_selected_count": 20,
+                "negative_selected_count": 0,
                 "cap_count": 100,
                 "cap_activated": False,
                 "diagnostics": {"later_forward_intervention_count": 0},
@@ -115,6 +131,9 @@ class Independent100DynamicAsymTest(unittest.TestCase):
         self.assertEqual(summary["worsening_count"], 1)
         self.assertEqual(summary["response_changed_count"], 1)
         self.assertEqual(summary["nominal_selected_count_mean"], 15.0)
+        self.assertEqual(summary["sign_eligible_candidate_count_mean"], 150.0)
+        self.assertEqual(summary["selection_shortfall_count_total"], 0)
+        self.assertAlmostEqual(summary["selected_z"]["mean"], 8 / 3)
         self.assertEqual(summary["selected_count_mean"], 15.0)
         self.assertEqual(summary["cap_violation_count"], 0)
         self.assertEqual(summary["decode_intervention_count"], 0)

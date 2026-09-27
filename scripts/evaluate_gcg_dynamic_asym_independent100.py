@@ -153,6 +153,11 @@ def parse_args(argv=None):
         default="antisymmetric",
     )
     parser.add_argument(
+        "--selection-direction",
+        choices=("absolute", "positive", "negative"),
+        default="absolute",
+    )
+    parser.add_argument(
         "--reference-source",
         choices=("gcg-selection20-original", "autodan-selection20-official"),
         default="gcg-selection20-original",
@@ -350,6 +355,19 @@ def summarize(rows: list[dict], baseline: list[dict]) -> dict:
     counts = [int(row["selected_count"]) for row in rows]
     nominal_counts = [int(row["nominal_selected_count"]) for row in rows]
     fractions = [float(row["selected_fraction"]) for row in rows]
+    selected_z_rows = [row["selected_z"] for row in rows if row["selected_z"]]
+    selected_z_count = sum(int(row["count"]) for row in selected_z_rows)
+    selected_z_summary = (
+        {
+            "count": selected_z_count,
+            "min": min(float(row["min"]) for row in selected_z_rows),
+            "mean": sum(float(row["mean"]) * int(row["count"]) for row in selected_z_rows)
+            / selected_z_count,
+            "max": max(float(row["max"]) for row in selected_z_rows),
+        }
+        if selected_z_count
+        else None
+    )
     return {
         "prompt_count": len(rows),
         "baseline_successful_count": sum(bool(row["success"]) for row in baseline),
@@ -362,6 +380,22 @@ def summarize(rows: list[dict], baseline: list[dict]) -> dict:
         "nominal_selected_count_mean": statistics.fmean(nominal_counts),
         "selected_count_mean": statistics.fmean(counts),
         "selected_fraction_mean": statistics.fmean(fractions),
+        "sign_eligible_candidate_count_mean": statistics.fmean(
+            int(row["sign_eligible_candidate_count"]) for row in rows
+        ),
+        "selection_shortfall_prompt_count": sum(
+            int(row["selection_shortfall_count"]) > 0 for row in rows
+        ),
+        "selection_shortfall_count_total": sum(
+            int(row["selection_shortfall_count"]) for row in rows
+        ),
+        "positive_selected_count": sum(
+            int(row["positive_selected_count"]) for row in rows
+        ),
+        "negative_selected_count": sum(
+            int(row["negative_selected_count"]) for row in rows
+        ),
+        "selected_z": selected_z_summary,
         "cap_activated_prompt_count": sum(bool(row["cap_activated"]) for row in rows),
         "cap_violation_count": sum(row["selected_count"] > row["cap_count"] for row in rows),
         "generation_failure_count": 0,
@@ -431,7 +465,8 @@ def run(args, output_dir: Path, provenance: dict, baseline: list[dict]) -> dict:
                     use_cache=False,
                     return_dict=True,
                 )
-            abs_z, collection = collector.result()
+            z_scores, collection = collector.result(signed=True)
+            abs_z = z_scores.abs()
         plan = build_stage2_selection_plan(
             abs_z,
             selection=selection,
@@ -439,6 +474,8 @@ def run(args, output_dir: Path, provenance: dict, baseline: list[dict]) -> dict:
             head_count=NUM_HEADS,
             elements_per_head=collection["strict_lower_elements_per_head"],
             layer0_included=LAYER0_INCLUDED,
+            signed_z=z_scores,
+            selection_direction=args.selection_direction,
         )
         with patch_llama_stage2_dynamic_asymmetry_attention(
             model,
@@ -481,9 +518,18 @@ def run(args, output_dir: Path, provenance: dict, baseline: list[dict]) -> dict:
                 **{key: value for key, value in generated.items() if key != "first_logits"},
                 **comparison,
                 "transition": classify_transition(bool(base["success"]), bool(generated["success"])),
+                "selection_direction": plan["selection_direction"],
+                "requested_count": plan["requested_count"],
                 "nominal_selected_count": plan["requested_or_threshold_eligible_count"],
+                "sign_eligible_candidate_count": plan[
+                    "sign_eligible_candidate_count"
+                ],
+                "selection_shortfall_count": plan["selection_shortfall_count"],
                 "selected_count": plan["selected_count"],
                 "selected_fraction": plan["selected_fraction"],
+                "selected_z": plan["selected_z"],
+                "positive_selected_count": plan["positive_selected_count"],
+                "negative_selected_count": plan["negative_selected_count"],
                 "cap_count": plan["cap_count"],
                 "cap_activated": plan["cap_activated"],
                 "diagnostics": diagnostics,
@@ -495,6 +541,7 @@ def run(args, output_dir: Path, provenance: dict, baseline: list[dict]) -> dict:
         "schema_version": 1,
         "experiment_role": f"fixed_dynamic_{args.component}_{args.dataset}_evaluation",
         "component": args.component,
+        "selection_direction": args.selection_direction,
         "selection": selection,
         "alpha": ALPHA,
         "layer0_included": LAYER0_INCLUDED,
@@ -519,6 +566,7 @@ def run(args, output_dir: Path, provenance: dict, baseline: list[dict]) -> dict:
         "scientific_conditions": {
             "dataset": args.dataset,
             "component": args.component,
+            "selection_direction": args.selection_direction,
             "autodan_split": args.autodan_split if args.dataset == "autodan130" else None,
             "reference_source": args.reference_source,
             "selection": selection,
@@ -568,6 +616,7 @@ def main(argv=None):
         "status": "cpu_preflight_passed",
         "selection": fixed_selection(args.proportional_rate),
         "component": args.component,
+        "selection_direction": args.selection_direction,
         "alpha": ALPHA,
         "layer0_included": LAYER0_INCLUDED,
         "cap_rate": 0.005,

@@ -109,6 +109,71 @@ class Stage1SelectionPlanTests(unittest.TestCase):
         self.assertEqual(plan["cap_excluded_count"], 1)
         self.assertGreater(plan["selected_abs_z"]["min"], 3.0)
 
+    def test_absolute_direction_exactly_matches_legacy_indices_and_order(self):
+        signed_z = torch.arange(-200, 200, dtype=torch.float32)
+        absolute_z = signed_z.abs()
+        legacy = build_stage1_selection_plan(
+            absolute_z,
+            condition=self.conditions[0],
+            **self.structure,
+        )
+        directional = build_stage1_selection_plan(
+            absolute_z,
+            signed_z=signed_z,
+            selection_direction="absolute",
+            condition=self.conditions[0],
+            **self.structure,
+        )
+        self.assertEqual(directional["selected_count"], legacy["selected_count"])
+        self.assertTrue(
+            torch.equal(directional["selected_indices"], legacy["selected_indices"])
+        )
+
+    def test_positive_and_negative_rank_signed_tails_with_same_requested_n(self):
+        signed_z = torch.arange(-1000, 1000, dtype=torch.float32)
+        structure = {"layer_count": 2, "head_count": 2, "elements_per_head": 500}
+        positive = build_stage1_selection_plan(
+            signed_z.abs(),
+            signed_z=signed_z,
+            selection_direction="positive",
+            condition=self.conditions[5],
+            **structure,
+        )
+        negative = build_stage1_selection_plan(
+            signed_z.abs(),
+            signed_z=signed_z,
+            selection_direction="negative",
+            condition=self.conditions[5],
+            **structure,
+        )
+        self.assertEqual(positive["requested_count"], 8)
+        self.assertEqual(negative["requested_count"], 8)
+        self.assertEqual(positive["selected_indices"].tolist(), list(range(1999, 1991, -1)))
+        self.assertEqual(negative["selected_indices"].tolist(), list(range(8)))
+        self.assertEqual(positive["positive_selected_count"], 8)
+        self.assertEqual(positive["negative_selected_count"], 0)
+        self.assertEqual(negative["positive_selected_count"], 0)
+        self.assertEqual(negative["negative_selected_count"], 8)
+        self.assertGreater(positive["selected_z"]["min"], 0)
+        self.assertLess(negative["selected_z"]["max"], 0)
+
+    def test_directional_shortfall_is_reported_without_top_up(self):
+        signed_z = -torch.arange(1, 401, dtype=torch.float32)
+        signed_z[17] = 5.0
+        plan = build_stage1_selection_plan(
+            signed_z.abs(),
+            signed_z=signed_z,
+            selection_direction="positive",
+            condition=self.conditions[0],
+            **self.structure,
+        )
+        self.assertEqual(plan["requested_count"], 250)
+        self.assertEqual(plan["cap_count"], 2)
+        self.assertEqual(plan["sign_eligible_candidate_count"], 1)
+        self.assertEqual(plan["selected_indices"].tolist(), [17])
+        self.assertEqual(plan["actual_selected_count"], 1)
+        self.assertEqual(plan["selection_shortfall_count"], 1)
+
 
 class PlannedControllerTests(unittest.TestCase):
     def setUp(self):
@@ -136,8 +201,15 @@ class PlannedControllerTests(unittest.TestCase):
             "cap_activated": False,
             "cap_excluded_count": 0,
             "requested_or_threshold_eligible_count": 2,
+            "requested_count": 2,
+            "selection_direction": "absolute",
+            "sign_eligible_candidate_count": 24,
+            "selection_shortfall_count": 0,
             "threshold_eligible_count": None,
             "selected_abs_z": {},
+            "selected_z": {},
+            "positive_selected_count": 2,
+            "negative_selected_count": 0,
             "layer_counts": [1, 1],
             "head_counts": [2, 0],
             "layer_head_counts": [[1, 0], [1, 0]],

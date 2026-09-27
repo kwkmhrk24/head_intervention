@@ -118,6 +118,8 @@ def build_stage2_selection_plan(
     head_count: int,
     elements_per_head: int,
     layer0_included: bool,
+    signed_z: torch.Tensor | None = None,
+    selection_direction: str = "absolute",
 ) -> dict:
     """Apply the Stage 1 rule after the frozen Layer 0 eligibility filter.
 
@@ -140,6 +142,8 @@ def build_stage2_selection_plan(
         elements_per_head=elements_per_head,
         eligible_mask=mask,
         cap_candidate_count=full_count,
+        signed_z=signed_z,
+        selection_direction=selection_direction,
     )
     plan["layer0_included"] = layer0_included
     plan["selection_candidate_definition"] = (
@@ -213,6 +217,21 @@ class Stage2PlannedDynamicAsymmetryController(PlannedDynamicAsymmetryController)
                 "cap_candidate_count": self._plan_metadata["cap_candidate_count"],
                 "eligible_candidate_count": self._plan_metadata[
                     "eligible_candidate_count"
+                ],
+                "selection_direction": self._plan_metadata["selection_direction"],
+                "requested_count": self._plan_metadata["requested_count"],
+                "sign_eligible_candidate_count": self._plan_metadata[
+                    "sign_eligible_candidate_count"
+                ],
+                "selection_shortfall_count": self._plan_metadata[
+                    "selection_shortfall_count"
+                ],
+                "selected_z": self._plan_metadata["selected_z"],
+                "positive_selected_count": self._plan_metadata[
+                    "positive_selected_count"
+                ],
+                "negative_selected_count": self._plan_metadata[
+                    "negative_selected_count"
                 ],
                 "cap_activated": self._plan_metadata["cap_activated"],
                 "cap_excluded_count": self._plan_metadata["cap_excluded_count"],
