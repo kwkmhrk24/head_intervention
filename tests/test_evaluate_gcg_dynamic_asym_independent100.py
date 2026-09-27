@@ -82,6 +82,13 @@ class Independent100DynamicAsymTest(unittest.TestCase):
                 )
             )
 
+        matched = parse_args(
+            ["--absolute-intervention-target", "positive-count-matched"]
+        )
+        self.assertEqual(
+            matched.absolute_intervention_target, "positive-count-matched"
+        )
+
     def test_half_percent_uses_layer0_excluded_candidates_and_full_cap(self):
         plan = build_stage2_selection_plan(
             torch.arange(4000, dtype=torch.float32),

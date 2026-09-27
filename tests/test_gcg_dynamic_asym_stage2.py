@@ -141,7 +141,8 @@ class Stage2SelectionPlanTests(unittest.TestCase):
         )
 
     def test_absolute_sign_subsets_partition_without_reranking(self):
-        signed_z = torch.arange(-2000, 2000, dtype=torch.float32) + 0.5
+        signed_z = torch.arange(1, 4001, dtype=torch.float32)
+        signed_z[1::2].neg_()
         absolute = build_stage2_selection_plan(
             signed_z.abs(),
             signed_z=signed_z,
@@ -194,6 +195,45 @@ class Stage2SelectionPlanTests(unittest.TestCase):
             plans["positive"]["selected_count"]
             + plans["negative"]["selected_count"],
             plans["all"]["selected_count"],
+        )
+
+        matched = {
+            target: restrict_absolute_plan_to_intervention_sign(
+                absolute,
+                signed_z,
+                intervention_target_sign=f"{target}-count-matched",
+                **self.structure,
+            )
+            for target in ("positive", "negative")
+        }
+        expected_count = min(
+            plans["positive"]["selected_count"],
+            plans["negative"]["selected_count"],
+        )
+        self.assertGreater(expected_count, 0)
+        for target in ("positive", "negative"):
+            self.assertEqual(matched[target]["selected_count"], expected_count)
+            self.assertEqual(matched[target]["matched_count"], expected_count)
+            self.assertEqual(matched[target]["layer_counts"][0], 0)
+            self.assertLessEqual(
+                matched[target]["selected_count"], matched[target]["cap_count"]
+            )
+            self.assertTrue(
+                torch.equal(
+                    matched[target]["selected_indices"],
+                    plans[target]["selected_indices"][:expected_count],
+                )
+            )
+            self.assertTrue(
+                set(matched[target]["selected_indices"].tolist()).issubset(
+                    set(absolute["selected_indices"].tolist())
+                )
+            )
+        self.assertTrue(
+            (signed_z[matched["positive"]["selected_indices"]] > 0).all().item()
+        )
+        self.assertTrue(
+            (signed_z[matched["negative"]["selected_indices"]] < 0).all().item()
         )
 
 

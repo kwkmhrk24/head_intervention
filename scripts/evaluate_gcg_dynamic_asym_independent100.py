@@ -402,6 +402,11 @@ def summarize(rows: list[dict], baseline: list[dict]) -> dict:
         for row in rows
         if row.get("absolute_negative_selected_count") is not None
     ]
+    matched_counts = [
+        int(row["matched_count"])
+        for row in rows
+        if row.get("matched_count") is not None
+    ]
     return {
         "prompt_count": len(rows),
         "baseline_successful_count": sum(bool(row["success"]) for row in baseline),
@@ -413,6 +418,8 @@ def summarize(rows: list[dict], baseline: list[dict]) -> dict:
         "response_changed_count": sum(not row["response_equal"] for row in rows),
         "nominal_selected_count_mean": statistics.fmean(nominal_counts),
         "selected_count_mean": statistics.fmean(counts),
+        "selected_count_min": min(counts),
+        "selected_count_max": max(counts),
         "selected_fraction_mean": statistics.fmean(fractions),
         "sign_eligible_candidate_count_mean": statistics.fmean(
             int(row["sign_eligible_candidate_count"]) for row in rows
@@ -443,6 +450,11 @@ def summarize(rows: list[dict], baseline: list[dict]) -> dict:
             if absolute_negative_counts
             else None
         ),
+        "matched_count_min": min(matched_counts) if matched_counts else None,
+        "matched_count_mean": (
+            statistics.fmean(matched_counts) if matched_counts else None
+        ),
+        "matched_count_max": max(matched_counts) if matched_counts else None,
         "cap_activated_prompt_count": sum(bool(row["cap_activated"]) for row in rows),
         "cap_violation_count": sum(row["selected_count"] > row["cap_count"] for row in rows),
         "generation_failure_count": 0,
@@ -585,6 +597,7 @@ def run(args, output_dir: Path, provenance: dict, baseline: list[dict]) -> dict:
                 "absolute_negative_selected_count": plan.get(
                     "absolute_negative_selected_count"
                 ),
+                "matched_count": plan.get("matched_count"),
                 "requested_count": plan["requested_count"],
                 "nominal_selected_count": plan["requested_or_threshold_eligible_count"],
                 "sign_eligible_candidate_count": plan[

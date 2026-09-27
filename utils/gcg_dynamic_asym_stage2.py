@@ -58,7 +58,13 @@ STAGE2_REUSED_VARIANT = {
     "layer0_included": True,
     "reused_from_stage1": True,
 }
-ABSOLUTE_INTERVENTION_TARGETS = ("all", "positive", "negative")
+ABSOLUTE_INTERVENTION_TARGETS = (
+    "all",
+    "positive",
+    "negative",
+    "positive-count-matched",
+    "negative-count-matched",
+)
 
 
 def stage2_selection_conditions() -> tuple[dict, ...]:
@@ -176,7 +182,7 @@ def restrict_absolute_plan_to_intervention_sign(
     """Restrict an already-ranked absolute Top-N plan without re-ranking."""
 
     if intervention_target_sign not in ABSOLUTE_INTERVENTION_TARGETS:
-        raise ValueError("absolute intervention target must be all, positive, or negative")
+        raise ValueError("absolute intervention target is invalid")
     if plan.get("selection_direction") != "absolute":
         raise ValueError("sign-restricted intervention requires an absolute selection plan")
     expected_candidates = layer_count * head_count * elements_per_head
@@ -213,6 +219,7 @@ def restrict_absolute_plan_to_intervention_sign(
     absolute_count = int(absolute_indices.numel())
     absolute_positive_count = int(positive_indices.numel())
     absolute_negative_count = int(negative_indices.numel())
+    matched_count = min(absolute_positive_count, absolute_negative_count)
     if (
         plan.get("positive_selected_count") != absolute_positive_count
         or plan.get("negative_selected_count") != absolute_negative_count
@@ -227,17 +234,17 @@ def restrict_absolute_plan_to_intervention_sign(
             "absolute_positive_selected_count": absolute_positive_count,
             "absolute_negative_selected_count": absolute_negative_count,
             "absolute_selected_fraction": absolute_count / expected_candidates,
+            "matched_count": matched_count,
         }
     )
     if intervention_target_sign == "all":
         restricted["intervention_subset_excluded_count"] = 0
         return restricted
 
-    selected_indices = (
-        positive_indices
-        if intervention_target_sign == "positive"
-        else negative_indices
-    )
+    target_is_positive = intervention_target_sign.startswith("positive")
+    selected_indices = positive_indices if target_is_positive else negative_indices
+    if intervention_target_sign.endswith("count-matched"):
+        selected_indices = selected_indices[:matched_count].contiguous()
     selected_z = signed_z[selected_indices]
     selected_count = int(selected_indices.numel())
     if selected_count:
@@ -266,10 +273,10 @@ def restrict_absolute_plan_to_intervention_sign(
             "selected_abs_z": selected_abs_z_summary,
             "selected_z": selected_z_summary,
             "positive_selected_count": (
-                selected_count if intervention_target_sign == "positive" else 0
+                selected_count if target_is_positive else 0
             ),
             "negative_selected_count": (
-                selected_count if intervention_target_sign == "negative" else 0
+                0 if target_is_positive else selected_count
             ),
             "intervention_subset_excluded_count": absolute_count - selected_count,
             **counts,
@@ -277,14 +284,16 @@ def restrict_absolute_plan_to_intervention_sign(
     )
     if selected_count > int(plan["cap_count"]):
         raise AssertionError("sign-restricted intervention exceeds the absolute cap")
-    if intervention_target_sign == "positive" and not bool(
+    if target_is_positive and not bool(
         (selected_z > 0).all().item()
     ):
         raise AssertionError("positive-only intervention contains a non-positive z-score")
-    if intervention_target_sign == "negative" and not bool(
+    if not target_is_positive and not bool(
         (selected_z < 0).all().item()
     ):
         raise AssertionError("negative-only intervention contains a non-negative z-score")
+    if intervention_target_sign.endswith("count-matched") and selected_count != matched_count:
+        raise AssertionError("count-matched intervention count mismatch")
     return restricted
 
 
@@ -360,6 +369,7 @@ class Stage2PlannedDynamicAsymmetryController(PlannedDynamicAsymmetryController)
                 "absolute_negative_selected_count": self._plan_metadata.get(
                     "absolute_negative_selected_count"
                 ),
+                "matched_count": self._plan_metadata.get("matched_count"),
                 "requested_count": self._plan_metadata["requested_count"],
                 "sign_eligible_candidate_count": self._plan_metadata[
                     "sign_eligible_candidate_count"
