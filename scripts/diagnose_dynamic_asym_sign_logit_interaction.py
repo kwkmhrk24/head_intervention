@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import statistics
 import sys
 from pathlib import Path
 
@@ -64,7 +65,14 @@ from utils.harmbench_gcg_independent_test import (  # noqa: E402
 
 
 SEED = 42
-TARGET_INDICES = (290, 313, 254, 249)
+KNOWN_INDICES = (290, 313, 254, 249)
+PRIOR_KNOWN_RUN = Path(
+    "data/outputs/gcg_dynamic_asym_sign_logit_interaction/llama2/gcg_ref/"
+    "diagnostic_20260929T140114Z"
+)
+EXPECTED_PRIOR_KNOWN_MANIFEST_SHA256 = (
+    "a92936c7905bf05eda455c55276639850f6ce2142dda8031b14cb7d720bf9d92"
+)
 SOURCE_RUNS = {
     "all": Path(
         "data/outputs/gcg_dynamic_asym_signed_direction/llama2/gcg_ref/"
@@ -103,6 +111,11 @@ def parse_args(argv=None):
     parser.add_argument("--stage", choices=("cpu-preflight", "run"), default="cpu-preflight")
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--reference", default=DEFAULT_REFERENCE)
+    parser.add_argument(
+        "--scope",
+        choices=("known4", "baseline-success53"),
+        default="known4",
+    )
     evaluation = parse_evaluation_args([])
     parser.add_argument("--independent-config", default=evaluation.independent_config)
     parser.add_argument(
@@ -151,7 +164,8 @@ def evaluation_args(args):
     )
 
 
-def load_source_rows() -> tuple[dict[str, dict[int, dict]], dict[str, str]]:
+def load_source_rows(target_indices) -> tuple[dict[str, dict[int, dict]], dict[str, str]]:
+    target_indices = tuple(int(index) for index in target_indices)
     loaded = {}
     hashes = {}
     for target, relative_directory in SOURCE_RUNS.items():
@@ -182,30 +196,76 @@ def load_source_rows() -> tuple[dict[str, dict[int, dict]], dict[str, str]]:
         rows = {
             int(row["dataset_index"]): row
             for row in read_jsonl(directory / "prompt_results.jsonl")
-            if int(row["dataset_index"]) in TARGET_INDICES
+            if int(row["dataset_index"]) in target_indices
         }
-        if set(rows) != set(TARGET_INDICES):
+        if set(rows) != set(target_indices):
             raise ValueError(f"{target} source target prompt set mismatch")
-        if any(bool(rows[index]["success"]) != EXPECTED_SUCCESS[target][index] for index in TARGET_INDICES):
+        if any(
+            bool(rows[index]["success"]) != EXPECTED_SUCCESS[target][index]
+            for index in KNOWN_INDICES
+            if index in rows
+        ):
             raise ValueError(f"{target} source known outcome mismatch")
         loaded[target] = rows
         hashes[target] = observed
     return loaded, hashes
 
 
+def load_prior_known_rows() -> tuple[dict[int, dict], str]:
+    directory = (REPO_ROOT / PRIOR_KNOWN_RUN).resolve()
+    manifest_path = directory / "artifact_manifest.json"
+    observed = sha256_file(manifest_path)
+    if observed != EXPECTED_PRIOR_KNOWN_MANIFEST_SHA256:
+        raise ValueError("prior known-four artifact manifest SHA-256 mismatch")
+    manifest = read_json(manifest_path)
+    for item in manifest["files"]:
+        if sha256_file(directory / item["path"]) != item["sha256"]:
+            raise ValueError("prior known-four artifact file SHA-256 mismatch")
+    rows = {
+        int(row["dataset_index"]): row
+        for row in read_jsonl(directory / "per_prompt.jsonl")
+    }
+    if set(rows) != set(KNOWN_INDICES):
+        raise ValueError("prior known-four prompt set mismatch")
+    return rows, observed
+
+
 def preflight(args) -> dict:
     provenance, baseline = validate_frozen_inputs(evaluation_args(args))
     baseline_by_index = {int(row["dataset_index"]): row for row in baseline}
-    if set(TARGET_INDICES) - set(baseline_by_index):
+    baseline_success_indices = tuple(
+        sorted(
+            int(row["dataset_index"])
+            for row in baseline
+            if bool(row["success"])
+        )
+    )
+    if len(baseline_success_indices) != 53:
+        raise ValueError("frozen baseline success count is not 53")
+    target_indices = (
+        KNOWN_INDICES if args.scope == "known4" else baseline_success_indices
+    )
+    if set(target_indices) - set(baseline_by_index):
         raise ValueError("target prompts are missing from the frozen baseline")
-    if any(not bool(baseline_by_index[index]["success"]) for index in TARGET_INDICES):
-        raise ValueError("all four target prompts must be baseline successes")
-    source_rows, source_hashes = load_source_rows()
+    if any(not bool(baseline_by_index[index]["success"]) for index in target_indices):
+        raise ValueError("all target prompts must be baseline successes")
+    source_rows, source_hashes = load_source_rows(target_indices)
+    defended_count = sum(
+        not bool(source_rows["all"][index]["success"])
+        for index in target_indices
+    )
+    if args.scope == "baseline-success53" and defended_count != 21:
+        raise ValueError("absolute-all defended count is not the frozen value 21")
+    prior_known_rows, prior_known_hash = load_prior_known_rows()
     return {
         "provenance": provenance,
         "baseline_by_index": baseline_by_index,
         "source_rows": source_rows,
         "source_manifest_sha256": source_hashes,
+        "target_indices": target_indices,
+        "absolute_all_defended_count": defended_count,
+        "prior_known_rows": prior_known_rows,
+        "prior_known_artifact_manifest_sha256": prior_known_hash,
     }
 
 
@@ -377,6 +437,18 @@ def diagnose_prompt(record, baseline_row, source_rows, *, model, tokenizer, refe
         "dataset_index": index,
         "prompt_id": record["prompt_id"],
         "prompt_length": record["prompt_length"],
+        "absolute_all_defended": not bool(source_rows["all"][index]["success"]),
+        "positive_only_defended": not bool(
+            source_rows["positive"][index]["success"]
+        ),
+        "negative_only_defended": not bool(
+            source_rows["negative"][index]["success"]
+        ),
+        "all_only_defended": (
+            not bool(source_rows["all"][index]["success"])
+            and bool(source_rows["positive"][index]["success"])
+            and bool(source_rows["negative"][index]["success"])
+        ),
         "selection": {
             "absolute_top_n_count": plans["all"]["selected_count"],
             "positive_count": plans["positive"]["selected_count"],
@@ -403,6 +475,159 @@ def diagnose_prompt(record, baseline_row, source_rows, *, model, tokenizer, refe
     }
 
 
+def numeric_distribution(values) -> dict:
+    values = [float(value) for value in values if value is not None]
+    if not values or not all(math.isfinite(value) for value in values):
+        raise ValueError("distribution requires finite values")
+    return {
+        "count": len(values),
+        "mean": statistics.fmean(values),
+        "median": statistics.median(values),
+        "population_std": statistics.pstdev(values),
+        "min": min(values),
+        "max": max(values),
+    }
+
+
+def cliffs_delta(left, right) -> float:
+    left = [float(value) for value in left]
+    right = [float(value) for value in right]
+    if not left or not right:
+        raise ValueError("Cliff's delta requires two non-empty groups")
+    greater = sum(a > b for a in left for b in right)
+    less = sum(a < b for a in left for b in right)
+    return (greater - less) / (len(left) * len(right))
+
+
+def group_summary(rows: list[dict]) -> dict:
+    if not rows:
+        raise ValueError("group summary requires prompts")
+    ratio_values = [
+        row["logit_change"]["interaction_over_delta_all"] for row in rows
+    ]
+    ratios = [value for value in ratio_values if value is not None]
+    interaction_l2 = [row["logit_change"]["interaction_l2"] for row in rows]
+    additive_all_match_count = sum(
+        row["conditions"]["additive_prediction"]["top1_token_id"]
+        == row["conditions"]["all"]["top1_token_id"]
+        for row in rows
+    )
+    additive_changed_count = sum(
+        row["conditions"]["additive_prediction"][
+            "argmax_changed_from_baseline"
+        ]
+        for row in rows
+    )
+    actual_changed_count = sum(
+        row["conditions"]["all"]["argmax_changed_from_baseline"]
+        for row in rows
+    )
+    return {
+        "prompt_count": len(rows),
+        "dataset_indices": [row["dataset_index"] for row in rows],
+        "interaction_ratio": numeric_distribution(ratios),
+        "interaction_ratio_undefined_count": len(ratio_values) - len(ratios),
+        "interaction_l2": {
+            key: value
+            for key, value in numeric_distribution(interaction_l2).items()
+            if key in ("count", "mean", "median")
+        },
+        "additive_actual_argmax_match_count": additive_all_match_count,
+        "additive_actual_argmax_match_rate": additive_all_match_count / len(rows),
+        "additive_argmax_changed_count": additive_changed_count,
+        "additive_argmax_changed_rate": additive_changed_count / len(rows),
+        "actual_all_argmax_changed_count": actual_changed_count,
+        "actual_all_argmax_changed_rate": actual_changed_count / len(rows),
+    }
+
+
+def aggregate_summary(rows: list[dict]) -> dict:
+    defended = [row for row in rows if row["absolute_all_defended"]]
+    not_defended = [row for row in rows if not row["absolute_all_defended"]]
+    all_only = [row for row in rows if row["all_only_defended"]]
+    not_all_only = [row for row in rows if not row["all_only_defended"]]
+    if len(rows) != 53 or len(defended) != 21 or len(not_defended) != 32:
+        raise ValueError("aggregate frozen group counts mismatch")
+
+    def ratios(group):
+        return [
+            row["logit_change"]["interaction_over_delta_all"]
+            for row in group
+            if row["logit_change"]["interaction_over_delta_all"] is not None
+        ]
+
+    def interaction_l2(group):
+        return [row["logit_change"]["interaction_l2"] for row in group]
+
+    decision_classes = {
+        "additive_unchanged_actual_changed": 0,
+        "additive_changed_actual_changed": 0,
+        "additive_changed_actual_unchanged": 0,
+        "both_unchanged": 0,
+    }
+    for row in rows:
+        add_changed = row["conditions"]["additive_prediction"][
+            "argmax_changed_from_baseline"
+        ]
+        actual_changed = row["conditions"]["all"][
+            "argmax_changed_from_baseline"
+        ]
+        if not add_changed and actual_changed:
+            key = "additive_unchanged_actual_changed"
+        elif add_changed and actual_changed:
+            key = "additive_changed_actual_changed"
+        elif add_changed and not actual_changed:
+            key = "additive_changed_actual_unchanged"
+        else:
+            key = "both_unchanged"
+        decision_classes[key] += 1
+    return {
+        "all_baseline_success": group_summary(rows),
+        "defended": group_summary(defended),
+        "not_defended": group_summary(not_defended),
+        "defended_vs_not_defended_effect_size": {
+            "definition": "Cliff's delta; positive means defended is larger",
+            "interaction_ratio": cliffs_delta(ratios(defended), ratios(not_defended)),
+            "interaction_l2": cliffs_delta(
+                interaction_l2(defended), interaction_l2(not_defended)
+            ),
+        },
+        "additive_vs_actual_all_decision_classes": decision_classes,
+        "all_only_defended": group_summary(all_only),
+        "other_prompts": group_summary(not_all_only),
+        "all_only_vs_other_effect_size": {
+            "definition": "Cliff's delta; positive means all-only defended is larger",
+            "interaction_ratio": cliffs_delta(ratios(all_only), ratios(not_all_only)),
+            "interaction_l2": cliffs_delta(
+                interaction_l2(all_only), interaction_l2(not_all_only)
+            ),
+        },
+    }
+
+
+def validate_known_reproduction(rows: list[dict], prior_rows: dict[int, dict]) -> dict:
+    current = {int(row["dataset_index"]): row for row in rows}
+    if set(KNOWN_INDICES) - set(current):
+        raise RuntimeError("known four prompts are missing from current run")
+    for index in KNOWN_INDICES:
+        now = current[index]
+        prior = prior_rows[index]
+        if now["selection"] != prior["selection"]:
+            raise RuntimeError(f"known prompt {index} selection reproduction mismatch")
+        for condition in ("baseline", "positive", "negative", "all", "additive_prediction"):
+            if now["conditions"][condition] != prior["conditions"][condition]:
+                raise RuntimeError(
+                    f"known prompt {index} {condition} logit reproduction mismatch"
+                )
+        if now["logit_change"] != prior["logit_change"]:
+            raise RuntimeError(f"known prompt {index} interaction reproduction mismatch")
+    return {
+        "passed": True,
+        "dataset_indices": list(KNOWN_INDICES),
+        "exact_condition_and_interaction_metric_match": True,
+    }
+
+
 def run(args, output_dir: Path, frozen: dict) -> dict:
     if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
         raise RuntimeError("CUDA is required; refusing CPU model execution")
@@ -419,7 +644,8 @@ def run(args, output_dir: Path, frozen: dict) -> dict:
     validate_formatted_evaluation_identity(records)
     records_by_index = {int(row["dataset_index"]): row for row in records}
     rows = []
-    for position, index in enumerate(TARGET_INDICES, 1):
+    target_indices = frozen["target_indices"]
+    for position, index in enumerate(target_indices, 1):
         record = records_by_index[index]
         baseline = frozen["baseline_by_index"][index]
         if serialized_input_ids(record["input_ids"]) != baseline["input_ids"]:
@@ -434,17 +660,26 @@ def run(args, output_dir: Path, frozen: dict) -> dict:
                 reference=reference,
             )
         )
-        print(f"[first-token interaction {position}/4] index={index}", flush=True)
+        print(
+            f"[first-token interaction {position}/{len(target_indices)}] index={index}",
+            flush=True,
+        )
+    known_reproduction = validate_known_reproduction(
+        rows, frozen["prior_known_rows"]
+    )
     summary = {
         "schema_version": 1,
         "status": "complete",
         "prompt_count": len(rows),
-        "dataset_indices": list(TARGET_INDICES),
+        "dataset_indices": list(target_indices),
         "generation_used": False,
         "first_token_logits_only": True,
         "numerical_or_runtime_failure_count": 0,
         "decision_cases": {str(row["dataset_index"]): row["decision_case"] for row in rows},
+        "known_four_reproduction": known_reproduction,
     }
+    if args.scope == "baseline-success53":
+        summary["aggregate"] = aggregate_summary(rows)
     output_dir.mkdir(parents=True)
     rows_path = output_dir / "per_prompt.jsonl"
     summary_path = output_dir / "summary.json"
@@ -461,8 +696,9 @@ def run(args, output_dir: Path, frozen: dict) -> dict:
         "sandbox_exempt_gpu": args.sandbox_exempt_gpu,
         "gpu": torch.cuda.get_device_name(0),
         "scientific_conditions": {
-            "dataset": "GCG independent100 selected four prompts",
-            "dataset_indices": list(TARGET_INDICES),
+            "dataset": "GCG independent100 baseline-success prompts",
+            "scope": args.scope,
+            "dataset_indices": list(target_indices),
             "component": "antisymmetric",
             "selection": fixed_selection(),
             "selection_direction": "absolute_then_fixed_sign_subsets",
@@ -475,6 +711,9 @@ def run(args, output_dir: Path, frozen: dict) -> dict:
         },
         "provenance": frozen["provenance"],
         "source_artifact_manifest_sha256": frozen["source_manifest_sha256"],
+        "prior_known_artifact_manifest_sha256": frozen[
+            "prior_known_artifact_manifest_sha256"
+        ],
         "source_code_sha256": {path: sha256_file(REPO_ROOT / path) for path in SOURCE_PATHS},
         "files": {
             rows_path.name: sha256_file(rows_path),
@@ -507,14 +746,18 @@ def main(argv=None):
     frozen = preflight(args)
     payload = {
         "status": "cpu_preflight_passed",
-        "dataset_indices": list(TARGET_INDICES),
+        "scope": args.scope,
+        "dataset_indices": list(frozen["target_indices"]),
+        "absolute_all_defended_count": frozen["absolute_all_defended_count"],
         "selection": fixed_selection(),
         "alpha": ALPHA,
         "layer0_included": LAYER0_INCLUDED,
         "source_artifact_manifest_sha256": frozen["source_manifest_sha256"],
         "generation_used": False,
-        "planned_gpu_first_forward_count": len(TARGET_INDICES) * 4,
-        "planned_selection_collection_prefill_count": len(TARGET_INDICES),
+        "planned_gpu_first_forward_count": len(frozen["target_indices"]) * 4,
+        "planned_selection_collection_prefill_count": len(
+            frozen["target_indices"]
+        ),
     }
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     if args.stage == "run":
