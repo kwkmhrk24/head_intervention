@@ -13,6 +13,8 @@ from scripts.prepare_gcg_dynamic_asym_reference import (
 from utils.artifact_io import sha256_file
 from utils.experiment_runtime import git_state, git_value
 from utils.gcg_dynamic_asym_intervention import (
+    CURRENT_PROMPT_MEAN_MODES,
+    REPLACEMENT_MODES,
     NUMERICAL_SIGMA_FLOOR,
     DynamicAsymmetryReference,
     DynamicAsymmetryController,
@@ -21,6 +23,7 @@ from utils.gcg_dynamic_asym_intervention import (
     full_prompt_component_moments,
     full_prompt_asymmetry_moments,
     patch_llama_dynamic_asymmetry_attention,
+    _current_prompt_mean_targets,
     validate_tau,
 )
 from utils.reference_asym_score_intervention import (
@@ -190,17 +193,17 @@ class DynamicAsymmetryControllerTests(unittest.TestCase):
     def test_replacement_mode_does_not_change_threshold_selection(self):
         z_scores = torch.tensor([[[-2.0, -0.5, 0.5, 2.0]]])
         masks = []
-        for replacement_mode in ("reference_mean", "asym_zero", "raw_s_zero"):
+        for replacement_mode in REPLACEMENT_MODES:
             controller = self.make_controller(
                 tau=0.5, replacement_mode=replacement_mode
             )
             masks.append(controller._selection_mask(layer=0, z_scores=z_scores))
-        self.assertTrue(torch.equal(masks[0], masks[1]))
-        self.assertTrue(torch.equal(masks[0], masks[2]))
+        for mask in masks:
+            self.assertTrue(torch.equal(masks[0], mask))
         self.assertEqual(masks[0].nonzero().tolist(), [[0, 0, 0], [0, 0, 3]])
 
     def test_zero_modes_reject_symmetric_selection_component(self):
-        for replacement_mode in ("asym_zero", "raw_s_zero"):
+        for replacement_mode in REPLACEMENT_MODES[1:]:
             with self.assertRaisesRegex(ValueError, "component='antisymmetric'"):
                 DynamicAsymmetryController(
                     mu=torch.zeros((1, 1), dtype=torch.float32),
@@ -356,6 +359,170 @@ class DynamicAsymmetryControllerTests(unittest.TestCase):
                 mu=torch.zeros((1, 1), dtype=torch.float32),
                 sigma=torch.ones((1, 1), dtype=torch.float32),
             )
+
+
+class CurrentPromptMeanReplacementTests(unittest.TestCase):
+    def setUp(self):
+        self.rows, self.cols = torch.tril_indices(4, 4, offset=-1)
+        self.asym = torch.zeros((1, 1, 4, 4), dtype=torch.float32)
+        self.asym[:, :, self.rows, self.cols] = torch.tensor(
+            [2.0, 4.0, 8.0, 6.0, 10.0, 14.0]
+        )
+        self.asym[:, :, self.cols, self.rows] = -self.asym[
+            :, :, self.rows, self.cols
+        ]
+        self.scores = 32.0 + self.asym
+        self.scores[0, 0].diagonal().copy_(torch.tensor([101., 202., 303., 404.]))
+        self.targets = {
+            "current_row_mean": [2.0, 6.0, 6.0, 10.0, 10.0, 10.0],
+            "current_column_mean": [4.0, 4.0, 9.0, 4.0, 9.0, 14.0],
+            "current_row_column_mean": [3.0, 5.0, 7.5, 7.0, 9.5, 12.0],
+        }
+
+    def _apply(self, mode, *, scores=None, alpha=1.0, tau=0.0, mu=0.0):
+        if scores is None:
+            scores = self.scores
+        controller = DynamicAsymmetryController(
+            mu=torch.full((1, scores.shape[1]), mu, dtype=torch.float32),
+            sigma=torch.ones((1, scores.shape[1]), dtype=torch.float32),
+            tau=tau,
+            alpha=alpha,
+            replacement_mode=mode,
+        )
+        controller.set_prompt_context(prompt_length=scores.shape[-1])
+        result = controller.apply(0, scores)
+        controller.assert_complete_prefill()
+        return result, controller
+
+    def test_targets_symmetry_snapshot_and_target_diagnostics(self):
+        for mode, values in self.targets.items():
+            with self.subTest(mode=mode):
+                before = self.scores.clone()
+                result, controller = self._apply(mode, mu=-20.0)
+                after_asym = (result - result.transpose(-1, -2)) / 2
+                expected = torch.tensor(values).view(1, 1, -1)
+                torch.testing.assert_close(
+                    after_asym[:, :, self.rows, self.cols], expected, atol=0, rtol=0
+                )
+                torch.testing.assert_close(
+                    after_asym[:, :, self.cols, self.rows], -expected, atol=0, rtol=0
+                )
+                torch.testing.assert_close(
+                    (result + result.transpose(-1, -2)) / 2,
+                    (before + before.transpose(-1, -2)) / 2,
+                    atol=0, rtol=0,
+                )
+                torch.testing.assert_close(self.scores, before, atol=0, rtol=0)
+
+                # Both traversal orders use targets frozen before any edits.
+                for order in (range(6), reversed(range(6))):
+                    sequential = before.clone()
+                    for index in order:
+                        i, j = self.rows[index], self.cols[index]
+                        delta = values[index] - self.asym[0, 0, i, j]
+                        sequential[0, 0, i, j] += delta
+                        sequential[0, 0, j, i] -= delta
+                    torch.testing.assert_close(result, sequential, atol=0, rtol=0)
+                summary = controller.summary()
+                self.assertTrue(summary["paired_update"])
+                stats = summary["selected_target_statistics"]
+                self.assertEqual(stats["count"], 6)
+                self.assertAlmostEqual(stats["mean"], sum(values) / 6)
+                self.assertEqual(stats["min"], min(values))
+                self.assertEqual(stats["max"], max(values))
+                self.assertAlmostEqual(stats["absolute_mean"], sum(values) / 6)
+
+    def test_means_use_all_strict_lower_values_not_only_selected(self):
+        for mode, values in self.targets.items():
+            with self.subTest(mode=mode):
+                result, controller = self._apply(mode, tau=5.0)
+                after_asym = (result - result.transpose(-1, -2)) / 2
+                # A_20=4 is unselected but contributes to r_2 and c_0.
+                selected = self.asym[:, :, self.rows, self.cols] > 5.0
+                expected = self.asym[:, :, self.rows, self.cols].clone()
+                expected[selected] = torch.tensor(values).view(1, 1, -1)[selected]
+                torch.testing.assert_close(
+                    after_asym[:, :, self.rows, self.cols], expected, atol=0, rtol=0
+                )
+                self.assertEqual(controller.summary()["selected_element_intervention_count"], 4)
+                self.assertEqual(controller.summary()["max_unselected_element_change"], 0)
+
+    def test_mean_reduction_excludes_poisoned_diagonal_and_upper_triangle(self):
+        snapshot = self.asym.clone()
+        snapshot[:, :, self.cols, self.rows] = math.nan
+        snapshot[0, 0].diagonal().fill_(math.nan)
+        for mode, values in self.targets.items():
+            with self.subTest(mode=mode):
+                result = _current_prompt_mean_targets(
+                    snapshot, self.rows, self.cols, mode
+                )
+                torch.testing.assert_close(
+                    result, torch.tensor(values).view(1, 1, -1), atol=0, rtol=0
+                )
+                reversed_result = _current_prompt_mean_targets(
+                    snapshot, self.rows.flip(0), self.cols.flip(0), mode
+                )
+                torch.testing.assert_close(
+                    reversed_result, result.flip(-1), atol=0, rtol=0
+                )
+
+    def test_head_isolation_and_alpha_half(self):
+        scores = torch.cat((self.scores, -3.0 * self.scores), dim=1)
+        for mode, values in self.targets.items():
+            with self.subTest(mode=mode):
+                result, controller = self._apply(mode, scores=scores, alpha=0.5)
+                after_asym = (result - result.transpose(-1, -2)) / 2
+                expected = (
+                    self.asym[:, :, self.rows, self.cols]
+                    + torch.tensor(values).view(1, 1, -1)
+                ) / 2
+                torch.testing.assert_close(
+                    after_asym[:, :, self.rows, self.cols],
+                    torch.cat((expected, -3.0 * expected), dim=1), atol=0, rtol=0,
+                )
+                self.assertEqual(controller.summary()["selected_element_intervention_count"], 12)
+
+    def test_empty_selection_and_singleton_mean_are_finite(self):
+        for mode in CURRENT_PROMPT_MEAN_MODES:
+            with self.subTest(mode=mode):
+                result, controller = self._apply(mode, tau=100.0)
+                torch.testing.assert_close(result, self.scores, atol=0, rtol=0)
+                self.assertIsNone(controller.summary()["selected_target_statistics"])
+                singleton = torch.tensor([[[[0., -2.], [2., 0.]]]])
+                result, controller = self._apply(mode, scores=singleton)
+                torch.testing.assert_close(result, singleton, atol=0, rtol=0)
+                self.assertEqual(controller.summary()["selected_target_statistics"]["mean"], 2.0)
+
+    def test_float32_and_float16_roundoff_and_prefill_only(self):
+        generator = torch.Generator().manual_seed(42)
+        for dtype in (torch.float32, torch.float16):
+            scores = (2.0 * torch.randn((1, 2, 17, 17), generator=generator)).to(dtype)
+            rows, cols = torch.tril_indices(17, 17, offset=-1)
+            before = scores.float()
+            asym = (before - before.transpose(-1, -2)) / 2
+            for mode in CURRENT_PROMPT_MEAN_MODES:
+                for alpha in (0.5, 1.0):
+                    with self.subTest(dtype=dtype, mode=mode, alpha=alpha):
+                        result, controller = self._apply(mode, scores=scores, alpha=alpha)
+                        after_asym = (result.float() - result.float().transpose(-1, -2)) / 2
+                        target = _current_prompt_mean_targets(asym, rows, cols, mode)
+                        expected = asym[:, :, rows, cols] + alpha * (
+                            target - asym[:, :, rows, cols]
+                        )
+                        torch.testing.assert_close(
+                            after_asym[:, :, rows, cols], expected,
+                            atol=5e-3 if dtype == torch.float16 else 2e-6, rtol=1e-5,
+                        )
+                        decode = torch.zeros((1, 2, 18, 18), dtype=dtype)
+                        self.assertIs(controller.apply(0, decode), decode)
+                        summary = controller.summary()
+                        self.assertTrue(summary["all_scores_finite"])
+                        self.assertEqual(summary["later_forward_intervention_count"], 0)
+                        self.assertLessEqual(
+                            summary["max_symmetric_component_error_after_cast"],
+                            summary["max_symmetric_component_error_float32"]
+                            + summary["max_score_cast_quantization_error"],
+                        )
 
 
 class ReferenceEntrypointTests(unittest.TestCase):

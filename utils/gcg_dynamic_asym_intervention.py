@@ -41,7 +41,14 @@ from utils.reference_asym_score_intervention import (
 
 
 REFERENCE_SCHEMA_VERSION = 1
-REPLACEMENT_MODES = ("reference_mean", "asym_zero", "raw_s_zero")
+CURRENT_PROMPT_MEAN_MODES = (
+    "current_row_mean",
+    "current_column_mean",
+    "current_row_column_mean",
+)
+REPLACEMENT_MODES = (
+    "reference_mean", "asym_zero", "raw_s_zero", *CURRENT_PROMPT_MEAN_MODES
+)
 # The square root keeps division by a floored denominator inside float32's
 # normal range for ordinary finite attention scores.  This is a numerical
 # guard, not a scientifically selected scale or threshold.
@@ -74,6 +81,34 @@ def validate_replacement_mode(replacement_mode: str) -> str:
             "replacement_mode must be one of " + ", ".join(REPLACEMENT_MODES)
         )
     return replacement_mode
+
+
+def _current_prompt_mean_targets(
+    current_asym: torch.Tensor,
+    rows: torch.Tensor,
+    cols: torch.Tensor,
+    replacement_mode: str,
+) -> torch.Tensor:
+    """Return targets from the same head's pre-intervention strict lower triangle.
+
+    Each mean includes the selected element itself and all other strict-lower
+    elements of its row/column, independent of the selection mask.  No score
+    is edited until all targets have been computed from this snapshot.
+    """
+
+    if replacement_mode not in CURRENT_PROMPT_MEAN_MODES:
+        raise ValueError("current-prompt mean replacement mode is invalid")
+    lower = current_asym.tril(diagonal=-1)
+    # Only i > j positions are queried, so both denominators are positive.
+    row_targets = lower.sum(dim=-1)[..., rows] / rows.to(current_asym.dtype)
+    column_targets = lower.sum(dim=-2)[..., cols] / (
+        current_asym.shape[-1] - cols - 1
+    ).to(current_asym.dtype)
+    if replacement_mode == "current_row_mean":
+        return row_targets
+    if replacement_mode == "current_column_mean":
+        return column_targets
+    return (row_targets + column_targets) / 2.0
 
 
 def full_prompt_asymmetry_moments(
@@ -499,7 +534,7 @@ class DynamicAsymmetryController:
         self.replacement_mode = validate_replacement_mode(replacement_mode)
         if self.replacement_mode != "reference_mean" and component != "antisymmetric":
             raise ValueError(
-                "zero replacement modes require component='antisymmetric'"
+                "non-reference replacement modes require component='antisymmetric'"
             )
         self.layer_count, self.head_count = mu.shape
         self._reference_cache: dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor]] = {}
@@ -635,6 +670,7 @@ class DynamicAsymmetryController:
             )
         selected_count = int(selected.sum().item())
         constructed_delta = torch.zeros_like(original)
+        selected_target_statistics = None
         if self.replacement_mode == "raw_s_zero":
             original_lower = original[:, :, rows, cols]
             replacement_delta = self.alpha * (0.0 - original_lower)
@@ -643,11 +679,27 @@ class DynamicAsymmetryController:
             expected_replacement_lower = original_lower + replacement_delta
             pair_sign = None
         else:
-            target = (
-                mu.view(1, -1, 1)
-                if self.replacement_mode == "reference_mean"
-                else torch.zeros_like(current_lower)
-            )
+            if self.replacement_mode == "reference_mean":
+                target = mu.view(1, -1, 1)
+            elif self.replacement_mode == "asym_zero":
+                target = torch.zeros_like(current_lower)
+            else:
+                target = _current_prompt_mean_targets(
+                    current_asym, rows, cols, self.replacement_mode
+                )
+                if not bool(torch.isfinite(target).all().item()):
+                    raise ReferenceInterventionRuntimeError(
+                        "current-prompt replacement targets contain NaN or infinity"
+                    )
+                if selected_count:
+                    selected_targets = target.masked_select(selected).to(torch.float64)
+                    selected_target_statistics = {
+                        "count": selected_count,
+                        "mean": float(selected_targets.mean().item()),
+                        "min": float(selected_targets.min().item()),
+                        "max": float(selected_targets.max().item()),
+                        "absolute_mean": float(selected_targets.abs().mean().item()),
+                    }
             replacement_delta = self.alpha * (target - current_lower)
             replacement_delta = torch.where(selected, replacement_delta, 0.0)
             constructed_delta[:, :, rows, cols] = replacement_delta
@@ -674,6 +726,12 @@ class DynamicAsymmetryController:
             intervened64 + intervened64.transpose(-1, -2)
         ) / 2.0
         expected_replacement_lower64 = expected_replacement_lower.to(torch.float64)
+        if self.replacement_mode in CURRENT_PROMPT_MEAN_MODES:
+            # Check the stored delta without extra float32 component-addition
+            # roundoff; the score update itself still uses the existing dtype.
+            expected_replacement_lower64 = (
+                current_lower.to(torch.float64) + replacement_delta.to(torch.float64)
+            )
         constructed_asym64 = (
             intervened64 - intervened64.transpose(-1, -2)
         ) / 2.0
@@ -837,6 +895,7 @@ class DynamicAsymmetryController:
                 "strict_lower_element_count_per_head": expected_elements,
                 "candidate_element_count": self.head_count * expected_elements,
                 "selected_element_count": selected_count,
+                "selected_target_statistics": selected_target_statistics,
                 "max_absolute_z_score": _max_abs(z_scores),
                 "max_constructed_delta_antisymmetry_error_float32": (
                     construction_error if self.component == "antisymmetric" else 0.0
@@ -913,6 +972,24 @@ class DynamicAsymmetryController:
             return max((float(row[key]) for row in self._records), default=0.0)
 
         captured_count = self.selected_element_intervention_count
+        target_records = [
+            row["selected_target_statistics"]
+            for row in self._records
+            if row["selected_target_statistics"] is not None
+        ]
+        target_statistics = None
+        if target_records:
+            target_count = sum(row["count"] for row in target_records)
+            target_statistics = {
+                "count": target_count,
+                "mean": sum(row["mean"] * row["count"] for row in target_records)
+                / target_count,
+                "min": min(row["min"] for row in target_records),
+                "max": max(row["max"] for row in target_records),
+                "absolute_mean": sum(
+                    row["absolute_mean"] * row["count"] for row in target_records
+                ) / target_count,
+            }
         score_metrics = None
         if self.capture_score_change_metrics:
             if captured_count <= 0 or self._selected_score_change_sq_sum <= 0.0:
@@ -945,6 +1022,9 @@ class DynamicAsymmetryController:
                 "reference_mean": f"alpha*(mu_lh-A_{self.component}_ij)",
                 "asym_zero": "alpha*(0-A_antisymmetric_ij)",
                 "raw_s_zero": "alpha*(0-S_ij)",
+                "current_row_mean": "alpha*(r_i-A_antisymmetric_ij)",
+                "current_column_mean": "alpha*(c_j-A_antisymmetric_ij)",
+                "current_row_column_mean": "alpha*((r_i+c_j)/2-A_antisymmetric_ij)",
             }[self.replacement_mode],
             "raw_score_intervention": {
                 "reference_mean": (
@@ -954,6 +1034,9 @@ class DynamicAsymmetryController:
                 ),
                 "asym_zero": "S_ij += delta; S_ji -= delta",
                 "raw_s_zero": "S_ij += delta; S_ji unchanged",
+                **dict.fromkeys(
+                    CURRENT_PROMPT_MEAN_MODES, "S_ij += delta; S_ji -= delta"
+                ),
             }[self.replacement_mode],
             "paired_update": self.replacement_mode != "raw_s_zero",
             "tau": self.tau,
@@ -1047,6 +1130,7 @@ class DynamicAsymmetryController:
             ),
             "all_scores_finite": True,
             "selected_raw_score_change": score_metrics,
+            "selected_target_statistics": target_statistics,
         }
 
 

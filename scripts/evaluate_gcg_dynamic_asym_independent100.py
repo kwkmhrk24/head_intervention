@@ -66,6 +66,7 @@ from utils.gcg_dynamic_asym_selection_diagnostics import (  # noqa: E402
     patch_llama_abs_z_collection,
 )
 from utils.gcg_dynamic_asym_intervention import (  # noqa: E402
+    CURRENT_PROMPT_MEAN_MODES,
     REPLACEMENT_MODES,
     load_dynamic_reference,
 )
@@ -198,7 +199,7 @@ def validate_request(args) -> Path | None:
         and args.component != "antisymmetric"
     ):
         raise ValueError(
-            "zero replacement modes require --component antisymmetric"
+            "non-reference replacement modes require --component antisymmetric"
         )
     if (
         args.absolute_intervention_target != "all"
@@ -676,6 +677,10 @@ def run(args, output_dir: Path, provenance: dict, baseline: list[dict]) -> dict:
                 "reference_mean": f"pure_{args.component}_pairwise",
                 "asym_zero": "pure_antisymmetric_pairwise_zero",
                 "raw_s_zero": "selected_lower_raw_score_zero_unpaired",
+                **{
+                    mode: f"pure_antisymmetric_pairwise_{mode}"
+                    for mode in CURRENT_PROMPT_MEAN_MODES
+                },
             }[args.replacement_mode],
             "timing": "first_prefill_only",
             "cap_rate": 0.005,

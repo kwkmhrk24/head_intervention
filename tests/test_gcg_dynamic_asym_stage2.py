@@ -3,10 +3,15 @@ import unittest
 import torch
 
 from scripts.evaluate_gcg_dynamic_asym_stage2 import parse_args, validate_request
-from utils.gcg_dynamic_asym_intervention import DynamicAsymmetryReference
+from utils.gcg_dynamic_asym_intervention import (
+    CURRENT_PROMPT_MEAN_MODES,
+    REPLACEMENT_MODES,
+    DynamicAsymmetryReference,
+)
 from utils.gcg_dynamic_asym_stage2 import (
     Stage2PlannedDynamicAsymmetryController,
     build_stage2_selection_plan,
+    patch_llama_stage2_dynamic_asymmetry_attention,
     restrict_absolute_plan_to_intervention_sign,
     stage2_new_conditions,
     stage2_selection_conditions,
@@ -343,7 +348,7 @@ class Stage2ControllerTests(unittest.TestCase):
     def test_replacement_modes_reuse_identical_planned_selection(self):
         selected_masks = []
         selected_counts = []
-        for replacement_mode in ("reference_mean", "asym_zero", "raw_s_zero"):
+        for replacement_mode in REPLACEMENT_MODES:
             controller = Stage2PlannedDynamicAsymmetryController(
                 reference=self.reference,
                 selection=self.selection,
@@ -359,9 +364,89 @@ class Stage2ControllerTests(unittest.TestCase):
             summary = controller.summary()
             selected_counts.append(summary["selected_element_intervention_count"])
             self.assertEqual(summary["replacement_mode"], replacement_mode)
-        self.assertTrue(torch.equal(selected_masks[0], selected_masks[1]))
-        self.assertTrue(torch.equal(selected_masks[0], selected_masks[2]))
-        self.assertEqual(selected_counts, [1, 1, 1])
+        for mask in selected_masks:
+            self.assertTrue(torch.equal(selected_masks[0], mask))
+        self.assertEqual(selected_counts, [1] * len(REPLACEMENT_MODES))
+
+    def test_frozen_proportional_selection_is_independent_of_all_six_modes(self):
+        # Enough eligible elements for the existing floor(0.001 * N) rule.
+        length = 48
+        rows, cols = torch.tril_indices(length, length, offset=-1)
+        generator = torch.Generator().manual_seed(42)
+        scores = torch.randint(
+            -32, 33, (2, 1, 2, length, length), generator=generator
+        ).float()
+        asym = (scores - scores.transpose(-1, -2)) / 2
+        signed_z = asym[:, 0, :, rows, cols].reshape(-1).contiguous()
+        selection = stage2_selection_conditions()[1]
+        legacy_indices = None
+        legacy_masks = None
+        for mode in REPLACEMENT_MODES:
+            with self.subTest(mode=mode):
+                plan = build_stage2_selection_plan(
+                    signed_z.abs(), signed_z=signed_z,
+                    selection=selection, layer_count=2, head_count=2,
+                    elements_per_head=rows.numel(), layer0_included=False,
+                )
+                controller = Stage2PlannedDynamicAsymmetryController(
+                    reference=self.reference, selection=selection, alpha=1.0,
+                    layer0_included=False, replacement_mode=mode,
+                )
+                controller.set_prompt_plan(prompt_length=length, plan=plan)
+                if legacy_indices is None:
+                    legacy_indices = plan["selected_indices"].clone()
+                    legacy_masks = {
+                        layer: mask.clone()
+                        for layer, mask in controller._planned_masks_cpu.items()
+                    }
+                self.assertTrue(torch.equal(plan["selected_indices"], legacy_indices))
+                for layer in range(2):
+                    self.assertTrue(torch.equal(
+                        controller._planned_masks_cpu[layer], legacy_masks[layer]
+                    ))
+                    controller.apply(layer, scores[layer])
+                controller.assert_complete_prefill()
+                self.assertGreater(plan["selected_count"], 0)
+                self.assertEqual(
+                    controller.summary()["selected_element_intervention_count"],
+                    plan["selected_count"],
+                )
+                self.assertEqual(plan["layer_counts"][0], 0)
+                self.assertLessEqual(plan["selected_count"], plan["cap_count"])
+
+    def test_mean_modes_through_existing_tiny_llama_cpu_patch(self):
+        from transformers import LlamaConfig, LlamaForCausalLM
+
+        config = LlamaConfig(
+            vocab_size=32, hidden_size=16, intermediate_size=32,
+            num_hidden_layers=2, num_attention_heads=2, num_key_value_heads=2,
+            max_position_embeddings=32,
+        )
+        config._attn_implementation = "eager"
+        model = LlamaForCausalLM(config).half().eval()
+        for mode in CURRENT_PROMPT_MEAN_MODES:
+            with self.subTest(mode=mode):
+                with patch_llama_stage2_dynamic_asymmetry_attention(
+                    model, reference=self.reference, selection=self.selection,
+                    alpha=1.0, layer0_included=False, replacement_mode=mode,
+                ) as controller:
+                    controller.set_prompt_plan(prompt_length=4, plan=self._plan())
+                    with torch.inference_mode():
+                        prefill = model.model(
+                            input_ids=torch.tensor([[1, 2, 3, 4]]), use_cache=False
+                        )
+                        model.model(
+                            input_ids=torch.tensor([[1, 2, 3, 4, 5]]), use_cache=False
+                        )
+                    controller.assert_complete_prefill()
+                    summary = controller.summary()
+                self.assertEqual(tuple(prefill.last_hidden_state.shape), (1, 4, 16))
+                self.assertEqual(summary["replacement_mode"], mode)
+                self.assertTrue(summary["paired_update"])
+                self.assertEqual(summary["later_forward_skip_count"], 2)
+                self.assertEqual(summary["later_forward_intervention_count"], 0)
+                self.assertEqual(summary["selected_target_statistics"]["count"], 1)
+                self.assertTrue(summary["all_scores_finite"])
 
 
 if __name__ == "__main__":
