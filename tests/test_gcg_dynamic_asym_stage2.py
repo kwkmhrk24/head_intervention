@@ -340,6 +340,29 @@ class Stage2ControllerTests(unittest.TestCase):
         self.assertEqual(metrics["l2"], 1.0)
         self.assertEqual(metrics["max_absolute"], 1.0)
 
+    def test_replacement_modes_reuse_identical_planned_selection(self):
+        selected_masks = []
+        selected_counts = []
+        for replacement_mode in ("reference_mean", "asym_zero", "raw_s_zero"):
+            controller = Stage2PlannedDynamicAsymmetryController(
+                reference=self.reference,
+                selection=self.selection,
+                alpha=1.0,
+                layer0_included=False,
+                replacement_mode=replacement_mode,
+            )
+            controller.set_prompt_plan(prompt_length=4, plan=self._plan())
+            selected_masks.append(controller._planned_masks_cpu[1].clone())
+            controller.apply(0, antisymmetric_scores(4, 2.0, heads=2))
+            controller.apply(1, antisymmetric_scores(4, 2.0, heads=2))
+            controller.assert_complete_prefill()
+            summary = controller.summary()
+            selected_counts.append(summary["selected_element_intervention_count"])
+            self.assertEqual(summary["replacement_mode"], replacement_mode)
+        self.assertTrue(torch.equal(selected_masks[0], selected_masks[1]))
+        self.assertTrue(torch.equal(selected_masks[0], selected_masks[2]))
+        self.assertEqual(selected_counts, [1, 1, 1])
+
 
 if __name__ == "__main__":
     unittest.main()

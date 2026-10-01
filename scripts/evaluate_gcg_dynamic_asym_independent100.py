@@ -65,7 +65,10 @@ from utils.experiment_runtime import git_state, git_value, seed_everything  # no
 from utils.gcg_dynamic_asym_selection_diagnostics import (  # noqa: E402
     patch_llama_abs_z_collection,
 )
-from utils.gcg_dynamic_asym_intervention import load_dynamic_reference  # noqa: E402
+from utils.gcg_dynamic_asym_intervention import (  # noqa: E402
+    REPLACEMENT_MODES,
+    load_dynamic_reference,
+)
 from utils.gcg_dynamic_asym_stage2 import (  # noqa: E402
     ABSOLUTE_INTERVENTION_TARGETS,
     build_stage2_selection_plan,
@@ -155,6 +158,11 @@ def parse_args(argv=None):
         default="antisymmetric",
     )
     parser.add_argument(
+        "--replacement-mode",
+        choices=REPLACEMENT_MODES,
+        default="reference_mean",
+    )
+    parser.add_argument(
         "--selection-direction",
         choices=("absolute", "positive", "negative"),
         default="absolute",
@@ -185,6 +193,13 @@ def parse_args(argv=None):
 
 
 def validate_request(args) -> Path | None:
+    if (
+        args.replacement_mode != "reference_mean"
+        and args.component != "antisymmetric"
+    ):
+        raise ValueError(
+            "zero replacement modes require --component antisymmetric"
+        )
     if (
         args.absolute_intervention_target != "all"
         and args.selection_direction != "absolute"
@@ -552,6 +567,7 @@ def run(args, output_dir: Path, provenance: dict, baseline: list[dict]) -> dict:
             alpha=ALPHA,
             layer0_included=LAYER0_INCLUDED,
             component=args.component,
+            replacement_mode=args.replacement_mode,
         ) as controller:
             controller.set_prompt_plan(prompt_length=record["prompt_length"], plan=plan)
             generated = generate_with_first_logits(model, tokenizer, record["input_ids"])
@@ -620,6 +636,7 @@ def run(args, output_dir: Path, provenance: dict, baseline: list[dict]) -> dict:
         "schema_version": 1,
         "experiment_role": f"fixed_dynamic_{args.component}_{args.dataset}_evaluation",
         "component": args.component,
+        "replacement_mode": args.replacement_mode,
         "selection_direction": args.selection_direction,
         "intervention_target_sign": args.absolute_intervention_target,
         "selection": selection,
@@ -646,6 +663,7 @@ def run(args, output_dir: Path, provenance: dict, baseline: list[dict]) -> dict:
         "scientific_conditions": {
             "dataset": args.dataset,
             "component": args.component,
+            "replacement_mode": args.replacement_mode,
             "selection_direction": args.selection_direction,
             "intervention_target_sign": args.absolute_intervention_target,
             "autodan_split": args.autodan_split if args.dataset == "autodan130" else None,
@@ -654,7 +672,11 @@ def run(args, output_dir: Path, provenance: dict, baseline: list[dict]) -> dict:
             "alpha": ALPHA,
             "layer0_included": LAYER0_INCLUDED,
             "position_scope": "full_prompt_strict_lower_i_gt_j",
-            "intervention": f"pure_{args.component}_pairwise",
+            "intervention": {
+                "reference_mean": f"pure_{args.component}_pairwise",
+                "asym_zero": "pure_antisymmetric_pairwise_zero",
+                "raw_s_zero": "selected_lower_raw_score_zero_unpaired",
+            }[args.replacement_mode],
             "timing": "first_prefill_only",
             "cap_rate": 0.005,
             "development68_used": False,
@@ -697,6 +719,7 @@ def main(argv=None):
         "status": "cpu_preflight_passed",
         "selection": fixed_selection(args.proportional_rate),
         "component": args.component,
+        "replacement_mode": args.replacement_mode,
         "selection_direction": args.selection_direction,
         "intervention_target_sign": args.absolute_intervention_target,
         "alpha": ALPHA,

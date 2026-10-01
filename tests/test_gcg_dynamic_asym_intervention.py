@@ -121,13 +121,94 @@ class FullPromptReferenceTests(unittest.TestCase):
 
 
 class DynamicAsymmetryControllerTests(unittest.TestCase):
-    def make_controller(self, *, tau=0.5, alpha=1.0, sigma_value=1.0):
+    def make_controller(
+        self,
+        *,
+        tau=0.5,
+        alpha=1.0,
+        sigma_value=1.0,
+        replacement_mode="reference_mean",
+    ):
         return DynamicAsymmetryController(
             mu=torch.zeros((2, 3), dtype=torch.float32),
             sigma=torch.full((2, 3), sigma_value, dtype=torch.float32),
             tau=tau,
             alpha=alpha,
+            replacement_mode=replacement_mode,
         )
+
+    def test_reference_mean_default_matches_explicit_mode(self):
+        scores = torch.zeros((1, 3, 4, 4), dtype=torch.float32)
+        scores[0, 1, 3, 0] = 6.0
+        scores[0, 1, 0, 3] = 2.0
+        results = []
+        for replacement_mode in (None, "reference_mean"):
+            kwargs = {} if replacement_mode is None else {
+                "replacement_mode": replacement_mode
+            }
+            controller = DynamicAsymmetryController(
+                mu=torch.ones((2, 3), dtype=torch.float32),
+                sigma=torch.ones((2, 3), dtype=torch.float32),
+                tau=0.5,
+                alpha=1.0,
+                **kwargs,
+            )
+            controller.set_prompt_context(prompt_length=4)
+            results.append(controller.apply(0, scores))
+        torch.testing.assert_close(results[0], results[1], atol=0, rtol=0)
+        self.assertEqual(results[0][0, 1, 3, 0].item(), 5.0)
+        self.assertEqual(results[0][0, 1, 0, 3].item(), 3.0)
+
+    def test_asym_zero_removes_only_selected_antisymmetric_component(self):
+        controller = self.make_controller(replacement_mode="asym_zero")
+        scores = torch.zeros((1, 3, 4, 4), dtype=torch.float32)
+        scores[0, 1, 3, 0] = 6.0
+        scores[0, 1, 0, 3] = 2.0
+        before_sym = (scores + scores.transpose(-1, -2)) / 2
+        controller.set_prompt_context(prompt_length=4)
+        result = controller.apply(0, scores)
+        after_asym = (result - result.transpose(-1, -2)) / 2
+        after_sym = (result + result.transpose(-1, -2)) / 2
+        self.assertEqual(after_asym[0, 1, 3, 0].item(), 0.0)
+        self.assertEqual(after_asym[0, 1, 0, 3].item(), 0.0)
+        torch.testing.assert_close(after_sym, before_sym, atol=0, rtol=0)
+        self.assertEqual(result[0, 1, 3, 0].item(), 4.0)
+        self.assertEqual(result[0, 1, 0, 3].item(), 4.0)
+
+    def test_raw_s_zero_changes_only_selected_lower_raw_score(self):
+        controller = self.make_controller(replacement_mode="raw_s_zero")
+        scores = torch.zeros((1, 3, 4, 4), dtype=torch.float32)
+        scores[0, 1, 3, 0] = 6.0
+        scores[0, 1, 0, 3] = 2.0
+        before = scores.clone()
+        controller.set_prompt_context(prompt_length=4)
+        result = controller.apply(0, scores)
+        self.assertEqual(result[0, 1, 3, 0].item(), 0.0)
+        self.assertEqual(result[0, 1, 0, 3].item(), before[0, 1, 0, 3].item())
+        self.assertEqual(controller.summary()["max_paired_score_change_after_cast"], 0.0)
+
+    def test_replacement_mode_does_not_change_threshold_selection(self):
+        z_scores = torch.tensor([[[-2.0, -0.5, 0.5, 2.0]]])
+        masks = []
+        for replacement_mode in ("reference_mean", "asym_zero", "raw_s_zero"):
+            controller = self.make_controller(
+                tau=0.5, replacement_mode=replacement_mode
+            )
+            masks.append(controller._selection_mask(layer=0, z_scores=z_scores))
+        self.assertTrue(torch.equal(masks[0], masks[1]))
+        self.assertTrue(torch.equal(masks[0], masks[2]))
+        self.assertEqual(masks[0].nonzero().tolist(), [[0, 0, 0], [0, 0, 3]])
+
+    def test_zero_modes_reject_symmetric_selection_component(self):
+        for replacement_mode in ("asym_zero", "raw_s_zero"):
+            with self.assertRaisesRegex(ValueError, "component='antisymmetric'"):
+                DynamicAsymmetryController(
+                    mu=torch.zeros((1, 1), dtype=torch.float32),
+                    sigma=torch.ones((1, 1), dtype=torch.float32),
+                    tau=0.5,
+                    component="symmetric",
+                    replacement_mode=replacement_mode,
+                )
 
     def test_selected_pair_preserves_sym_and_alpha_one_reaches_mu(self):
         controller = self.make_controller()

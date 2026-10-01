@@ -298,7 +298,7 @@ def restrict_absolute_plan_to_intervention_sign(
 
 
 class Stage2PlannedDynamicAsymmetryController(PlannedDynamicAsymmetryController):
-    """Apply Stage 2 plans while reusing the existing Pure Asym implementation."""
+    """Apply Stage 2 plans while reusing the shared replacement implementation."""
 
     def __init__(
         self,
@@ -310,6 +310,7 @@ class Stage2PlannedDynamicAsymmetryController(PlannedDynamicAsymmetryController)
         expected_score_dtype: torch.dtype | None = None,
         capture_score_change_metrics: bool = False,
         component: str = "antisymmetric",
+        replacement_mode: str = "reference_mean",
     ):
         if float(alpha) not in (0.5, 1.0):
             raise ValueError("Stage 2 alpha must be exactly 0.5 or 1.0")
@@ -326,6 +327,7 @@ class Stage2PlannedDynamicAsymmetryController(PlannedDynamicAsymmetryController)
             expected_score_dtype=expected_score_dtype,
             capture_score_change_metrics=capture_score_change_metrics,
             component=component,
+            replacement_mode=replacement_mode,
         )
 
     def set_prompt_plan(self, *, prompt_length: int, plan: Mapping[str, object]) -> None:
@@ -344,7 +346,12 @@ class Stage2PlannedDynamicAsymmetryController(PlannedDynamicAsymmetryController)
                 "intervention_variant": (
                     "dynamic_full_prompt_stage2_planned_pure_asym"
                     if self.component == "antisymmetric"
-                    else "dynamic_full_prompt_stage2_planned_pure_sym"
+                    and self.replacement_mode == "reference_mean"
+                    else (
+                        "dynamic_full_prompt_stage2_planned_pure_sym"
+                        if self.component == "symmetric"
+                        else f"dynamic_full_prompt_stage2_planned_{self.replacement_mode}"
+                    )
                 ),
                 "selection_rule": self.condition["family"],
                 "selection": self.condition,
@@ -403,6 +410,7 @@ def patch_llama_stage2_dynamic_asymmetry_attention(
     layer0_included: bool,
     capture_score_change_metrics: bool = False,
     component: str = "antisymmetric",
+    replacement_mode: str = "reference_mean",
 ):
     controller = Stage2PlannedDynamicAsymmetryController(
         reference=reference,
@@ -412,6 +420,7 @@ def patch_llama_stage2_dynamic_asymmetry_attention(
         expected_score_dtype=torch.float16,
         capture_score_change_metrics=capture_score_change_metrics,
         component=component,
+        replacement_mode=replacement_mode,
     )
     patched = []
     try:

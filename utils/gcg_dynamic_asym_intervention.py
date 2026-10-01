@@ -4,7 +4,7 @@ The reference is built only from per-prompt summaries of the strict lower
 triangle of ``A_asym = (S - S.T) / 2``.  Consequently every reference prompt
 has weight 1/20 regardless of its token length.  At runtime, anomalous
 strict-lower elements are selected independently for each prompt by an
-explicit z-score threshold and edited as an antisymmetric raw-score pair.
+explicit z-score threshold.  Replacement is applied only after selection.
 """
 
 from __future__ import annotations
@@ -41,6 +41,7 @@ from utils.reference_asym_score_intervention import (
 
 
 REFERENCE_SCHEMA_VERSION = 1
+REPLACEMENT_MODES = ("reference_mean", "asym_zero", "raw_s_zero")
 # The square root keeps division by a floored denominator inside float32's
 # normal range for ordinary finite attention scores.  This is a numerical
 # guard, not a scientifically selected scale or threshold.
@@ -63,6 +64,16 @@ def validate_tau(tau: float) -> float:
     if not math.isfinite(tau) or tau < 0.0:
         raise ValueError("tau must be a finite non-negative number")
     return tau
+
+
+def validate_replacement_mode(replacement_mode: str) -> str:
+    """Validate the post-selection replacement rule."""
+
+    if replacement_mode not in REPLACEMENT_MODES:
+        raise ValueError(
+            "replacement_mode must be one of " + ", ".join(REPLACEMENT_MODES)
+        )
+    return replacement_mode
 
 
 def full_prompt_asymmetry_moments(
@@ -449,7 +460,7 @@ class FullPromptAsymmetryMomentCollector:
 
 
 class DynamicAsymmetryController:
-    """Select full-prompt anomalies and apply a pure antisymmetric pair edit."""
+    """Select full-prompt anomalies and apply the requested score replacement."""
 
     def __init__(
         self,
@@ -461,6 +472,7 @@ class DynamicAsymmetryController:
         expected_score_dtype: torch.dtype | None = None,
         capture_score_change_metrics: bool = False,
         component: str = "antisymmetric",
+        replacement_mode: str = "reference_mean",
     ):
         if not isinstance(mu, torch.Tensor) or not isinstance(sigma, torch.Tensor):
             raise TypeError("mu and sigma must be torch tensors")
@@ -484,6 +496,11 @@ class DynamicAsymmetryController:
         if component not in ("antisymmetric", "symmetric"):
             raise ValueError("component must be antisymmetric or symmetric")
         self.component = component
+        self.replacement_mode = validate_replacement_mode(replacement_mode)
+        if self.replacement_mode != "reference_mean" and component != "antisymmetric":
+            raise ValueError(
+                "zero replacement modes require component='antisymmetric'"
+            )
         self.layer_count, self.head_count = mu.shape
         self._reference_cache: dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor]] = {}
         self._tril_cache: dict[tuple[int, str], torch.Tensor] = {}
@@ -617,12 +634,26 @@ class DynamicAsymmetryController:
                 "dynamic intervention selection mask shape/dtype mismatch"
             )
         selected_count = int(selected.sum().item())
-        component_delta = self.alpha * (mu.view(1, -1, 1) - current_lower)
-        component_delta = torch.where(selected, component_delta, 0.0)
         constructed_delta = torch.zeros_like(original)
-        constructed_delta[:, :, rows, cols] = component_delta
-        pair_sign = -1.0 if self.component == "antisymmetric" else 1.0
-        constructed_delta[:, :, cols, rows] = pair_sign * component_delta
+        if self.replacement_mode == "raw_s_zero":
+            original_lower = original[:, :, rows, cols]
+            replacement_delta = self.alpha * (0.0 - original_lower)
+            replacement_delta = torch.where(selected, replacement_delta, 0.0)
+            constructed_delta[:, :, rows, cols] = replacement_delta
+            expected_replacement_lower = original_lower + replacement_delta
+            pair_sign = None
+        else:
+            target = (
+                mu.view(1, -1, 1)
+                if self.replacement_mode == "reference_mean"
+                else torch.zeros_like(current_lower)
+            )
+            replacement_delta = self.alpha * (target - current_lower)
+            replacement_delta = torch.where(selected, replacement_delta, 0.0)
+            constructed_delta[:, :, rows, cols] = replacement_delta
+            pair_sign = -1.0 if self.component == "antisymmetric" else 1.0
+            constructed_delta[:, :, cols, rows] = pair_sign * replacement_delta
+            expected_replacement_lower = current_lower + replacement_delta
         intervened_float32 = original + constructed_delta
         intervened_cast = intervened_float32.to(attention_scores.dtype)
 
@@ -642,9 +673,7 @@ class DynamicAsymmetryController:
         constructed_sym64 = (
             intervened64 + intervened64.transpose(-1, -2)
         ) / 2.0
-        expected_lower64 = current_lower.to(torch.float64) + component_delta.to(
-            torch.float64
-        )
+        expected_replacement_lower64 = expected_replacement_lower.to(torch.float64)
         constructed_asym64 = (
             intervened64 - intervened64.transpose(-1, -2)
         ) / 2.0
@@ -657,32 +686,58 @@ class DynamicAsymmetryController:
         float32_addition_roundoff = _max_abs(
             intervened64 - (original64 + constructed_delta64)
         )
-        construction_error = _max_abs(
-            constructed_delta
-            - pair_sign * constructed_delta.transpose(-1, -2)
-        )
-        preserved_error = _max_abs(
-            (constructed_sym64 - before_sym64)
-            if self.component == "antisymmetric"
-            else (constructed_asym64 - original_asym64)
-        )
-        target_error = _max_abs(
-            (constructed_lower64 - expected_lower64).masked_select(selected)
-        )
-        if construction_error != 0.0:
-            raise ReferenceInterventionRuntimeError(
-                "pure component float32 construction invariant failed"
+        if self.replacement_mode == "raw_s_zero":
+            construction_error = 0.0
+            preserved_error = _max_abs(constructed_sym64 - before_sym64)
+            replacement_target_error = _max_abs(
+                (
+                    intervened64[:, :, rows, cols]
+                    - expected_replacement_lower64
+                ).masked_select(selected)
             )
-        if preserved_error > float32_addition_roundoff:
-            raise ReferenceInterventionRuntimeError(
-                "float32 preserved-component error exceeds score-addition roundoff"
+            paired_score_change_float32 = _max_abs(
+                constructed_delta[:, :, cols, rows].masked_select(selected)
             )
-        if target_error > (
-            current_component_calculation_roundoff + float32_addition_roundoff
-        ):
-            raise ReferenceInterventionRuntimeError(
-                "float32 target error exceeds component plus addition roundoff"
+            if paired_score_change_float32 != 0.0:
+                raise ReferenceInterventionRuntimeError(
+                    "raw-score zero replacement changed the paired score"
+                )
+            if replacement_target_error > float32_addition_roundoff:
+                raise ReferenceInterventionRuntimeError(
+                    "float32 raw-score target error exceeds score-addition roundoff"
+                )
+        else:
+            construction_error = _max_abs(
+                constructed_delta
+                - pair_sign * constructed_delta.transpose(-1, -2)
             )
+            preserved_error = _max_abs(
+                (constructed_sym64 - before_sym64)
+                if self.component == "antisymmetric"
+                else (constructed_asym64 - original_asym64)
+            )
+            replacement_target_error = _max_abs(
+                (constructed_lower64 - expected_replacement_lower64).masked_select(
+                    selected
+                )
+            )
+            paired_score_change_float32 = _max_abs(
+                constructed_delta[:, :, cols, rows].masked_select(selected)
+            )
+            if construction_error != 0.0:
+                raise ReferenceInterventionRuntimeError(
+                    "pure component float32 construction invariant failed"
+                )
+            if preserved_error > float32_addition_roundoff:
+                raise ReferenceInterventionRuntimeError(
+                    "float32 preserved-component error exceeds score-addition roundoff"
+                )
+            if replacement_target_error > (
+                current_component_calculation_roundoff + float32_addition_roundoff
+            ):
+                raise ReferenceInterventionRuntimeError(
+                    "float32 target error exceeds component plus addition roundoff"
+                )
 
         modified = attention_scores.clone()
         modified.copy_(intervened_cast)
@@ -691,15 +746,16 @@ class DynamicAsymmetryController:
                 "post-intervention attention scores contain NaN or infinity"
             )
         realized_delta = modified.float() - original
-        selected_pair_mask = torch.zeros(
+        selected_score_mask = torch.zeros(
             (1, self.head_count, query_length, query_length),
             dtype=torch.bool,
             device=attention_scores.device,
         )
-        selected_pair_mask[:, :, rows, cols] = selected
-        selected_pair_mask[:, :, cols, rows] = selected
+        selected_score_mask[:, :, rows, cols] = selected
+        if self.replacement_mode != "raw_s_zero":
+            selected_score_mask[:, :, cols, rows] = selected
         unselected_change = _max_abs(
-            realized_delta.masked_select(~selected_pair_mask)
+            realized_delta.masked_select(~selected_score_mask)
         )
         diagonal_change = _max_abs(
             torch.diagonal(realized_delta, dim1=-2, dim2=-1)
@@ -741,17 +797,34 @@ class DynamicAsymmetryController:
             (realized_lower - mu.view(1, -1, 1)).masked_select(selected)
         )
         cast_quantization_error = _max_abs(realized64 - intervened64)
-        preserved_error_after_cast = _max_abs(
-            (realized_sym64 - before_sym64)
-            if self.component == "antisymmetric"
-            else (realized_asym64 - original_asym64)
-        )
-        if preserved_error_after_cast > (
-            preserved_error + cast_quantization_error
-        ):
-            raise ReferenceInterventionRuntimeError(
-                "post-cast preserved-component error exceeds roundoff"
+        if self.replacement_mode == "raw_s_zero":
+            preserved_error_after_cast = _max_abs(realized_sym64 - before_sym64)
+            paired_score_change_after_cast = _max_abs(
+                (
+                    realized[:, :, cols, rows] - original[:, :, cols, rows]
+                ).masked_select(selected)
             )
+            if paired_score_change_after_cast != 0.0:
+                raise ReferenceInterventionRuntimeError(
+                    "raw-score zero replacement changed the paired score after cast"
+                )
+        else:
+            preserved_error_after_cast = _max_abs(
+                (realized_sym64 - before_sym64)
+                if self.component == "antisymmetric"
+                else (realized_asym64 - original_asym64)
+            )
+            paired_score_change_after_cast = _max_abs(
+                (
+                    realized[:, :, cols, rows] - original[:, :, cols, rows]
+                ).masked_select(selected)
+            )
+            if preserved_error_after_cast > (
+                preserved_error + cast_quantization_error
+            ):
+                raise ReferenceInterventionRuntimeError(
+                    "post-cast preserved-component error exceeds roundoff"
+                )
 
         self.intervention_call_count += 1
         self.selected_element_intervention_count += selected_count
@@ -776,13 +849,17 @@ class DynamicAsymmetryController:
                     current_component_calculation_roundoff
                 ),
                 "max_symmetric_component_error_float32": (
-                    preserved_error if self.component == "antisymmetric" else target_error
+                    preserved_error
+                    if self.component == "antisymmetric"
+                    else replacement_target_error
                 ),
                 "max_symmetric_component_error_after_cast": (
                     preserved_error_after_cast
                     if self.component == "antisymmetric"
                     else _max_abs(
-                        (realized_lower - expected_lower64).masked_select(selected)
+                        (
+                            realized_lower - expected_replacement_lower64
+                        ).masked_select(selected)
                     )
                 ),
                 "max_antisymmetric_component_change_float32": (
@@ -793,9 +870,19 @@ class DynamicAsymmetryController:
                 ),
                 "max_score_cast_quantization_error": cast_quantization_error,
                 "max_asym_expected_error_float32": (
-                    target_error if self.component == "antisymmetric" else 0.0
+                    replacement_target_error
+                    if self.component == "antisymmetric"
+                    and self.replacement_mode != "raw_s_zero"
+                    else 0.0
                 ),
-                "max_target_component_error_float32": target_error,
+                "max_target_component_error_float32": (
+                    replacement_target_error
+                    if self.replacement_mode != "raw_s_zero"
+                    else 0.0
+                ),
+                "max_replacement_target_error_float32": replacement_target_error,
+                "max_paired_score_change_float32": paired_score_change_float32,
+                "max_paired_score_change_after_cast": paired_score_change_after_cast,
                 "max_preserved_component_error_float32": preserved_error,
                 "max_preserved_component_error_after_cast": preserved_error_after_cast,
                 "max_unselected_element_change": unselected_change,
@@ -841,19 +928,34 @@ class DynamicAsymmetryController:
             }
         return {
             "component": self.component,
+            "replacement_mode": self.replacement_mode,
             "intervention_variant": (
                 "dynamic_full_prompt_zscore_pure_asym"
                 if self.component == "antisymmetric"
-                else "dynamic_full_prompt_zscore_pure_sym"
+                and self.replacement_mode == "reference_mean"
+                else (
+                    "dynamic_full_prompt_zscore_pure_sym"
+                    if self.component == "symmetric"
+                    else f"dynamic_full_prompt_zscore_{self.replacement_mode}"
+                )
             ),
             "position_scope": "full_prompt_strict_lower_i_gt_j",
             "selection_rule": "abs(z) > tau",
-            "delta_definition": f"alpha*(mu_lh-A_{self.component}_ij)",
-            "raw_score_intervention": (
-                "S_ij += delta; S_ji -= delta"
-                if self.component == "antisymmetric"
-                else "S_ij += delta; S_ji += delta"
-            ),
+            "delta_definition": {
+                "reference_mean": f"alpha*(mu_lh-A_{self.component}_ij)",
+                "asym_zero": "alpha*(0-A_antisymmetric_ij)",
+                "raw_s_zero": "alpha*(0-S_ij)",
+            }[self.replacement_mode],
+            "raw_score_intervention": {
+                "reference_mean": (
+                    "S_ij += delta; S_ji -= delta"
+                    if self.component == "antisymmetric"
+                    else "S_ij += delta; S_ji += delta"
+                ),
+                "asym_zero": "S_ij += delta; S_ji -= delta",
+                "raw_s_zero": "S_ij += delta; S_ji unchanged",
+            }[self.replacement_mode],
+            "paired_update": self.replacement_mode != "raw_s_zero",
             "tau": self.tau,
             "alpha": self.alpha,
             "intervention_timing": "first_prefill_only",
@@ -912,6 +1014,15 @@ class DynamicAsymmetryController:
             ),
             "max_target_component_error_float32": maximum(
                 "max_target_component_error_float32"
+            ),
+            "max_replacement_target_error_float32": maximum(
+                "max_replacement_target_error_float32"
+            ),
+            "max_paired_score_change_float32": maximum(
+                "max_paired_score_change_float32"
+            ),
+            "max_paired_score_change_after_cast": maximum(
+                "max_paired_score_change_after_cast"
             ),
             "max_preserved_component_error_float32": maximum(
                 "max_preserved_component_error_float32"
@@ -1005,8 +1116,9 @@ def patch_llama_dynamic_asymmetry_attention(
     reference: DynamicAsymmetryReference,
     tau: float,
     alpha: float = 1.0,
+    replacement_mode: str = "reference_mean",
 ):
-    """Install the first-prefill-only dynamic pure-Asym intervention."""
+    """Install the first-prefill-only dynamic score intervention."""
 
     controller = DynamicAsymmetryController(
         mu=reference.mu,
@@ -1014,6 +1126,7 @@ def patch_llama_dynamic_asymmetry_attention(
         tau=tau,
         alpha=alpha,
         expected_score_dtype=torch.float16,
+        replacement_mode=replacement_mode,
     )
     patched = []
     try:

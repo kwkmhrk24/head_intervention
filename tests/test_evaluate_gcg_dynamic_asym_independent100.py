@@ -56,6 +56,21 @@ class Independent100DynamicAsymTest(unittest.TestCase):
         args = parse_args(["--component", "symmetric"])
         self.assertEqual(args.component, "symmetric")
 
+    def test_replacement_mode_cli_defaults_to_reference_mean(self):
+        self.assertEqual(parse_args([]).replacement_mode, "reference_mean")
+        for replacement_mode in ("asym_zero", "raw_s_zero"):
+            args = parse_args(["--replacement-mode", replacement_mode])
+            self.assertEqual(args.replacement_mode, replacement_mode)
+            self.assertIsNone(validate_request(args))
+
+    def test_zero_replacement_modes_require_asymmetric_component(self):
+        with self.assertRaisesRegex(ValueError, "component antisymmetric"):
+            validate_request(
+                parse_args(
+                    ["--component", "symmetric", "--replacement-mode", "asym_zero"]
+                )
+            )
+
     def test_half_percent_rate_cli(self):
         args = parse_args(["--proportional-rate", "0.005"])
         self.assertEqual(args.proportional_rate, 0.005)
