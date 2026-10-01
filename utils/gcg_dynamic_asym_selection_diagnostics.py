@@ -613,3 +613,43 @@ def patch_llama_abs_z_collection(
         yield collector
     finally:
         _restore_llama_attention_modules(patched)
+
+
+@contextmanager
+def patch_llama_multi_reference_z_collection(model, *, references, prompt_length):
+    """Normalize one unchanged prefill against multiple references on the GPU.
+
+    Each named collector uses exactly the existing float32 z-score calculation.
+    Only the reference differs; the raw attention scores and input forward are
+    shared, and no score or model state is edited by the collectors.
+    """
+    if not references:
+        raise ValueError("at least one reference is required")
+    layer_count = len(model.model.layers)
+    head_count = model.config.num_attention_heads
+    collectors = {}
+    for name, reference in references.items():
+        collector = FullPromptAbsZCollector(
+            layer_count=layer_count, head_count=head_count,
+            expected_score_dtype=torch.float16, component="antisymmetric",
+        )
+        collector.set_prompt_context(prompt_length=prompt_length, excluded_selection_position=0,
+                                     mu=reference.mu, sigma=reference.sigma)
+        collectors[name] = collector
+
+    class SharedPrefillCollector:
+        def apply(self, layer, scores):
+            for collector in collectors.values():
+                if collector.apply(layer, scores) is not scores:
+                    raise ReferenceInterventionRuntimeError("reference collection modified scores")
+            return scores
+
+    shared = SharedPrefillCollector()
+    shared.layer_count = layer_count
+    shared.head_count = head_count
+    patched = []
+    try:
+        patched = _patch_llama_attention_modules(model, shared)
+        yield collectors
+    finally:
+        _restore_llama_attention_modules(patched)

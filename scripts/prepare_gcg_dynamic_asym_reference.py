@@ -23,12 +23,13 @@ if str(REPO_ROOT) not in sys.path:
 from utils.artifact_io import (  # noqa: E402
     ensure_output_directory_absent,
     read_json,
+    read_jsonl,
     sha256_file,
     sha256_text,
     utc_now,
     write_json,
 )
-from utils.experiment_runtime import git_state, git_value  # noqa: E402
+from utils.experiment_runtime import git_state, git_value, seed_everything  # noqa: E402
 from utils.gcg_dynamic_asym_intervention import (  # noqa: E402
     REFERENCE_SCHEMA_VERSION,
     compute_equal_prompt_reference_statistics,
@@ -52,6 +53,8 @@ from scripts.run_autodan_position_element_selection_ablation import (  # noqa: E
     OFFICIAL_FORMAT as AUTODAN_OFFICIAL_FORMAT,
     parse_args as parse_autodan_args,
     validate_sources as validate_autodan_sources,
+    model_repository_head,
+    MODEL_REPOSITORY_HEAD,
 )
 
 
@@ -63,6 +66,9 @@ DEFAULT_SELECTION_MANIFEST = (
 )
 REFERENCE_FILE = "selection20_original_full_prompt_asym_reference.pt"
 AUTODAN_REFERENCE_FILE = "autodan_selection20_official_full_prompt_asym_reference.pt"
+AUTODAN_ORIGINAL_REFERENCE_FILE = "autodan_selection20_original_full_prompt_asym_reference.pt"
+DEFAULT_AUTODAN_ORIGINAL_INPUT = "data/derived/llama2/autodan/original_prompts.jsonl"
+AUTODAN_ORIGINAL_CONDITION = "autodan_selection20_corresponding_originals_only"
 GCG_SYM_REFERENCE_FILE = "selection20_original_full_prompt_sym_reference.pt"
 AUTODAN_SYM_REFERENCE_FILE = "autodan_selection20_official_full_prompt_sym_reference.pt"
 MANIFEST_FILE = "reference_manifest.json"
@@ -101,10 +107,12 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "--source",
-        choices=("gcg-selection20-original", "autodan-selection20-official"),
+        choices=("gcg-selection20-original", "autodan-selection20-official", "autodan-selection20-original"),
         default="gcg-selection20-original",
     )
     parser.add_argument("--original-input", default=DEFAULT_ORIGINAL_INPUT)
+    parser.add_argument("--autodan-original-input", default=DEFAULT_AUTODAN_ORIGINAL_INPUT)
+    parser.add_argument("--sandbox-exempt-gpu", action="store_true")
     parser.add_argument("--selection-manifest", default=DEFAULT_SELECTION_MANIFEST)
     parser.add_argument(
         "--autodan-selection-manifest",
@@ -118,13 +126,22 @@ def parse_args(argv=None):
 
 
 def validate_request(args) -> Path | None:
+    if args.source == "autodan-selection20-original" and args.component != "antisymmetric":
+        raise ValueError("AutoDAN corresponding-original reference is antisymmetric only")
     if args.stage == "cpu-preflight":
-        if args.output_dir is not None:
+        if args.output_dir is not None or args.sandbox_exempt_gpu:
             raise ValueError("cpu-preflight does not write an output directory")
         return None
     if not args.output_dir:
         raise ValueError("--output-dir is required for --stage build-reference")
     return ensure_output_directory_absent(Path(args.output_dir).resolve())
+
+
+def validate_autodan_original_model(model_path):
+    revision = model_repository_head(Path(model_path).resolve())
+    if revision != MODEL_REPOSITORY_HEAD:
+        raise ValueError("AutoDAN model repository revision mismatch")
+    return revision
 
 
 def load_eager_model(model_path: str):
@@ -225,7 +242,7 @@ def collect_reference_moments(model, tokenizer, records, *, component="antisymme
     return prompt_means, prompt_mean_squares, prompt_records
 
 
-def load_autodan_selection20_records(selection_manifest_path, tokenizer=None):
+def load_autodan_selection20_records(selection_manifest_path, tokenizer=None, *, original_input=None):
     selection_path = Path(selection_manifest_path).resolve()
     if sha256_file(selection_path) != EXPECTED_AUTODAN_SELECTION_MANIFEST_SHA256:
         raise ValueError("frozen AutoDAN Selection20 manifest SHA-256 mismatch")
@@ -238,11 +255,39 @@ def load_autodan_selection20_records(selection_manifest_path, tokenizer=None):
     ):
         raise ValueError("frozen AutoDAN Selection20 manifest mismatch")
     autodan_args = parse_autodan_args(["--stage", "cpu-validate"])
-    raw_rows, _, _, split = validate_autodan_sources(
+    raw_rows, advbench_rows, _, split = validate_autodan_sources(
         autodan_args, tokenizer=tokenizer
     )
     if split["selection_indices"] != AUTODAN_SELECTION_INDICES:
         raise ValueError("revalidated AutoDAN Selection20 indices mismatch")
+    if (split["evaluation_indices"] != saved.get("evaluation_indices")
+            or set(AUTODAN_SELECTION_INDICES) & set(split["evaluation_indices"])):
+        raise ValueError("AutoDAN split overlap or evaluation index mismatch")
+    if original_input is not None:
+        original_path = Path(original_input).resolve()
+        sources = saved["source_provenance"]
+        if sha256_file(original_path) != sources["derived_original_sha256"]:
+            raise ValueError("AutoDAN corresponding original source hash mismatch")
+        for key in ("advbench_sha256", "derived_original_sha256", "autodan_sha256"):
+            if split["source_provenance"][key] != sources[key]:
+                raise ValueError(f"AutoDAN source provenance mismatch: {key}")
+        originals = read_jsonl(original_path)
+        if len(originals) != 130:
+            raise ValueError("AutoDAN original source must contain 130 aligned prompts")
+        records = []
+        for index in AUTODAN_SELECTION_INDICES:
+            prompt = originals[index]["prompt"]
+            digest = sha256_text(prompt)
+            if (prompt != advbench_rows[index]["prompt"]
+                    or digest != saved["records"][index]["original_prompt_sha256"]
+                    or prompt == raw_rows[index]["user prompt"]):
+                raise ValueError(f"original/jailbreak pairing mismatch at index={index}")
+            records.append({"dataset_index": index, "row_position": index,
+                            "prompt_id": f"autodan_original_{index}", "prompt": prompt,
+                            "original_prompt_sha256": digest})
+        if tokenizer is not None:
+            records = format_autodan_records(records, tokenizer, prompt_format=AUTODAN_OFFICIAL_FORMAT)
+        return records, saved
     records = [
         {
             "dataset_index": index,
@@ -299,13 +344,19 @@ def runtime_provenance(repo_root: str | Path = REPO_ROOT) -> dict:
 def main(argv=None):
     args = parse_args(argv)
     output_dir = validate_request(args)
-    if args.source == "autodan-selection20-official":
+    is_autodan_original = args.source == "autodan-selection20-original"
+    if is_autodan_original:
+        validate_autodan_original_model(args.model)
+    is_autodan = args.source.startswith("autodan-selection20-")
+    if is_autodan:
         records, selection_manifest = load_autodan_selection20_records(
-            args.autodan_selection_manifest
+            args.autodan_selection_manifest,
+            original_input=args.autodan_original_input if is_autodan_original else None,
         )
         summary = {
             "stage": args.stage,
-            "reference_condition": "autodan_selection20_official_jailbreak_only",
+            "reference_condition": (AUTODAN_ORIGINAL_CONDITION if is_autodan_original
+                                    else "autodan_selection20_official_jailbreak_only"),
             "selection_count": len(records),
             "selection_dataset_indices": AUTODAN_SELECTION_INDICES,
             "selection_manifest": str(Path(args.autodan_selection_manifest).resolve()),
@@ -313,10 +364,25 @@ def main(argv=None):
             "prompt_format": AUTODAN_OFFICIAL_FORMAT,
             "position_scope": "full_prompt_strict_lower_i_gt_j",
             "prompt_weighting": "equal_weight_per_prompt",
-            "jailbreak_reference_data_used": True,
+            "jailbreak_reference_data_used": not is_autodan_original,
             "tau": None,
             "component": args.component,
         }
+        if is_autodan_original:
+            summary.update({
+                "reference_source_description": "AutoDAN Selection20 corresponding originals only",
+                "original_input": str(Path(args.autodan_original_input).resolve()),
+                "original_input_sha256": sha256_file(args.autodan_original_input),
+                "original_prompt_hashes_verified": True,
+                "original_prompt_records": [
+                    {key: row[key] for key in ("dataset_index", "original_prompt_sha256")}
+                    for row in records
+                ],
+                "evaluation_dataset_indices": selection_manifest["evaluation_indices"],
+                "reference_evaluation_overlap_count": 0,
+                "source_provenance": selection_manifest["source_provenance"],
+                "model_repository_head": MODEL_REPOSITORY_HEAD,
+            })
     else:
         records, selection_manifest = load_selection20_original_prompts(
             split_manifest_path=args.selection_manifest,
@@ -329,10 +395,13 @@ def main(argv=None):
         return
 
     provenance = runtime_provenance()
+    if is_autodan_original:
+        seed_everything(42)
     model, tokenizer = load_eager_model(args.model)
-    if args.source == "autodan-selection20-official":
+    if is_autodan:
         records, selection_manifest = load_autodan_selection20_records(
-            args.autodan_selection_manifest, tokenizer
+            args.autodan_selection_manifest, tokenizer,
+            original_input=args.autodan_original_input if is_autodan_original else None,
         )
     model_summary = llama_model_config_summary(model)
     prompt_means, prompt_mean_squares, prompt_records = collect_reference_moments(
@@ -342,10 +411,9 @@ def main(argv=None):
         prompt_means,
         prompt_mean_squares,
     )
-    is_autodan = args.source == "autodan-selection20-official"
     metadata = {
         "reference_condition": (
-            "autodan_selection20_official_jailbreak_only"
+            (AUTODAN_ORIGINAL_CONDITION if is_autodan_original else "autodan_selection20_official_jailbreak_only")
             if is_autodan
             else "selection20_original_only"
         ),
@@ -395,13 +463,25 @@ def main(argv=None):
             if is_autodan
             else selection_manifest["selection_dataset_indices"]
         ),
-        "jailbreak_reference_data_used": is_autodan,
+        "jailbreak_reference_data_used": is_autodan and not is_autodan_original,
         "git_head": provenance["git_head"],
         "git_branch": provenance["git_branch"],
         "created_at": utc_now(),
     }
     if is_autodan:
         metadata["prompt_format"] = AUTODAN_OFFICIAL_FORMAT
+        if is_autodan_original:
+            metadata.update({key: summary[key] for key in (
+                "reference_source_description", "original_input", "original_input_sha256",
+                "original_prompt_hashes_verified", "original_prompt_records",
+                "evaluation_dataset_indices", "reference_evaluation_overlap_count",
+                "source_provenance",
+                "model_repository_head",
+            )})
+            metadata["sandbox_exempt_gpu"] = args.sandbox_exempt_gpu
+            metadata["reference_collection_forward_count"] = SELECTION_COUNT
+            metadata["seed"] = 42
+            metadata["gpu"] = torch.cuda.get_device_name(0)
     else:
         metadata.update(
             {
@@ -426,7 +506,8 @@ def main(argv=None):
     ensure_output_directory_absent(output_dir)
     output_dir.mkdir(parents=True)
     reference_path = output_dir / (
-        (AUTODAN_REFERENCE_FILE if is_autodan else REFERENCE_FILE)
+        (AUTODAN_ORIGINAL_REFERENCE_FILE if is_autodan_original else
+         (AUTODAN_REFERENCE_FILE if is_autodan else REFERENCE_FILE))
         if args.component == "antisymmetric"
         else (AUTODAN_SYM_REFERENCE_FILE if is_autodan else GCG_SYM_REFERENCE_FILE)
     )
@@ -458,6 +539,9 @@ def main(argv=None):
         },
         "tau": None,
     }
+    if is_autodan_original:
+        manifest_payload.update({"sandbox_exempt_gpu": args.sandbox_exempt_gpu,
+                                 "reference_collection_forward_count": SELECTION_COUNT})
     write_json(output_dir / MANIFEST_FILE, manifest_payload)
     print(json.dumps(manifest_payload, ensure_ascii=False, indent=2))
     print(f"reference artifacts written: {output_dir}")

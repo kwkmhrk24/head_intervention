@@ -109,7 +109,8 @@ class AnalysisArtifactTests(unittest.TestCase):
     def test_cli_exposes_no_selection_or_generation_controls(self):
         args = analysis.parse_args([])
         self.assertEqual(args.stage, "cpu-preflight")
-        for key in ("alpha", "rate", "replacement_mode", "dataset", "component", "bins"):
+        self.assertEqual(args.dataset, "independent100")
+        for key in ("alpha", "rate", "replacement_mode", "component", "bins"):
             self.assertFalse(hasattr(args, key))
 
     def test_cpu_preflight_rejects_outputs_and_replay_rejects_gpu_flag(self):

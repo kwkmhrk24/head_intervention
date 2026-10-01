@@ -57,6 +57,12 @@ def parse_args(argv=None):
     parser.add_argument("--coordinates-from", help="Replay a completed analysis on CPU, without model loading.")
     parser.add_argument("--output-dir")
     parser.add_argument("--sandbox-exempt-gpu", action="store_true")
+    parser.add_argument("--dataset", choices=("independent100", "autodan110-reference-comparison"),
+                        default="independent100")
+    parser.add_argument("--autodan-original-reference")
+    parser.add_argument("--gcg-analysis", default=(
+        "data/outputs/gcg_dynamic_asym_selected_positions/llama2/independent100/"
+        "analysis_20261001T125944Z"))
     return parser.parse_args(argv)
 
 
@@ -325,22 +331,28 @@ def plot_heatmap(path, position_bins, metric, provenance):
     ax.set_yticks(np.linspace(0, 1, 6))
     ax.set_xlabel("Key relative position j/n (Early → Late)")
     ax.set_ylabel("Query relative position i/n (Early → Late)")
-    ax.set_title(f"GCG independent100: {label}\nPrompt-equal, Layers 1–31; gray = no candidates")
+    ax.set_title(f"{provenance.get('dataset', 'GCG independent100')}: {label}\n"
+                 "Prompt-equal, Layers 1–31; gray = no candidates")
     fig.tight_layout()
     fig.savefig(path, dpi=180, metadata={"Provenance": json.dumps(provenance, ensure_ascii=False)})
     plt.close(fig)
 
 
-def save_analysis(output, metrics_rows, coordinate_rows, provenance):
+def save_analysis(output, metrics_rows, coordinate_rows, provenance, *,
+                  expected_total=91531, expected_prompt_count=100,
+                  validation=None, coordinate_filename="selected_coordinates.jsonl"):
     summary = {"provenance": provenance, **aggregate_positions(metrics_rows), "validation": {
-        "prompt_count": 100, "prior_counts_and_layer_counts_match": True,
+        "prompt_count": expected_prompt_count, "prior_counts_and_layer_counts_match": True,
         "prior_selected_z_match": True, "region_and_bin_counts_conserved": True,
         "layer0_selected_count": 0, "nonfinite_metric_count": 0,
         "selection_shortfall_count": 0, "cap_activation_count": 0, "cap_violation_count": 0,
         "intervention_applied": False, "response_generation_performed": False,
     }}
-    if summary["total_selected_count"] != 91531:
-        raise AssertionError("independent100 selected total mismatch")
+    if validation:
+        summary["validation"].update(validation)
+    if (summary["prompt_count"] != expected_prompt_count
+            or summary["total_selected_count"] != expected_total):
+        raise AssertionError("selected total/prompt count mismatch")
     # No non-standard JSON NaN/Infinity; absent candidate metrics are null.
     json.dumps(summary, allow_nan=False)
     json.dumps(metrics_rows, allow_nan=False)
@@ -350,7 +362,7 @@ def save_analysis(output, metrics_rows, coordinate_rows, provenance):
     write_jsonl(output / "per_prompt_region_metrics.jsonl", [
         {"provenance": provenance, **row} for row in metrics_rows
     ])
-    write_jsonl(output / "selected_coordinates.jsonl", [
+    write_jsonl(output / coordinate_filename, [
         {"provenance": provenance, **row} for row in coordinate_rows
     ])
     provenance_json = json.dumps(provenance, ensure_ascii=False)
@@ -385,6 +397,9 @@ def save_analysis(output, metrics_rows, coordinate_rows, provenance):
 
 def main(argv=None):
     args = parse_args(argv)
+    if args.dataset == "autodan110-reference-comparison":
+        from utils.autodan_dynamic_asym_position_comparison import run_comparison
+        return run_comparison(args)
     if args.stage == "cpu-preflight" and (args.output_dir or args.sandbox_exempt_gpu):
         raise ValueError("cpu-preflight cannot write outputs or claim GPU execution")
     if args.coordinates_from and args.sandbox_exempt_gpu:

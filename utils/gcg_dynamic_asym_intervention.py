@@ -376,6 +376,24 @@ def validate_dynamic_reference_payload(payload: Mapping[str, object]) -> None:
     if condition == "selection20_original_only":
         if metadata.get("jailbreak_reference_data_used") is not False:
             raise ValueError("GCG original reference metadata mismatch")
+    elif condition == "autodan_selection20_corresponding_originals_only":
+        selection = metadata.get("selection_dataset_indices", [])
+        evaluation = metadata.get("evaluation_dataset_indices", [])
+        originals = metadata.get("original_prompt_records", [])
+        if (
+            metadata.get("jailbreak_reference_data_used") is not False
+            or metadata.get("prompt_format") != "official_fastchat_34062e9"
+            or metadata.get("component") != "A_asym=(S-S^T)/2"
+            or metadata.get("original_prompt_hashes_verified") is not True
+            or len(selection) != 20 or len(set(selection)) != 20
+            or len(evaluation) != 110 or len(set(evaluation)) != 110
+            or set(selection) & set(evaluation)
+            or set(selection) | set(evaluation) != set(range(130))
+            or [row.get("dataset_index") for row in originals] != selection
+            or any(len(row.get("original_prompt_sha256", "")) != 64 for row in originals)
+            or len(metadata.get("original_input_sha256", "")) != 64
+        ):
+            raise ValueError("AutoDAN original reference provenance/split mismatch")
     elif condition == "autodan_selection20_official_jailbreak_only":
         if (
             metadata.get("jailbreak_reference_data_used") is not True
