@@ -89,7 +89,7 @@ def validate_permutation(before, after, start, end):
         raise ValueError('suffix token multiplicities changed')
 
 
-def prepare_samples(tokenizer):
+def prepare_samples(tokenizer, *, use_all_selection=False):
     records, split = load_selection_development_records(
         split_manifest_path=SPLIT, jailbreak_input=JAILBREAK, baseline_results=BASELINE)
     if sha(ORIGINAL) != split['original_input_sha256']:
@@ -97,8 +97,9 @@ def prepare_samples(tokenizer):
     originals = {r['index']: r['prompt'] for r in read_jsonl(ORIGINAL)}
     historical = {r['source_index']: r for r in read_jsonl(BASELINE)}
     split_records = {r['dataset_index']: r for r in split['records']}
-    selected = sorted(random.Random(SELECTION_SEED).sample(
-        sorted(r['dataset_index'] for r in records), 5))
+    candidates = sorted(r['dataset_index'] for r in records)
+    selected = candidates if use_all_selection else sorted(
+        random.Random(SELECTION_SEED).sample(candidates, 5))
     output, exclusions = [], []
     for record in records:
         index = record['dataset_index']
