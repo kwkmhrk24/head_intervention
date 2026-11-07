@@ -6,17 +6,9 @@ METRICS = tuple(f'mu_{region}_{policy}' for policy in ('full', 'causal')
 
 
 def signed_means(scores, ranges):
-    if scores.ndim < 2 or scores.shape[-1] != scores.shape[-2]:
-        raise ValueError('square score matrices required')
-    a, b = ranges['original']; c, d = ranges['suffix']
-    if not 0 <= a < b <= c < d <= scores.shape[-1] or d-c != 20:
-        raise ValueError('invalid Original/Suffix ranges or suffix length')
-    o = np.arange(a, b); u = np.arange(c, d)
-    blocks = {'OO': scores[..., a:b, a:b], 'UU': scores[..., c:d, c:d],
-              'UO': scores[..., c:d, a:b]}
-    masks = {'OO': o[None, :] <= o[:, None], 'UU': u[None, :] <= u[:, None],
-             'UO': o[None, :] <= u[:, None]}
-    values = {}; counts = {'original_length': b-a, 'suffix_length': d-c}
+    from utils.gcg_shuffled_common import region_layout
+    blocks,masks,counts=region_layout(scores,ranges)
+    values = {}
     for policy in ('full', 'causal'):
         for region, block in blocks.items():
             if not np.isfinite(block).all():

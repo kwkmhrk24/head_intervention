@@ -26,84 +26,7 @@ from utils.artifact_io import read_json,read_jsonl,sha256_file,utc_now
 from utils.gcg_shuffled_metrics import METRICS,TIE_ATOL,TIE_RTOL,calculate_metrics,paired_differences,summarize
 from scripts.analyze_attention_head_metric_relationships import pearson_correlation,spearman_correlation
 
-SCORES=ROOT/'data/outputs/full_attention_scores/legacy_selection20_20261107T053240Z'
-DATASET=ROOT/'data/outputs/shuffled_gcg_comparison/legacy_selection20_20261106T171044Z/dataset.jsonl'
-
-
-def write_json(path,value):
-    with Path(path).open('x') as handle:
-        json.dump(value,handle,ensure_ascii=False,indent=2,allow_nan=False)
-        handle.write('\n')
-
-
-def write_csv(path,frame):
-    frame.to_csv(path,index=False,mode='x',float_format='%.17g')
-
-
-def inspect_inputs():
-    extraction_plan=read_json(SCORES/'plan.json')
-    validation=read_json(SCORES/'validation_final.json')
-    if sha256_file(SCORES/'manifest.jsonl')!=validation['manifest_sha256']:
-        raise ValueError('score manifest hash mismatch')
-    if sha256_file(DATASET)!=extraction_plan['dataset_sha256']:
-        raise ValueError('comparison dataset differs from score extraction source')
-    dataset=read_jsonl(DATASET)
-    comparison_plan=read_json(DATASET.parent/'plan.json')
-    if [r['dataset_index'] for r in dataset]!=comparison_plan['selected_indices'] or len(dataset)!=20:
-        raise ValueError('exact selection20 required')
-    by_index={r['dataset_index']:r for r in dataset}
-    if len(by_index)!=20 or any(i>=220 for i in by_index):
-        raise ValueError('duplicate/nonlegacy index')
-    primary=[]
-    for row in dataset:
-        labels={c:row['conditions'][c]['evaluation']['success'] for c in ('original','gcg','shuffled')}
-        if any(type(v) is not bool for v in labels.values()):
-            raise ValueError('historical automatic labels missing')
-        if not labels['original'] and labels['gcg'] and not labels['shuffled']:
-            primary.append(row['dataset_index'])
-        gcg,shuffled=(row['conditions'][c] for c in ('gcg','shuffled'))
-        u0,u1=gcg['token_ranges']['suffix']
-        if u1-u0!=20 or shuffled['token_ranges']!=gcg['token_ranges']:
-            raise ValueError('paired suffix ranges differ')
-        g,s=gcg['input_ids'],shuffled['input_ids']
-        if len(g)!=len(s) or g[:u0]!=s[:u0] or g[u1:]!=s[u1:] or Counter(g[u0:u1])!=Counter(s[u0:u1]):
-            raise ValueError('paired input token multiset/flanks differ')
-    if len(primary)!=18 or sorted(set(by_index)-set(primary))!=[91,123]:
-        raise ValueError('predefined primary18/auxiliary20 membership mismatch')
-    entries=read_jsonl(SCORES/'manifest.jsonl')
-    expected={(i,c) for i in by_index for c in ('original','gcg','shuffled')}
-    if len(entries)!=60 or {(e['dataset_index'],e['condition']) for e in entries}!=expected:
-        raise ValueError('missing/duplicate input correspondence')
-    references=[]
-    for entry in entries:
-        index,condition=entry['dataset_index'],entry['condition']
-        pointer_path=SCORES/entry['completion_file'];pointer=read_json(pointer_path)
-        metadata_path=SCORES/pointer['metadata_file']
-        if sha256_file(metadata_path)!=pointer['metadata_sha256']:
-            raise ValueError('score metadata hash mismatch')
-        metadata=read_json(metadata_path);item=metadata['input'];source=by_index[index]['conditions'][condition]
-        if item['dataset_index']!=index or item['condition']!=condition or metadata['score_file']!=entry['score_file']:
-            raise ValueError('score Index/condition mismatch')
-        for field in ('input_ids','token_ranges','final_input_token_position','final_input_token_id'):
-            if item[field]!=source[field]:raise ValueError(f'input metadata mismatch: {field}')
-        length=len(source['input_ids']);cursor=0
-        for region in ('template_prefix','original','suffix','template_closing'):
-            a,b=source['token_ranges'][region]
-            if a!=cursor or not a<=b<=length:raise ValueError('invalid region partition')
-            cursor=b
-        if cursor!=length or item['sequence_length']!=length or source['final_input_token_position']!=length-1 or source['final_input_token_id']!=source['input_ids'][-1]:
-            raise ValueError('final query or sequence metadata mismatch')
-        extraction=metadata['extraction']
-        if metadata['plan_sha256']!=sha256_file(SCORES/'plan.json') or extraction['causal_mask_applied_to_saved_scores'] or extraction['softmax_applied'] or not extraction['future_direction_entries_preserved']:
-            raise ValueError('source scores not verified raw pre-mask/pre-softmax')
-        path=SCORES/entry['score_file']
-        if sha256_file(path)!=metadata['score_sha256']:raise ValueError('score file hash mismatch')
-        values=np.load(path,mmap_mode='r',allow_pickle=False)
-        if values.shape!=(32,32,length,length) or values.dtype!=np.float32:
-            raise ValueError('source score shape/dtype mismatch')
-        references.append(dict(dataset_index=index,condition=condition,path=str(path),sha256=metadata['score_sha256'],
-            metadata_path=str(metadata_path),metadata_sha256=pointer['metadata_sha256'],input=item))
-    return dataset,primary,references
+from utils.gcg_shuffled_common import SCORES,DATASET,write_json,write_csv,inspect_inputs
 
 
 def frames_from_inputs(primary,references):
@@ -272,7 +195,7 @@ def main():
     dataset,primary,references=inspect_inputs()
     directory.mkdir(parents=True,exist_ok=False)
     initial_hashes={str(p):sha256_file(p) for p in [DATASET,DATASET.parent/'plan.json',SCORES/'manifest.jsonl',SCORES/'plan.json',
-        Path(__file__),ROOT/'utils/gcg_shuffled_metrics.py',ROOT/'tests/test_gcg_shuffled_four_metrics.py',
+        Path(__file__),ROOT/'utils/gcg_shuffled_common.py',ROOT/'utils/gcg_shuffled_metrics.py',ROOT/'tests/test_gcg_shuffled_four_metrics.py',
         ROOT/'utils/artifact_io.py',ROOT/'scripts/analyze_attention_head_metric_relationships.py']}
     write_json(directory/'manifest.json',dict(created_at=utc_now(),role='exploratory_outcome_conditioned_selection20',
         dataset=str(DATASET),score_root=str(SCORES),primary_indices=primary,auxiliary_indices=[r['dataset_index'] for r in dataset],

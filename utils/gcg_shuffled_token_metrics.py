@@ -33,9 +33,7 @@ def select_heads(summary):
     return selected,views
 
 
-def reduce_views(values,views):
-    """Features are computed per head before equal-weight aggregation."""
-    return np.stack([values[v['members']].mean(axis=0) for v in views])
+from utils.gcg_shuffled_common import reduce_views
 
 
 def closing_queries(scores,item):

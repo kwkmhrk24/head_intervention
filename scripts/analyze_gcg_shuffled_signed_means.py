@@ -35,7 +35,7 @@ def run(out):
     with np.load(OLD/'per_sample_values.npz', allow_pickle=False) as z:
         rms = z['region_metrics']
     if rms.shape != (20, 2, 1024, len(old['metrics'])): raise ValueError('RMS correspondence shape')
-    sources = [Path(__file__), ROOT/'utils/gcg_shuffled_signed_means.py', ROOT/'tests/test_gcg_shuffled_signed_means.py',
+    sources = [Path(__file__), ROOT/'utils/gcg_shuffled_common.py', ROOT/'utils/gcg_shuffled_plot_common.py', ROOT/'utils/gcg_shuffled_signed_means.py', ROOT/'tests/test_gcg_shuffled_signed_means.py',
                ROOT/'docs/gcg_shuffled_signed_mean_analysis.md', ROOT/'scripts/analyze_gcg_shuffled_regions.py',
                ROOT/'utils/gcg_shuffled_region_metrics.py', ROOT/'utils/gcg_shuffled_token_metrics.py',
                ROOT/'scripts/analyze_gcg_shuffled_four_metrics.py'] + [OLD/n for n in used]

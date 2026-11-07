@@ -114,7 +114,7 @@ def run(directory):
         memberships.append(dict(view_id=view['view_id'],layer=member//32,head=member%32,
                                 selection_count=len(part),groups=';'.join(part.group_id)))
     write_csv(directory/'head_memberships.csv',pd.DataFrame(memberships))
-    source_files=[Path(__file__),ROOT/'utils/gcg_shuffled_token_metrics.py',ROOT/'utils/gcg_shuffled_token_plots.py',
+    source_files=[Path(__file__),ROOT/'utils/gcg_shuffled_common.py',ROOT/'utils/gcg_shuffled_token_metrics.py',ROOT/'utils/gcg_shuffled_token_plots.py',
         ROOT/'tests/test_gcg_shuffled_tokens.py',ROOT/'utils/gcg_shuffled_metrics.py',ROOT/'scripts/analyze_gcg_shuffled_four_metrics.py',
         PREVIOUS/'manifest.json',PREVIOUS/'summary_18.csv',PREVIOUS/'metrics.csv',PREVIOUS/'paired_differences.csv']
     source_hashes={str(path):sha256_file(path) for path in source_files}

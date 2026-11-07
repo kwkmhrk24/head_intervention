@@ -27,11 +27,7 @@ OO_RTOL=1e-5
 OO_ATOL=1e-5
 
 
-def summary_frame(values,indices,names,entities):
-    stats=paired_stats(values,indices);count=len(names)
-    rows=pd.DataFrame([dict(**entity,metric=name,sample_count=len(indices)) for entity in entities for name in names])
-    for name,array in stats.items():rows[name]=array.reshape(-1)
-    return rows
+from utils.gcg_shuffled_common import summary_frame
 
 
 def check_original(gcg,shuffled,reference):
@@ -112,7 +108,7 @@ def run(directory):
         norm_reference=archive['norm_metrics'][:,:,:,0]
         existing_view_queries=archive['view_queries']
     if attention.shape!=(20,2,1024,3) or norm_reference.shape!=(20,2,1024):raise ValueError('existing scalar shape mismatch')
-    sources=[Path(__file__),ROOT/'utils/gcg_shuffled_region_metrics.py',ROOT/'utils/gcg_shuffled_region_plots.py',
+    sources=[Path(__file__),ROOT/'utils/gcg_shuffled_common.py',ROOT/'utils/gcg_shuffled_plot_common.py',ROOT/'utils/gcg_shuffled_region_metrics.py',ROOT/'utils/gcg_shuffled_region_plots.py',
         ROOT/'tests/test_gcg_shuffled_regions.py',ROOT/'scripts/analyze_gcg_shuffled_four_metrics.py',
         ROOT/'utils/gcg_shuffled_token_metrics.py',ROOT/'utils/gcg_shuffled_metrics.py',
         DATASET,DATASET.parent/'plan.json',SCORES/'plan.json',SCORES/'manifest.jsonl',SCORES/'validation_final.json',

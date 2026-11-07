@@ -27,19 +27,9 @@ def block_norm(block,visible):
 
 
 def region_metrics(scores,ranges):
-    if scores.ndim<2 or scores.shape[-1]!=scores.shape[-2]:raise ValueError('square scores required')
-    a,b=ranges['original'];c,d=ranges['suffix'];length=scores.shape[-1]
-    if not 0<=a<b<=c<d<=length:raise ValueError('invalid ordered Original/Suffix ranges')
-    if d-c!=20:raise ValueError('suffix length must be twenty')
-    op=np.arange(a,b);up=np.arange(c,d)
-    blocks=dict(OO=np.asarray(scores[...,a:b,a:b],dtype=np.float64),
-                UU=np.asarray(scores[...,c:d,c:d],dtype=np.float64),
-                UO=np.asarray(scores[...,c:d,a:b],dtype=np.float64))
-    masks=dict(OO=op[None,:]<=op[:,None],UU=up[None,:]<=up[:,None],UO=op[None,:]<=up[:,None])
-    if not masks['UO'].all():raise ValueError('Suffix-to-Original contains future elements')
-    m,n=b-a,d-c
-    if masks['OO'].sum()!=m*(m+1)//2 or masks['UU'].sum()!=n*(n+1)//2 or masks['UO'].sum()!=m*n:
-        raise ValueError('causal visible element count mismatch')
+    from utils.gcg_shuffled_common import region_layout
+    blocks,masks,lengths=region_layout(scores,ranges)
+    m,n=lengths['original_length'],lengths['suffix_length']
     values={};counts={}
     for policy in ('full','causal'):
         for region,block in blocks.items():
@@ -58,30 +48,4 @@ def region_metrics(scores,ranges):
     return values,dict(original_length=m,suffix_length=n,**counts)
 
 
-def paired_stats(values,indices):
-    """values[sample, condition G/S, head-or-view, metric]."""
-    if values.ndim!=4 or values.shape[1]!=2:raise ValueError('paired sample/condition tensor required')
-    x=values[indices,0];y=values[indices,1];d=x-y
-    if np.isinf(values).any():raise ValueError('infinite input metric')
-    valid=np.isfinite(x)&np.isfinite(y);count=valid.sum(axis=0)
-
-    def mean(z):
-        n=np.isfinite(z).sum(axis=0);result=np.full(z.shape[1:],np.nan)
-        np.divide(np.nansum(z,axis=0),n,out=result,where=n>0)
-        return result
-
-    def median(z):
-        with warnings.catch_warnings():
-            # An entirely undefined ratio stays undefined, with explicit count.
-            warnings.simplefilter('ignore',RuntimeWarning)
-            return np.nanmedian(z,axis=0)
-
-    d=np.where(valid,d,np.nan);dm=mean(d);variance=np.full(dm.shape,np.nan)
-    np.divide(np.nansum((d-dm)**2,axis=0),count-1,out=variance,where=count>1)
-    tolerance=TIE_ATOL+TIE_RTOL*np.maximum(np.abs(x),np.abs(y))
-    return dict(gcg_mean=mean(x),shuffled_mean=mean(y),gcg_median=median(x),shuffled_median=median(y),
-        delta_mean=dm,delta_median=median(d),delta_std=np.sqrt(variance),delta_mean_absolute=mean(np.abs(d)),
-        gcg_valid_count=np.isfinite(x).sum(axis=0),shuffled_valid_count=np.isfinite(y).sum(axis=0),
-        pair_valid_count=count,gcg_larger_count=((d>tolerance)&valid).sum(axis=0),
-        shuffled_larger_count=((d < -tolerance)&valid).sum(axis=0),
-        equal_count=((np.abs(d)<=tolerance)&valid).sum(axis=0))
+from utils.gcg_shuffled_common import paired_stats
