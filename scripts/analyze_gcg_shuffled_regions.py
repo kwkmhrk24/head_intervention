@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 from scripts.analyze_gcg_shuffled_four_metrics import DATASET,SCORES,inspect_inputs,write_csv,write_json
-from scripts.analyze_attention_head_metric_relationships import pearson_correlation,spearman_correlation
+from utils.gcg_shuffled_statistics import pearson_correlation,spearman_correlation
 from utils.artifact_io import read_json,sha256_file,utc_now
 from utils.gcg_shuffled_region_metrics import METRICS,region_metrics,paired_stats
 from utils.gcg_shuffled_token_metrics import reduce_views
@@ -108,7 +108,7 @@ def run(directory):
         norm_reference=archive['norm_metrics'][:,:,:,0]
         existing_view_queries=archive['view_queries']
     if attention.shape!=(20,2,1024,3) or norm_reference.shape!=(20,2,1024):raise ValueError('existing scalar shape mismatch')
-    sources=[Path(__file__),ROOT/'utils/gcg_shuffled_common.py',ROOT/'utils/gcg_shuffled_plot_common.py',ROOT/'utils/gcg_shuffled_region_metrics.py',ROOT/'utils/gcg_shuffled_region_plots.py',
+    sources=[Path(__file__),ROOT/'utils/gcg_shuffled_statistics.py',ROOT/'utils/gcg_shuffled_common.py',ROOT/'utils/gcg_shuffled_plot_common.py',ROOT/'utils/gcg_shuffled_region_metrics.py',ROOT/'utils/gcg_shuffled_region_plots.py',
         ROOT/'tests/test_gcg_shuffled_regions.py',ROOT/'scripts/analyze_gcg_shuffled_four_metrics.py',
         ROOT/'utils/gcg_shuffled_token_metrics.py',ROOT/'utils/gcg_shuffled_metrics.py',
         DATASET,DATASET.parent/'plan.json',SCORES/'plan.json',SCORES/'manifest.jsonl',SCORES/'validation_final.json',

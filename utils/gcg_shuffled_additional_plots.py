@@ -1,7 +1,7 @@
 """Compact publication-style panels; plotted values are saved stage tables."""
 import numpy as np
 import pandas as pd
-from utils.gcg_shuffled_region_plots import plt,finish
+from utils.gcg_shuffled_plot_common import plt,finish
 
 
 def make_figures(paths,m):
@@ -115,9 +115,19 @@ def distributions(paths,m):
         fig,axes=plt.subplots(2,4,figsize=(19,8))
         for col,h in enumerate(chosen):
             vi=next(i for i,v in enumerate(m['views']) if v['members']==[h]);qslot=19
+            keys=visible_query_keys(z,qslot,ranges['suffix'][0]+qslot)
             for row,name in enumerate(('raw','weight')):
                 ax=axes[row,col]
-                for cond,color in [('gcg','tab:red'),('shuffled','tab:blue')]:ax.plot(z[cond+'_'+name][vi,qslot],color=color,label=cond)
-                for region in ('original','suffix','template_closing'):ax.axvline(ranges[region][0]-.5,color='grey',lw=.5)
-                ax.legend(fontsize=7);ax.set(title=f'L{h//32} H{h%32} suffix Query19',xlabel='Absolute Key position; O/U/template boundaries',ylabel='raw score' if name=='raw' else 'causal Attention fraction')
-        finish(fig,paths['query']/'figures/fixed_head_distributions.png',f'Index {index}, n=1 diagnostic | first members of old groups, no new selection; suffix positions compare content permutations')
+                for cond,color in [('gcg','tab:red'),('shuffled','tab:blue')]:ax.plot(keys,z[cond+'_'+name][vi,qslot,keys],color=color,label=cond)
+                for region in ('original','suffix'):ax.axvline(ranges[region][0]-.5,color='grey',lw=.5)
+                ax.legend(fontsize=7);ax.set(title=f'L{h//32} H{h%32} suffix Query19',xlabel='Visible Key position (Key <= Query); O/U boundaries',ylabel='Raw score (pre-softmax)' if name=='raw' else 'Softmax Attention fraction (causal)')
+        finish(fig,paths['query']/'figures/fixed_head_distributions.png',f'Index {index}, n=1 diagnostic | first members of old groups, no new selection; VISIBLE Keys only; raw pre-softmax vs causal Attention')
+
+
+def visible_query_keys(profile,slot,expected_position):
+    """Plot raw/weight data at the same verified causal Key positions."""
+    q=int(profile['query_positions'][slot])
+    keys=np.flatnonzero(profile['visible'][slot])
+    if q!=expected_position or not np.array_equal(keys,np.arange(q+1)):
+        raise ValueError('saved query position/visibility mismatch')
+    return keys

@@ -9,7 +9,7 @@ import sys
 ROOT=Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:sys.path.insert(0,str(ROOT))
 from utils.artifact_io import read_json,sha256_file,utc_now
-from scripts.analyze_gcg_shuffled_four_metrics import write_json,write_csv
+from utils.gcg_shuffled_common import write_json,write_csv
 import pandas as pd
 
 LEGACY=[

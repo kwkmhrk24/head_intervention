@@ -107,7 +107,13 @@ class SourceAndFigureTests(unittest.TestCase):
     def test_existing_input_correspondence_and_no_model_load(self):
         from scripts.analyze_gcg_shuffled_four_metrics import DATASET,inspect_inputs
         if not DATASET.exists():self.skipTest('research artifacts unavailable')
-        with patch('transformers.AutoModelForCausalLM.from_pretrained',side_effect=AssertionError('no model')):
+        import builtins
+        original_import=builtins.__import__
+        def cpu_only_import(name,*args,**kwargs):
+            if name.split('.')[0] in ('torch','transformers'):
+                raise AssertionError('CPU inspection must not import model libraries')
+            return original_import(name,*args,**kwargs)
+        with patch('builtins.__import__',side_effect=cpu_only_import):
             dataset,primary,references=inspect_inputs()
         self.assertEqual(len(dataset),20);self.assertEqual(len(primary),18);self.assertEqual(len(references),60)
         self.assertNotIn(91,primary);self.assertNotIn(123,primary)

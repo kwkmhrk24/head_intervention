@@ -9,7 +9,7 @@ if str(ROOT) not in sys.path:sys.path.insert(0,str(ROOT))
 import numpy as np
 import pandas as pd
 from utils.artifact_io import sha256_file
-from scripts.analyze_gcg_shuffled_four_metrics import write_json
+from utils.gcg_shuffled_common import write_json
 
 RTOL=1e-12
 ATOL=1e-12
@@ -56,7 +56,8 @@ def compare_trees(before,after):
 
 def main():
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--before',type=Path,required=True);p.add_argument('--after',type=Path,required=True);p.add_argument('--output',type=Path,required=True)
-    a=p.parse_args();r=compare_trees(a.before,a.after);write_json(a.output,r);print(f"Passed {r['scientific_files']} files, maximum error {r['max_absolute_error']}")
+    a=p.parse_args();r=compare_trees(a.before,a.after);r['source_hashes']={str(path):sha256_file(path) for path in [Path(__file__),ROOT/'utils/gcg_shuffled_common.py',ROOT/'utils/gcg_shuffled_metrics.py',ROOT/'utils/artifact_io.py']}
+    write_json(a.output,r);print(f"Passed {r['scientific_files']} files, maximum error {r['max_absolute_error']}")
 
 
 if __name__=='__main__':main()

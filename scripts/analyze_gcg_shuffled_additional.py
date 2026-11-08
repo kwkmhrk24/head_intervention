@@ -9,12 +9,11 @@ ROOT=Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:sys.path.insert(0,str(ROOT))
 import numpy as np
 import pandas as pd
-from scripts.analyze_gcg_shuffled_four_metrics import inspect_inputs,write_json,write_csv
-from scripts.analyze_gcg_shuffled_regions import summary_frame
+from utils.gcg_shuffled_common import inspect_inputs,write_json,write_csv,summary_frame
 from utils.artifact_io import read_json,sha256_file,utc_now
 from utils.gcg_shuffled_token_metrics import reduce_views
 from utils.gcg_shuffled_additional_metrics import SIGN_METRICS,QUERY_FIELDS,QUERY_LABELS,sign_metrics,query_diagnostics
-from scripts.analyze_attention_head_metric_relationships import pearson_correlation,spearman_correlation
+from utils.gcg_shuffled_statistics import pearson_correlation,spearman_correlation
 REGION=ROOT/'data/outputs/gcg_shuffled_region_analysis/legacy_selection20_20261107T094154Z'
 SIGNED=ROOT/'data/outputs/gcg_shuffled_signed_means/legacy_selection20_20261108T_signed_mean_v1'
 TOKEN=ROOT/'data/outputs/gcg_shuffled_token_analysis/legacy_selection20_20261107T075659Z'
@@ -75,7 +74,7 @@ def run(root,run_id):
         hashes=read_json(source/'output_hashes.json')
         for p in old_files:
             if p.parent==source and sha256_file(p)!=hashes[p.name]:raise ValueError('old artifact hash mismatch')
-    code=[Path(__file__),ROOT/'utils/gcg_shuffled_additional_metrics.py',ROOT/'utils/gcg_shuffled_additional_plots.py',ROOT/'tests/test_gcg_shuffled_additional.py']
+    code=[Path(__file__),ROOT/'utils/gcg_shuffled_statistics.py',ROOT/'utils/artifact_io.py',ROOT/'utils/gcg_shuffled_additional_metrics.py',ROOT/'utils/gcg_shuffled_additional_plots.py',ROOT/'tests/test_gcg_shuffled_additional.py']
     code += [ROOT/p for p in ['scripts/analyze_gcg_shuffled_four_metrics.py','scripts/analyze_gcg_shuffled_regions.py','utils/gcg_shuffled_region_metrics.py','utils/gcg_shuffled_token_metrics.py','utils/gcg_shuffled_metrics.py']]
     # Include shared implementation once it is extracted in the compatibility phase.
     shared=ROOT/'utils/gcg_shuffled_common.py'

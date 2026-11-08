@@ -24,7 +24,7 @@ import pandas as pd
 
 from utils.artifact_io import read_json,read_jsonl,sha256_file,utc_now
 from utils.gcg_shuffled_metrics import METRICS,TIE_ATOL,TIE_RTOL,calculate_metrics,paired_differences,summarize
-from scripts.analyze_attention_head_metric_relationships import pearson_correlation,spearman_correlation
+from utils.gcg_shuffled_statistics import pearson_correlation,spearman_correlation
 
 from utils.gcg_shuffled_common import SCORES,DATASET,write_json,write_csv,inspect_inputs
 
@@ -196,7 +196,7 @@ def main():
     directory.mkdir(parents=True,exist_ok=False)
     initial_hashes={str(p):sha256_file(p) for p in [DATASET,DATASET.parent/'plan.json',SCORES/'manifest.jsonl',SCORES/'plan.json',
         Path(__file__),ROOT/'utils/gcg_shuffled_common.py',ROOT/'utils/gcg_shuffled_metrics.py',ROOT/'tests/test_gcg_shuffled_four_metrics.py',
-        ROOT/'utils/artifact_io.py',ROOT/'scripts/analyze_attention_head_metric_relationships.py']}
+        ROOT/'utils/artifact_io.py',ROOT/'utils/gcg_shuffled_statistics.py']}
     write_json(directory/'manifest.json',dict(created_at=utc_now(),role='exploratory_outcome_conditioned_selection20',
         dataset=str(DATASET),score_root=str(SCORES),primary_indices=primary,auxiliary_indices=[r['dataset_index'] for r in dataset],
         primary_rule='historical automatic Original=false, GCG=true, Shuffled=false',
