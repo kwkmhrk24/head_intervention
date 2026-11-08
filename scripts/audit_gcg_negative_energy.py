@@ -14,6 +14,38 @@ from utils.gcg_negative_energy import CONDITION_FIELDS,PAIR_FIELDS,REGIONS
 from scripts.analyze_gcg_negative_energy import blocks_for_pair,selected_elements
 
 
+def verify_hashed_files(root, expected, names=None):
+    """Verify an explicit, nonempty set before consuming audited artifacts."""
+    root=Path(root)
+    names=list(expected if names is None else names)
+    if not names:raise ValueError('empty hash inventory')
+    result={}
+    for name in names:
+        if name not in expected:raise ValueError('missing audited hash: '+name)
+        path=root/name
+        if not path.is_file():raise ValueError('missing hashed file: '+str(path))
+        actual=sha256_file(path)
+        if actual!=expected[name]:raise ValueError('hash mismatch: '+str(path))
+        result[name]=actual
+    return result
+
+
+def verify_report_bundle(directory):
+    """Detached checksums cover reports AND manifests; the ledger excludes itself."""
+    directory=Path(directory)
+    hashes=read_json(directory/'report_hashes.json')
+    required={'findings.md','MTG_findings.md','README.md','report_manifest.json','manifest.json'}
+    if set(hashes)!=required:raise ValueError('report hash inventory mismatch')
+    verify_hashed_files(directory,hashes)
+    manifest=read_json(directory/'report_manifest.json')
+    verify_hashed_files(Path('/'),manifest['input_hashes'])
+    ledger=Path(manifest['audited_ledger'])
+    verify_hashed_files(Path('/'),{str(ledger):manifest['audited_ledger_sha256']})
+    verify_hashed_files(Path('/'),manifest['source_hashes'])
+    return {'status':'passed','report_files_verified':len(hashes),
+            'input_files_verified':len(manifest['input_hashes'])}
+
+
 def snapshot(out):
     """Read-only baseline capture before a fresh run; no original file writes."""
     if (out/'baseline_hashes.json').exists():raise FileExistsError('baseline already exists')
@@ -113,7 +145,8 @@ def audit(out,name='validation.json'):
 
 
 if __name__=='__main__':
-    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--output-dir',type=Path,required=True);p.add_argument('--audit-name',default='validation.json');p.add_argument('--snapshot',action='store_true',help='Capture immutable inputs before starting a fresh run')
+    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--output-dir',type=Path,required=True);p.add_argument('--audit-name',default='validation.json');p.add_argument('--verify-report',type=Path,help='Verify a detached report bundle without recomputation');p.add_argument('--snapshot',action='store_true',help='Capture immutable inputs before starting a fresh run')
     a=p.parse_args()
-    if a.snapshot:snapshot(a.output_dir)
+    if a.verify_report:print(verify_report_bundle(a.verify_report))
+    elif a.snapshot:snapshot(a.output_dir)
     else:audit(a.output_dir,a.audit_name)

@@ -8,10 +8,21 @@ if str(ROOT) not in sys.path:sys.path.insert(0,str(ROOT))
 import pandas as pd
 from utils.artifact_io import read_json,sha256_file,utc_now
 from utils.gcg_shuffled_common import write_json
+from scripts.audit_gcg_negative_energy import verify_hashed_files,verify_report_bundle
 
 
-def report(out):
-    if (out/'findings.md').exists() or (out/'manifest.json').exists():raise FileExistsError('report exists')
+def report(out,report_dir=None):
+    out=Path(out).resolve()
+    target=Path(report_dir).resolve() if report_dir else out
+    if (target/'findings.md').exists() or (target/'manifest.json').exists():raise FileExistsError('report exists')
+    names=('head_distributions.csv','factor_overview.csv','tail_overview.csv','head_tail_sensitivity.csv','sample_summary.csv','leave_one_sample_out.csv','layer_summary.csv','query_overview.csv','query_weighting.csv')
+    ledger=out/('final_output_hashes.json' if (out/'final_output_hashes.json').exists() else 'output_hashes.json')
+    ledger_digest=sha256_file(ledger)
+    checked=verify_hashed_files(out,read_json(ledger),['tables/'+name for name in names]+['core_manifest.json','finish_manifest.json'])
+    products=('findings.md','MTG_findings.md','README.md','report_manifest.json','manifest.json','report_hashes.json')
+    for name in products:
+        if (target/name).exists():raise FileExistsError('report exists: '+str(target/name))
+    target.mkdir(parents=True,exist_ok=True)
     tables=out/'tables';m=read_json(out/'core_manifest.json');finish=read_json(out/'finish_manifest.json')
     validation=read_json(out/'validation.json')
     dist=pd.read_csv(tables/'head_distributions.csv');d=dist[(dist.subset==18)&(dist.view_id=='all_heads')].set_index('region')
@@ -24,8 +35,8 @@ def report(out):
     q=pd.read_csv(tables/'query_overview.csv');q=q[(q.subset==18)&(q.view_id=='all_heads')]
     w=pd.read_csv(tables/'query_weighting.csv');w=w[(w.subset==18)&(w.view_id=='all_heads')].set_index('region')
     main=['UU_full','UU_causal','UO']
-    lines=['# 結論：Headには広い増加、要素差分には相殺と集中','',
-        '主要18ペアの観測では、負側エネルギー増加は少数Headだけの現象ではない。一方、全Score要素が一様に変化したわけではなく、正負の要素差分の相殺後の純増分には上位数%の寄与が大きく効く。',
+    lines=['# 結論：Headには広い増加、純増分には正負相殺と上位正寄与への感度','',
+        '主要18ペアの観測では、負側エネルギー増加は少数Headだけの現象ではない。一方、全Score要素が一様に変化したわけではなく、正負の要素差分が相殺されており、純増分は上位の正寄与を除く操作に敏感である。これは要素自体の集中度とは区別する。',
         '以下は保存済みCSVから取得した記述統計で、Headは独立標本ではない。人手確認済み成功やAttention増加の因果は主張しない。','',
         '## Q1：多数のHeadに共通するか','', '| 領域 | 平均ΔE_neg | 中央値 | 増加Head | 増加率 |','|---|---:|---:|---:|---:|']
     for r in main:
@@ -50,11 +61,11 @@ def report(out):
         for kind in ('energy_gcg','energy_shuffled'):
             x=tail[(tail.region==r)&(tail.kind==kind)].set_index('fraction')
             lines.append(f'| {r} | {kind} | {100*x.loc[.01,"energy_weighted_share"]:.2f}% | {100*x.loc[.1,"energy_weighted_share"]:.2f}% |')
-    lines+=['','これはmean(top/N)/mean(total/N)の割合で、定義される各Headの割合平均とは別。最も極端な1%だけがエネルギーの大半を占める状態ではない。Causalの名目1%は切り上げにより3/210要素である。','',
+    lines+=['','上位1/5/10%は、各サンプル・各Head・各領域内で個別に選択し、その後集計する。全サンプル・全Headをプールして選ぶものではない。条件別エネルギーはall（全有効要素数）基準。正のΔeはallとactive（正寄与要素数）を区別する。k=ceil(率×基準数)であり、activeの5%は全要素の5%ではない。','これはmean(top/N)/mean(total/N)の割合で、定義される各Headの割合平均とは別。最も極端な1%だけがエネルギーの大半を占める状態ではない。Causalの名目1%は切り上げにより3/210要素である。','',
         '| 領域 | 上位数の基準 | 率 | 正寄与中の割合 | 元の純増分から差し引いた残差 |','|---|---|---:|---:|---:|']
     for x in tail[(tail.region.isin(main))&(tail.kind=='positive_delta')].itertuples():
         lines.append(f'| {x.region} | {x.basis} | {100*x.fraction:.0f}% | {100*x.energy_weighted_share:.2f}% | {x.net_delta_after_top_positive_removed:+.6f} |')
-    lines+=['','純増分は正負相殺後の量なので、正寄与の一部を差し引くだけで符号が変わり得る。Full UU/UOは全要素上位5%で純増分が消える一方、Causal UUは同5%では正を保ち10%で負になる。したがって「ごく少数の異常値だけ」とは言えないが、「広く一様で極端要素の影響はない」とも言えない。これは差分の記述的感度で、モデルやScoreへの介入結果ではない。tables/tail_overview.csv、figures/element_concentration.png、tail_sensitivity.png参照。','',
+    lines+=['','純増分は正負相殺後の量なので、正寄与の一部を差し引くだけで符号が変わり得る。Full UU/UOは全要素上位5%で純増分が消える一方、Causal UUは同5%では正を保ち10%で負になる。この符号反転だけから「極端な要素に集中している」とは断定できない。要素自体の集中度は上の集中度表で評価し、相殺後の純増分の感度とは明確に区別する。これは差分の記述的感度で、モデルやScoreへの介入結果ではない。tables/tail_overview.csv、figures/element_concentration.png、tail_sensitivity.png参照。','',
         '## Q5：サンプル・Layer・Queryの一貫性','', '| 領域 | 平均増加サンプル | 1サンプル除外平均の範囲 | 増加Layer数 |','|---|---|---|---:|']
     for r in main:
         x=sample[sample.region==r];l=loo[loo.region==r];z=layers[layers.region==r]
@@ -71,29 +82,39 @@ def report(out):
         '位置を揃えた比較は同じToken内容の比較ではない。Score規模からAttention配分・実際の有害応諾・成功因果は説明しない。少数成功例を選んだ同一18件と既存固定群の探索であり、Headを独立標本とした有意性も主張しない。',
         '今後の候補は、固定した分布・集中度の定義を独立な開発データで再現する確認と、位置とToken内容を区別する確認。今回の範囲を超える解析や独立100件は実施していない。','',
         '## 監査',f'従来E_negとの最大差={validation["old_E_neg_max_error"]:.3g}、要因分解誤差={validation["midpoint_decomposition_max_error"]:.3g}。詳細はvalidation.json、interpretation.md、docs/gcg_negative_energy_attribution.md。']
-    with (out/'findings.md').open('x') as h:h.write('\n'.join(lines)+'\n')
+    with (target/'findings.md').open('x') as h:h.write('\n'.join(lines)+'\n')
     summary=['# MTG向け：最重要の発見','',
         '1. **Headには広範な増加。少数の極端Headだけではない。**',
         '2. **負Score数の増加より、負Scoreの二乗平均増加が主因。**',
-        '3. **要素差分は正負に分かれ、相殺後の純増分には上位数%が大きく効く。**',
+        '3. **正負の要素差分が相殺され、純増分は上位の正寄与を除く操作に敏感。集中度とは別の性質。**',
         '4. **Causalでも成立するが、Query後半・Layer・固定群で強弱がある。**','',
         '| 領域 | 平均ΔE_neg | 中央値 | 増加Head | 上位10% Head除外後平均 |','|---|---:|---:|---:|---:|']
     for r in main:
         z=d.loc[r];x=trim[(trim.region==r)&(trim.removed_fraction==.1)].iloc[0]
         summary.append(f'| {r} | {z["mean"]:+.4f} | {z["median"]:+.4f} | {int(z.positive_count)}/1024 | {x.remaining_mean:+.4f} |')
-    summary+=['','条件別エネルギーの上位1%は約3〜5%のエネルギー。一方、正の差分寄与の全要素上位5%を引くとFull UU/UOの純増分は消え、Causal UUでは正を保つ。平均だけでは、広がりと集中の両面を区別できない。',
+    summary+=['','条件別エネルギーの上位1%は約3〜5%のエネルギー。一方、正の差分寄与の全要素上位5%を引くとFull UU/UOの純増分は消え、Causal UUでは正を保つ。この符号反転は、極端要素への集中の証明ではなく、正負相殺後の純増分の感度である。上位選択は各サンプル・Head・領域内で行い、プール選択しない。allは全有効要素数、activeは正寄与要素数を基準として切り上げる。',
               '詳細値・Q1〜Q6の回答・制約はfindings.md、元数値はtables/。図はhead_distributions → factor_decomposition → element_concentration → tail_sensitivity → query_profilesの順を推奨。',
               '自動拒否判定の選択済み少数例の探索。因果・有意性・人手確認済み成功一般への結論ではない。']
-    with (out/'MTG_findings.md').open('x') as h:h.write('\n'.join(summary)+'\n')
-    with (out/'README.md').open('x') as h:h.write('# 負側エネルギー増加の要因\n\nまず[結論とQ1〜Q6](findings.md)、[MTG要約](MTG_findings.md)を参照。\n\n定義と全数表は[詳細レポート](interpretation.md)、[tables](tables/)、[図](figures/)、[検証](validation.json)。\n再現手順はdocs/gcg_negative_energy_attribution.md。core/tail/query_values.npzは配列順を各manifestで管理。\n')
-    source_files=[Path(__file__),ROOT/'utils/artifact_io.py',ROOT/'utils/gcg_shuffled_common.py']
-    inputs=[out/'tables'/name for name in ('head_distributions.csv','factor_overview.csv','tail_overview.csv','head_tail_sensitivity.csv','sample_summary.csv','leave_one_sample_out.csv','layer_summary.csv','query_overview.csv','query_weighting.csv')]
-    write_json(out/'report_manifest.json',dict(created_at=utc_now(),input_hashes={str(x):sha256_file(x) for x in inputs},source_hashes={str(x):sha256_file(x) for x in source_files},role='saved-table synthesis, no new metrics'))
-    write_json(out/'manifest.json',dict(**m,finish=finish,validation=validation,core_manifest_sha256=sha256_file(out/'core_manifest.json'),finish_manifest_sha256=sha256_file(out/'finish_manifest.json'),
-        reporting_manifest_sha256=sha256_file(out/'report_manifest.json'),source_audit={str(ROOT/'scripts/audit_gcg_negative_energy.py'):sha256_file(ROOT/'scripts/audit_gcg_negative_energy.py')}))
-    print(out/'findings.md')
+    with (target/'MTG_findings.md').open('x') as h:h.write('\n'.join(summary)+'\n')
+    with (target/'README.md').open('x') as h:h.write('# 負側エネルギー増加の要因\n\nまず[結論とQ1〜Q6](findings.md)、[MTG要約](MTG_findings.md)を参照。\n\n定義と全数表は[詳細レポート](interpretation.md)、[tables](tables/)、[図](figures/)、[検証](validation.json)。\n再現手順はdocs/gcg_negative_energy_attribution.md。core/tail/query_values.npzは配列順を各manifestで管理。\n')
+    if target!=out:
+        text=(target/'README.md').read_text()
+        for name in ('interpretation.md','tables/','figures/','validation.json'):
+            text=text.replace(']('+name+')',']('+str(out/name)+')')
+        (target/'README.md').write_text(text+f'\n修正版：元レポート・表・図は変更していません。元run: {out}\n\n[元レポート]({out}/README.md)\n')
+    source_files=[Path(__file__),ROOT/'utils/artifact_io.py',ROOT/'utils/gcg_shuffled_common.py',ROOT/'scripts/audit_gcg_negative_energy.py']
+    inputs=[out/'tables'/name for name in names]+[out/'core_manifest.json',out/'finish_manifest.json',out/'validation.json']
+    # Recheck immediately before publishing provenance, as well as before reading CSVs.
+    verify_hashed_files(out,checked)
+    verify_hashed_files(Path('/'),{str(ledger):ledger_digest})
+    write_json(target/'report_manifest.json',dict(created_at=utc_now(),input_hashes={str(x):sha256_file(x) for x in inputs},source_hashes={str(x):sha256_file(x) for x in source_files},audited_ledger=str(ledger),audited_ledger_sha256=ledger_digest,original_reports={name:str(out/name) for name in ('findings.md','MTG_findings.md','README.md','manifest.json')},role='saved-table synthesis, no new metrics'))
+    write_json(target/'manifest.json',dict(**m,finish=finish,validation=validation,core_manifest_sha256=sha256_file(out/'core_manifest.json'),finish_manifest_sha256=sha256_file(out/'finish_manifest.json'),
+        reporting_manifest_sha256=sha256_file(target/'report_manifest.json'),source_audit={str(ROOT/'scripts/audit_gcg_negative_energy.py'):sha256_file(ROOT/'scripts/audit_gcg_negative_energy.py')}))
+    write_json(target/'report_hashes.json',{name:sha256_file(target/name) for name in products if name!='report_hashes.json'})
+    verify_report_bundle(target)
+    print(target/'findings.md')
 
 
 if __name__=='__main__':
-    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--output-dir',type=Path,required=True)
-    report(p.parse_args().output_dir)
+    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--output-dir',type=Path,required=True);p.add_argument('--report-dir',type=Path,help='New directory for a non-overwriting report revision')
+    a=p.parse_args();report(a.output_dir,a.report_dir)

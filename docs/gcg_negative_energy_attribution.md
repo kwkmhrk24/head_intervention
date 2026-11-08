@@ -59,3 +59,30 @@ Head方向のSDは1024 Headの記述であり、1024独立標本の推論では�
 
 旧READMEは元内容を保存したうえで末尾に新runへの案内だけを追記する。
 数値・画像・旧runのmanifestは変更しない。README追記のハッシュ差だけを明示的に監査する。
+
+## 解釈の修正版とレポート監査
+
+上位1/5/10%は**各サンプル・各Head・各領域内**で選び、その後に集計する。
+全サンプル・全Headをプールした上位要素ではない。条件別エネルギーはall、
+正の差分寄与はall（全有効要素数）とactive（正寄与要素数）の両方を保持する。
+正負の要素差分が相殺されるため、上位正寄与を除くと純増分の符号が変わり得る。
+これは純増分の感度であり、その事実だけで要素自体の集中を断定しない。
+集中度は既存tables/tail_overview.csvの割合と別に評価する。
+
+既存runを上書きせず、レポートのみ別ディレクトリへ生成する：
+
+```bash
+python -B scripts/report_gcg_negative_energy.py --output-dir EXISTING_RUN --report-dir NEW_REPORT_DIR
+python -B scripts/audit_gcg_negative_energy.py --output-dir EXISTING_RUN --verify-report NEW_REPORT_DIR
+python -B -m unittest tests.test_gcg_negative_energy_reporting tests.test_gcg_negative_energy
+```
+
+生成前に全参照CSVとcore/finish manifestを、既存の監査済みoutput hashと照合する。
+final_output_hashes.jsonがあれば優先し、なければoutput_hashes.jsonを使う。
+元runのハッシュ台帳・参照入力・実行ソースのハッシュと元レポートの対応先は
+新しいreport_manifest.jsonに保存する。新ディレクトリのREADMEから元の表・図へ参照する。
+生成後はreport_hashes.jsonが最終Markdown3件とmanifest2件を検証する。
+台帳自身は含めず、manifestから台帳への逆参照もしないため循環しない。
+検証は入力・ソース・監査元台帳も再照合し、不一致ならValueErrorとする。
+ハッシュは変更検出用であり、台帳と全ファイルの同時改ざんを防ぐ電子署名ではない。
+既存の数値・図・レポートは不変で、追加開発や新規分析は実施しない。
