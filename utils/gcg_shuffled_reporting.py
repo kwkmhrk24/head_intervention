@@ -19,6 +19,24 @@ def validate_summary(frame, label):
     require_columns(frame, SUMMARY_COLUMNS, label)
     if not np.isfinite(frame[list(SUMMARY_COLUMNS)].to_numpy(dtype=float)).all():
         raise ValueError(f'{label}: nonfinite required reporting values')
+    # CSVs use %.17g float64. mean(G-S) and mean(G)-mean(S) can differ
+    # by reduction/roundtrip error; retain the existing 1e-12 comparison precision.
+    expected=frame.gcg_mean.to_numpy(float)-frame.shuffled_mean.to_numpy(float)
+    consistent=np.isclose(frame.delta_mean.to_numpy(float),expected,rtol=1e-12,atol=1e-12)
+    def identity(position):
+        row=frame.iloc[position]
+        return {k:row[k] for k in ('subset','view_id','query','metric') if k in frame}
+    if not consistent.all():
+        i=int(np.flatnonzero(~consistent)[0]);row=frame.iloc[i]
+        raise ValueError(f'{label}: delta_mean inconsistent for {identity(i)}: '
+                         f'delta_mean={row.delta_mean!r}, gcg_mean={row.gcg_mean!r}, '
+                         f'shuffled_mean={row.shuffled_mean!r}, expected={expected[i]!r} '
+                         '(rtol=1e-12, atol=1e-12)')
+    negative_std=frame.delta_std.to_numpy(float)<0
+    if negative_std.any():
+        i=int(np.flatnonzero(negative_std)[0])
+        raise ValueError(f'{label}: delta_std must be >= 0 for {identity(i)}: '
+                         f'delta_std={frame.iloc[i].delta_std!r}')
     for c in ('sample_count','gcg_larger_count','shuffled_larger_count','equal_count'):
         x=frame[c].to_numpy(float)
         if np.any(x<0) or np.any(x!=np.floor(x)):raise ValueError(f'{label}: invalid count {c}')

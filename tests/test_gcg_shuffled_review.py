@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 import numpy as np
 import pandas as pd
-from utils.gcg_shuffled_reporting import ReportData,render_reports,TABLE_METRICS
+from utils.gcg_shuffled_reporting import ReportData,render_reports,TABLE_METRICS,validate_summary
 from utils.gcg_shuffled_additional_plots import visible_query_keys,distributions
 from utils.gcg_shuffled_plot_common import plt
 from utils.gcg_shuffled_statistics import pearson_correlation,spearman_correlation
@@ -30,6 +30,11 @@ def fixture():
     return m,pd.DataFrame(o),groups,c
 
 
+def set_delta(frame,selected,value):
+    frame.loc[selected,'delta_mean']=value
+    frame.loc[selected,'gcg_mean']=frame.loc[selected,'shuffled_mean']+value
+
+
 def render(m,o,g,c):return render_reports(ReportData(m,o,g),'test_run',c)
 
 
@@ -38,7 +43,7 @@ class ReportRegressionTests(unittest.TestCase):
         for metric in ('RMS_UU_full','mu_UO_full','E_pos_UU_full','E_neg_UO_full','mu_neg_UU_full',
                        'suffix_mean20_M_U','q4_M_O','q4_D','q4_centered_U'):
             with self.subTest(metric=metric):
-                m,o,g,c=fixture();o.loc[(o.subset==18)&(o.metric==metric),'delta_mean']=.123456
+                m,o,g,c=fixture();set_delta(o,(o.subset==18)&(o.metric==metric),.123456)
                 detail,mtg=render(m,o,g,c)
                 self.assertIn('+0.1234560',detail)
                 expected='+12.3456' if metric.endswith(('M_U','M_O')) else '+0.123456'
@@ -47,13 +52,13 @@ class ReportRegressionTests(unittest.TestCase):
     def test_counts_and_cohorts_are_not_hardcoded(self):
         m,o,g,c=fixture();sel=(o.subset==18)&(o.metric=='suffix_mean20_M_U')
         o.loc[sel,['gcg_larger_count','shuffled_larger_count']]=[3,15]
-        o.loc[(o.subset==20)&(o.metric=='suffix_mean20_M_U'),'delta_mean']=.7654321
+        set_delta(o,(o.subset==20)&(o.metric=='suffix_mean20_M_U'),.7654321)
         detail,mtg=render(m,o,g,c)
         self.assertIn('3増/15減/0同等（18件）',mtg)
         self.assertIn('+0.7654321',detail)
 
     def test_fixed_groups_update_and_validate_manifest_identity(self):
-        m,o,g,c=fixture();f=g[18];f.loc[(f.view_id=='D_increase')&(f['query']=='q4')&(f.metric=='M_U'),'delta_mean']=.123456
+        m,o,g,c=fixture();f=g[18];set_delta(f,(f.view_id=='D_increase')&(f['query']=='q4')&(f.metric=='M_U'),.123456)
         detail,mtg=render(m,o,g,c)
         self.assertIn('+12.3456',detail);self.assertIn('+12.35',mtg)
         m['views'][1]['view_id']='renamed'
@@ -76,11 +81,11 @@ class ReportRegressionTests(unittest.TestCase):
 
     def test_conclusions_follow_changed_data_not_old_story(self):
         m,o,g,c=fixture()
-        o.loc[(o.subset==18)&o.metric.str.startswith('E_neg_'),'delta_mean']=0.
+        set_delta(o,(o.subset==18)&o.metric.str.startswith('E_neg_'),0.)
         detail,mtg=render(m,o,g,c)
         self.assertIn('一括して要約できない',mtg)
         self.assertNotIn('変化は逆方向',mtg)
-        o.loc[(o.subset==18)&(o.metric=='q4_M_U'),'delta_mean']=-.5
+        set_delta(o,(o.subset==18)&(o.metric=='q4_M_U'),-.5)
         _,mtg=render(m,o,g,c);self.assertIn('変化は逆方向',mtg)
 
     def test_units_and_correlation_data_are_explicit(self):
@@ -111,7 +116,7 @@ class ReportRegressionTests(unittest.TestCase):
             np.savez(q/'row_profiles/index_000.npz',gcg_centered=x,shuffled_centered=x,gcg_weight=x,shuffled_weight=x)
             build(root,run,root/'first')
             old_hash=sha256_file(root/'first/MTG_summary.md')
-            o.loc[(o.subset==18)&(o.metric=='q4_M_U'),'delta_mean']=.234567
+            set_delta(o,(o.subset==18)&(o.metric=='q4_M_U'),.234567)
             o.to_csv(i/'overview.csv',index=False)
             build(root,run,root/'second')
             self.assertIn('+23.4567パーセントポイント',(root/'second/MTG_summary.md').read_text())
@@ -174,6 +179,73 @@ class VisibilityTests(unittest.TestCase):
                 self.assertIn('Raw score',fig.axes[0].get_ylabel())
                 self.assertIn('Softmax Attention',fig.axes[4].get_ylabel());plt.close(fig)
             with patch('utils.gcg_shuffled_additional_plots.finish',side_effect=inspect):distributions({'query':root},m)
+
+
+class SummaryConsistencyTests(unittest.TestCase):
+    def test_rounding_error_and_zero_std_are_accepted(self):
+        _,o,_,_=fixture();f=o.iloc[:1].copy();f['delta_mean']+=5e-13;f['delta_std']=0.
+        validate_summary(f,'roundtrip')
+        f['gcg_mean']=.1+.2;f['shuffled_mean']=.3;f['delta_mean']=0.
+        validate_summary(f,'cancellation')
+
+    def test_inconsistent_delta_names_metric_and_values(self):
+        _,o,_,_=fixture();f=o.iloc[:1].copy();f['delta_mean']+=1e-5
+        with self.assertRaisesRegex(ValueError,r'RMS_OO_full.*delta_mean|delta_mean.*RMS_OO_full'):
+            validate_summary(f,'overview')
+
+    def test_negative_std_names_metric_and_value(self):
+        _,o,_,_=fixture();f=o.iloc[:1].copy();f['delta_std']=-1e-16
+        with self.assertRaisesRegex(ValueError,r'RMS_OO_full.*delta_std|delta_std.*RMS_OO_full'):
+            validate_summary(f,'overview')
+
+
+class HeadCorrespondenceTests(unittest.TestCase):
+    def build_case(self,change,expect=None):
+        import json
+        from scripts.report_gcg_shuffled_phase import build
+        m,o,g,c=fixture();first=[v['members'][0] for v in m['views']]
+        m['views']=[dict(view_id=f'h{h}',kind='individual',members=[h]) for h in first]+m['views']
+        m['score_references']=[dict(dataset_index=0,condition='gcg',input=dict(token_ranges=dict(original=[1,3],suffix=[3,23])))]
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);i=root/'60_integrated_analysis/fixture';q=root/'40_query_softmax/fixture'
+            i.mkdir(parents=True);q.mkdir(parents=True);(q/'row_profiles').mkdir()
+            (i/'manifest.json').write_text(json.dumps(m));o.to_csv(i/'overview.csv',index=False);c.to_csv(i/'correlations.csv',index=False)
+            h=pd.DataFrame([dict(layer=h//32,head=h%32,metric=f'{f}_{r}_{p}',delta_mean=.1)
+                for f in ('RMS','E_neg') for r in ('UU','UO') for p in ('full','causal') for h in range(1024)])
+            change(h).to_csv(i/'head_summary_18.csv',index=False)
+            pd.DataFrame([dict(subset=18,query='suffix_00',metric='M_U',delta_mean=.1)]).to_csv(q/'overview.csv',index=False)
+            for n in (18,20):g[n].to_csv(q/f'view_summary_{n}.csv',index=False)
+            x=np.zeros((len(m['views']),24,27))
+            np.savez(q/'row_profiles/index_000.npz',gcg_centered=x,shuffled_centered=x,gcg_weight=x,shuffled_weight=x)
+            if expect:
+                with self.assertRaisesRegex(ValueError,expect):build(root,'fixture',root/'out')
+                self.assertFalse((root/'out/interpretation.md').exists())
+            else:
+                build(root,'fixture',root/'out')
+                result=pd.read_csv(root/'out/energy_head_correspondence.csv')
+                np.testing.assert_array_equal(result.head_count,1024)
+                np.testing.assert_array_equal(result.rms_up_negative_energy_up,1024)
+
+    @staticmethod
+    def replace_first_key(h,both=False):
+        metric=h.metric.isin(['RMS_UU_full','E_neg_UU_full']) if both else h.metric.eq('E_neg_UU_full')
+        h.loc[metric & h.layer.eq(0) & h['head'].eq(0),'layer']=32
+        return h
+
+    def test_equal_row_counts_with_different_keys_are_rejected(self):
+        self.build_case(self.replace_first_key,r'UU full.*Head key mismatch')
+
+    def test_matching_but_noncanonical_head_grid_is_rejected(self):
+        self.build_case(lambda h:self.replace_first_key(h,True),r'UU full.*invalid Head keys')
+
+    def test_missing_head_count_is_identified(self):
+        self.build_case(lambda h:h.drop(h.index[0]),r'UU full RMS.*expected 1024.*1023')
+
+    def test_duplicate_head_identifies_metric_and_key(self):
+        self.build_case(lambda h:pd.concat([h,h.iloc[:1]],ignore_index=True),r'duplicate Head metric.*RMS_UU_full')
+
+    def test_valid_permuted_head_rows_preserve_all_heads(self):
+        self.build_case(lambda h:h.sample(frac=1,random_state=42))
 
 
 if __name__=='__main__':unittest.main()

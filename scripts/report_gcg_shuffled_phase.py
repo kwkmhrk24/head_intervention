@@ -13,6 +13,31 @@ from utils.gcg_shuffled_plot_common import plt,finish
 from utils.gcg_shuffled_reporting import ReportData,render_reports,require_columns
 
 
+def join_head_metrics(x,y,label):
+    """Validate complete 32x32 correspondence before the unchanged inner join."""
+    keys=['layer','head'];sets=[]
+    for name,frame in (('RMS',x),('E_neg',y)):
+        if len(frame)!=1024:
+            raise ValueError(f'{label} {name}: expected 1024 Head rows, got {len(frame)}')
+        duplicate=frame.duplicated(keys,keep=False)
+        if duplicate.any():
+            raise ValueError(f'{label} {name}: duplicate Head keys '
+                             f'{frame.loc[duplicate,keys].head(5).to_dict("records")}')
+        sets.append(set(frame[keys].itertuples(index=False,name=None)))
+    def preview(items):return sorted(items,key=repr)[:5]
+    if sets[0]!=sets[1]:
+        raise ValueError(f'{label}: Head key mismatch: missing in E_neg={preview(sets[0]-sets[1])}; '
+                         f'extra in E_neg={preview(sets[1]-sets[0])}')
+    canonical={(layer,head) for layer in range(32) for head in range(32)}
+    if sets[0]!=canonical:
+        raise ValueError(f'{label}: invalid Head keys: missing={preview(canonical-sets[0])}; '
+                         f'extra={preview(sets[0]-canonical)}; expected Layer/Head 0-31')
+    joined=x.merge(y,on=keys,suffixes=('_rms','_neg'),validate='one_to_one')
+    if len(joined)!=1024:
+        raise ValueError(f'{label}: join lost Head rows: expected 1024, got {len(joined)}')
+    return joined
+
+
 def build(root,run_id,output_dir=None):
     p={k:root/v/run_id for k,v in [('sign','30_sign_decomposition'),('query','40_query_softmax'),('center','50_row_centered'),('integrated','60_integrated_analysis')]}
     source_integrated=p['integrated']
@@ -24,7 +49,10 @@ def build(root,run_id,output_dir=None):
     data=ReportData(m,o,groups)
     interpretation,mtg=render_reports(data,run_id,corr)
     require_columns(h,('layer','head','metric','delta_mean'),'head summary')
-    if h.duplicated(['layer','head','metric']).any():raise ValueError('duplicate Head metric')
+    duplicate=h.duplicated(['layer','head','metric'],keep=False)
+    if duplicate.any():
+        raise ValueError(f'duplicate Head metric: '
+                         f'{h.loc[duplicate,["metric","layer","head"]].head(5).to_dict("records")}')
     input_files=[source_integrated/name for name in ('manifest.json','overview.csv','head_summary_18.csv','correlations.csv')]
     input_files += [p['query']/name for name in ('overview.csv','view_summary_18.csv','view_summary_20.csv')]
     out=Path(output_dir) if output_dir is not None else source_integrated
@@ -38,8 +66,7 @@ def build(root,run_id,output_dir=None):
         for policy in ('full','causal'):
             x=h[h.metric==f'RMS_{region}_{policy}'][['layer','head','delta_mean']]
             y=h[h.metric==f'E_neg_{region}_{policy}'][['layer','head','delta_mean']]
-            if len(x)!=1024 or len(y)!=1024:raise ValueError('missing Head rows for '+region+' '+policy)
-            z=x.merge(y,on=['layer','head'],suffixes=('_rms','_neg'),validate='one_to_one')
+            z=join_head_metrics(x,y,f'{region} {policy}')
             relations.append(dict(region=region,policy=policy,rms_up_negative_energy_up=int(((z.delta_mean_rms>0)&(z.delta_mean_neg>0)).sum()),head_count=len(z)))
     write_csv(out/'energy_head_correspondence.csv',pd.DataFrame(relations))
     # Export suffix-position deltas in a compact, easy-to-cite table.
