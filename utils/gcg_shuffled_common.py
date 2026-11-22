@@ -25,7 +25,10 @@ def write_csv(path,frame):
     frame.to_csv(path,index=False,mode='x',float_format='%.17g')
 
 
-def inspect_inputs():
+def inspect_inputs(*, conditions=('original', 'gcg', 'shuffled')):
+    """Audit the legacy dataset and the requested saved Score conditions."""
+    if not conditions or set(conditions) - {'original', 'gcg', 'shuffled'}:
+        raise ValueError('unknown or empty Score conditions')
     extraction_plan=read_json(SCORES/'plan.json')
     validation=read_json(SCORES/'validation_final.json')
     if sha256_file(SCORES/'manifest.jsonl')!=validation['manifest_sha256']:
@@ -56,8 +59,10 @@ def inspect_inputs():
     if len(primary)!=18 or sorted(set(by_index)-set(primary))!=[91,123]:
         raise ValueError('predefined primary18/auxiliary20 membership mismatch')
     entries=read_jsonl(SCORES/'manifest.jsonl')
-    expected={(i,c) for i in by_index for c in ('original','gcg','shuffled')}
-    if len(entries)!=60 or {(e['dataset_index'],e['condition']) for e in entries}!=expected:
+    expected={(i,c) for i in by_index for c in conditions}
+    if conditions != ('original','gcg','shuffled'):
+        entries=[entry for entry in entries if entry['condition'] in conditions]
+    if len(entries)!=len(expected) or {(e['dataset_index'],e['condition']) for e in entries}!=expected:
         raise ValueError('missing/duplicate input correspondence')
     references=[]
     for entry in entries:
