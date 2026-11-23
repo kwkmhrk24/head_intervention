@@ -45,26 +45,32 @@ def check_model(model):
     return config.num_hidden_layers, config.num_attention_heads
 
 
-def extract_to_npy(model, input_ids, path, *, validate_native=False, forward_kwargs=None):
+def extract_to_npy(model, input_ids, path, *, validate_native=False, forward_kwargs=None, layer_consumer=None):
     """Hook actual layer arguments; write/release one layer before native attention.
 
     The optional smoke spy observes native post-RoPE tensors and returns them
     unchanged. It checks the saved score against per-head native-Q/K references.
     forward_kwargs exists for tests of nondefault actual position IDs; production
-    invokes this function without supplying or constructing position IDs.
+    invokes this function without supplying or constructing position IDs. If path
+    is None, layer_consumer receives each finite FP32 Score tensor in layer order
+    instead of storing the full NPY. The consumer must not mutate the tensor.
     """
     layers, heads = check_model(model)
     if input_ids.ndim != 2 or input_ids.shape[0] != 1 or input_ids.dtype != torch.long:
         raise ValueError('one unpadded torch.long input required')
-    path = Path(path)
-    # Exclusive creation: even a partial NPY from an interrupted attempt is immutable.
-    with path.open('xb'):
-        pass
+    if (path is None) == (layer_consumer is None):
+        raise ValueError("choose exactly one of NPY path or layer consumer")
     length = int(input_ids.shape[-1])
     if length == 0:
         raise ValueError('empty input')
     shape = (layers, heads, length, length)
-    destination = np.lib.format.open_memmap(path, mode='w+', dtype=np.float32, shape=shape)
+    destination = None
+    if path is not None:
+        path = Path(path)
+        # Exclusive creation: even a partial NPY from an interrupted attempt is immutable.
+        with path.open('xb'):
+            pass
+        destination = np.lib.format.open_memmap(path, mode='w+', dtype=np.float32, shape=shape)
     captured, handles, native_checks, pending = {}, [], [], {}
     original_rope = modeling_llama.apply_rotary_pos_emb
 
@@ -110,7 +116,10 @@ def extract_to_npy(model, input_ids, path, *, validate_native=False, forward_kwa
             scores = full_fp32_scores(query, key)
             if scores.shape != (heads, length, length):
                 raise ValueError('raw score shape mismatch')
-            destination[index] = scores.cpu().numpy()
+            if destination is not None:
+                destination[index] = scores.cpu().numpy()
+            else:
+                layer_consumer(index, scores)
             if validate_native:
                 if pending:
                     raise RuntimeError('unverified previous native attention')
@@ -135,16 +144,17 @@ def extract_to_npy(model, input_ids, path, *, validate_native=False, forward_kwa
         position_ids = captured[0]['position_ids']
         if any(value['position_ids'] != position_ids for value in captured.values()):
             raise ValueError('position_ids differ across layers')
-        destination.flush()
     finally:
         for handle in handles:
             handle.remove()
-        destination.flush()
-        del destination
-    saved = np.load(path, mmap_mode='r', allow_pickle=False)
-    if saved.shape != shape or saved.dtype != np.float32 or not np.isfinite(saved).all():
-        raise ValueError('saved NPY validation failed')
-    del saved
+        if destination is not None:
+            destination.flush()
+            del destination
+    if path is not None:
+        saved = np.load(path, mmap_mode='r', allow_pickle=False)
+        if saved.shape != shape or saved.dtype != np.float32 or not np.isfinite(saved).all():
+            raise ValueError('saved NPY validation failed')
+        del saved
     return dict(shape=list(shape), dtype='float32', computation=SCORE_METHOD,
         position_ids=position_ids, position_ids_source='actual self_attn forward kwargs; equality verified across all layers',
         layer_arguments={str(k): v for k, v in captured.items()},
